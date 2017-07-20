@@ -1,0 +1,10 @@
+# Add any directories, files, or patterns you don't want to be tracked by version control
+.png
+.sar
+.asi
+.ash
+.jpg
+.tiff
+.tif
+.kml
+.nitf
