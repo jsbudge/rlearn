@@ -150,6 +150,8 @@ class Radar(object):
         self.el_bw = params['Elevation_Beamwidth_D'] * DTR
         self.az_bw = params['Azimuth_Beamwidth_D'] * DTR
         self.wavelength = params['lambda']
+        self.prf = params['Doppler_PRF_Hz']
+        self.tp = nsam / fs
         self.supported_pulses = min(np.ceil(gps_times[-1] / (params['PRI_TAC'] / TAC)).astype(int),
                                     nframes)
         self.range_bins = range_bins
@@ -176,7 +178,7 @@ class Radar(object):
 
     def resampleRangeBins(self, upsample):
         MPP = c0 / fs / upsample
-        self.upsample_nsam = self.fft_len * upsample
+        self.upsample_nsam = self.nsam * upsample
         range_bins = self.near_slant_range + np.arange(self.upsample_nsam) * MPP / 2
         self.range_bins = range_bins
         return range_bins
