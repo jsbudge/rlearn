@@ -20,7 +20,7 @@ def raisedCosine(x, bw, a0):
 
 
 @cuda.jit
-def genRangeProfile(f_path, gx, gy, gz, gv, rpan, rtilt, pd_r, pd_i, params):
+def genRangeProfile(f_path, gx, gy, gz, gv, times, rpan, rtilt, pd_r, pd_i, params):
     tt, samp_point = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and samp_point < gx.size:
         # Load in all the parameters that don't change
@@ -47,7 +47,9 @@ def genRangeProfile(f_path, gx, gy, gz, gv, rpan, rtilt, pd_r, pd_i, params):
             att = abs(math.sin(att_el_c * eldiff) / (att_el_c * eldiff)
                       * math.sin(att_az_c * azdiff) / (att_az_c * azdiff))
             fd = params[3] * math.sin(azdiff) / (params[2] * np.pi)
-            acc_val = gv[samp_point] * cmath.exp(-1j * 2 * wavenumber * rng_to_target) * att
+            # fd = 2 * params[3] / params[2] * math.cos(azdiff)
+            # acc_val = gv[samp_point] * cmath.exp(-1j * math.sqrt(4 * wavenumber * wavenumber - azdiff * azdiff) - 1j * fd * azdiff)
+            acc_val = gv[samp_point] * cmath.exp(-1j * 2 * wavenumber * rng_to_target) * cmath.exp(1j * fd * times[tt])
             cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
             cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
@@ -164,20 +166,19 @@ def interpolate(params, pulses, interp_pulses):
 
 
 @cuda.jit
-def genDoppProfile(f_path, gx, gy, gz, rpan, pd_r, pd_i, params):
+def genDoppProfile(f_path, rpan, gx, gy, gz, gv, times, pd_r, pd_i, params):
     tt, samp_point = cuda.grid(ndim=2)
     if tt < pd_r.size and samp_point < gx.size:
         att_az_c = params[1]
         wavenumber = 2 * np.pi / params[2]
         # Get LOS vector in XYZ and spherical coordinates at pulse time
-        sh_x = gx[samp_point] - f_path[0, tt]
-        sh_y = gy[samp_point] - f_path[1, tt]
-        sh_z = gz[samp_point] - f_path[2, tt]
+        sh_x = f_path[0, tt] - gx[samp_point]
+        sh_y = f_path[1, tt] - gy[samp_point]
+        sh_z = f_path[2, tt] - gz[samp_point]
         rng_to_target = math.sqrt(sh_x * sh_x + sh_y * sh_y + sh_z * sh_z)
         az_to_target = math.atan2(sh_x, sh_y)
         azdiff = diff(az_to_target, rpan[tt])
-        fd = cmath.exp(-1j * params[3] * math.sin(azdiff) / (params[2] * np.pi))
-        att = abs(math.sin(att_az_c * azdiff) / (att_az_c * azdiff))
-        acc_val = fd * att
-        cuda.atomic.add(pd_r, np.uint64(tt), acc_val.real)
-        cuda.atomic.add(pd_i, np.uint64(tt), acc_val.imag)
+        fd = params[3] * math.cos(azdiff) / (params[2] * np.pi)
+        val = gv[samp_point] * cmath.exp(-1j * fd * times[tt])
+        cuda.atomic.add(pd_r, np.uint64(tt), val.real)
+        cuda.atomic.add(pd_i, np.uint64(tt), val.imag)

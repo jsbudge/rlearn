@@ -26,7 +26,7 @@ DTR = np.pi / 180
 
 class Environment(object):
 
-    def __init__(self, ashfile, asifile, dec_fac=4):
+    def __init__(self, ashfile, asifile, subgrid_size=(100, 100), dec_fac=4):
         ash = loadASHFile(ashfile)
         nRows = int(ash['image']['nRows'])
         nCols = int(ash['image']['nCols'])
@@ -62,7 +62,8 @@ class Environment(object):
         self._origin = (ge[0], gn[0])
         self._res = (ge[1] - ge[0], gn[1] - gn[0])
         self._dec = dec_fac
-        self.shape = (e_span, n_span)
+        self.data_shape = (e_span / 2, n_span / 2)
+        self.shape = subgrid_size
 
     def __call__(self, x, y, is_enu=True):
         x_i = (self._scp[0] - y) / self._conv[0] if not is_enu else x
