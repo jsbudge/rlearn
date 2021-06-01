@@ -13,6 +13,7 @@ import cupy as cupy
 import numpy as np
 from numpy.fft import fft, ifft, fftshift
 from scipy.io import loadmat
+from scipy.stats import trapezoid
 from tqdm import tqdm
 
 from cuda_kernels import genRangeProfile, backproject, genDoppProfile
@@ -66,6 +67,9 @@ def genPoints(nn, e, method='uniform'):
             _gy = np.random.normal(0, e.shape[1] / 2, nn)
             while np.any(abs(_gy) > e.data_shape[1]):
                 _gy[abs(_gy) > e.data_shape[1]] = np.random.normal(0, e.shape[1] / 2, sum(abs(_gy) > e.data_shape[1]))
+        elif method == 'trap':
+            _gx = trapezoid.rvs(0.2, .8, size=nn) * (e.shape[0] + e.shape[0] * .4) - (e.shape[0] + e.shape[0] * .4) / 2
+            _gy = trapezoid.rvs(0.2, .8, size=nn) * (e.shape[1] + e.shape[1] * .4) - (e.shape[1] + e.shape[1] * .4) / 2
         _gz, _gv = e(_gx, _gy)
     return _gx, _gy, _gz, _gv
 
@@ -80,21 +84,32 @@ fnme = '/data5/SAR_DATA/2021/05052021/SAR_05052021_112239.sar'
 output_fnme = './test.dat'
 
 threads_per_block = (16, 16)
-chunk_sz = 256
 upsample = 1
+chunk_sz = 256 // upsample
 n_samples = 1000000
-subgrid_size = (300, 300)
-rand_method = 'uniform'
-do_backproject = False
-write_to_file = True
+subgrid_size = (600, 600)
+bpj_size = (300, 300)
+rand_method = 'trap'
+do_backproject = True
+write_to_file = False
 
 files = findAllFilenames(fnme)
+
+# Initialize all the variables
+match_filt = None
+gpx_gpu = gpy_gpu = gpz_gpu = gpv_gpu = None
+n_splits = None
+check_tt = None
+rc_data = None
+pulses = None
+gx = gy = gz = gv = None
+range_prof = None
 
 print('Loading environment...')
 env = Environment(files['ash'], files['asi'], subgrid_size=subgrid_size, dec_fac=4)
 
 print('Loading radar...')
-radar = Radar(fnme, env.scp)
+radar = Radar(fnme, env.scp, use_xml_flightpath=True, presum=14)
 radar.resampleRangeBins(upsample)
 ashfile = loadASHFile(files['ash'])
 
@@ -115,12 +130,15 @@ ref_set = False
 try:
     ap_output = loadmat('/home/jeff/repo/Debug/05052021/refchirp')
     ref_chirp = ap_output['Channel_1_X_Band_9_GHz_Cal_Data_I'] + 1j * ap_output['Channel_1_X_Band_9_GHz_Cal_Data_Q']
-    ref_chirp = ref_chirp / 10 ** (32 / 20)
+    # ref_chirp = ref_chirp / (10 ** (32 / 20))
     r_chirp = np.zeros((radar.fft_len,), dtype=np.complex128)
     ref_chirp = np.mean(ref_chirp, axis=1)
-    r_chirp[5100:5100 + len(ref_chirp)] = ref_chirp
+    ref_chirp = radar.chirp(px=np.linspace(0, 1, 10), py=np.linspace(0, 1, 10))
+    r_chirp[:len(ref_chirp)] = ref_chirp
+    r_chirp = ref_chirp
     if upsample == 1:
         match_filt = loadMatchedFilter(files['MatchedFilter'])
+        match_filt = fft(r_chirp, n=radar.fft_len * upsample).conj().T
     else:
         match_filt = fft(r_chirp, n=radar.fft_len * upsample).conj().T
 except IndexError:
@@ -131,9 +149,17 @@ except IndexError:
 # Get chirp to the right size
 fft_chirp = fft(r_chirp, radar.fft_len * upsample)
 ref_gpu = cupy.array(np.tile(fft_chirp, (chunk_sz, 1)).T, dtype=np.complex128)
+mf_gpu = cupy.array(np.tile(match_filt, (chunk_sz, 1)).T, dtype=np.complex128)
 
 # Get grid for debug testing
-bx, by = np.meshgrid(np.linspace(-100, 100, 200), np.linspace(-100, 100, 200))
+bx, by = np.meshgrid(np.linspace(-bpj_size[0]//2, bpj_size[0]//2, bpj_size[0] * 4),
+                     np.linspace(-bpj_size[1]//2, bpj_size[1]//2, bpj_size[1] * 4))
+gs = bx.shape
+R = np.array([[np.cos(env.cta), -np.sin(env.cta)],
+             [np.sin(env.cta), np.cos(env.cta)]])
+b_p = R.dot(np.array([bx.flatten(), by.flatten()]))
+bx = b_p[1, :].reshape(gs)
+by = b_p[0, :].reshape(gs)
 bz, _ = env(bx, by)
 bx_gpu = cupy.array(bx, dtype=np.float64)
 by_gpu = cupy.array(by, dtype=np.float64)
@@ -148,11 +174,8 @@ blocks_per_grid_rpf = (
 
 # Load constants and other parameters
 param_gpu = cupy.array(np.array([np.pi / radar.el_bw, np.pi / radar.az_bw,
-                                 radar.wavelength, radar.params['Velocity_Knots'] * .514444, radar.el_bw, radar.az_bw,
-                                 radar.near_slant_range / c0, 2e9 * upsample, radar.prf]), dtype=np.float64)
-
-# Only get pulses that contribute to the image
-numSupportedPulses = radar.supported_pulses
+                                 radar.wavelength, radar.velocity, radar.el_bw, radar.az_bw,
+                                 radar.near_slant_range / c0, 2e9 * upsample, 0, radar.prf]), dtype=np.float64)
 
 n_frames, sdr_samples, atts, sys_times = getRawSDRParams(files['RawData'])
 
@@ -189,8 +212,9 @@ else:
     gpz_gpu = cupy.array(gz, dtype=np.float64)
     gpv_gpu = cupy.array(gv, dtype=np.float64)
 
-for ch in tqdm(np.arange(0, n_frames, chunk_sz)):
-    tt = sys_times[ch:min(ch + chunk_sz, n_frames)] / TAC
+n_pulses = len(radar.times) if radar.is_presummed else n_frames
+for ch in tqdm(np.arange(0, n_pulses, chunk_sz)):
+    tt = radar.systimes[ch:min(ch + chunk_sz, n_pulses)] / TAC
 
     # This is usually only on the last chunk in the file, change the size of the
     # reference pulse block
@@ -198,17 +222,17 @@ for ch in tqdm(np.arange(0, n_frames, chunk_sz)):
         ch_sz = len(tt)
         ref_gpu = cupy.array(np.tile(fft_chirp, (ch_sz, 1)).T, dtype=np.complex128)
         rpf_shape = (radar.upsample_nsam, ch_sz)
+        mf_gpu = cupy.array(np.tile(match_filt, (ch_sz, 1)).T, dtype=np.complex128)
 
     # Toss in all the interpolated stuff
     fp_gpu = cupy.array(np.ascontiguousarray(radar.pos(tt), dtype=np.float64))
     rad_pan_gpu = cupy.array(np.ascontiguousarray(radar.pan(tt), dtype=np.float64))
     rad_tilt_gpu = cupy.array(np.ascontiguousarray(radar.tilt(tt), dtype=np.float64))
 
-    rpf_r_gpu = cupy.random.rand(*rpf_shape, dtype=np.float64) * .002
+    rpf_r_gpu = cupy.random.rand(*rpf_shape, dtype=np.float64) * 1
     # rpf_r_gpu = cupy.zeros(rpf_shape, dtype=np.float64)
-    rpf_i_gpu = cupy.zeros(rpf_shape, dtype=np.float64)
-    dopp_chirp_r_gpu = cupy.zeros((ch_sz,), dtype=np.float64)
-    dopp_chirp_i_gpu = cupy.zeros((ch_sz,), dtype=np.float64)
+    rpf_i_gpu = cupy.random.rand(*rpf_shape, dtype=np.float64) * 1
+    # rpf_i_gpu = cupy.zeros(rpf_shape, dtype=np.float64)
     times_gpu = cupy.array(np.ascontiguousarray(tt - t_pca), dtype=np.float64)
 
     for rnd in range(n_splits):
@@ -226,16 +250,18 @@ for ch in tqdm(np.arange(0, n_frames, chunk_sz)):
         genRangeProfile[blocks_per_grid_rpf, threads_per_block](fp_gpu, gpx_gpu, gpy_gpu, gpz_gpu,
                                                                 gpv_gpu, times_gpu, rad_pan_gpu,
                                                                 rad_tilt_gpu, rpf_r_gpu, rpf_i_gpu, param_gpu)
-
-        # genDoppProfile[blocks_per_grid_rpf, threads_per_block](fp_gpu, rad_pan_gpu, gpx_gpu, gpy_gpu, gpz_gpu,
-        #                                                         gpv_gpu, times_gpu, dopp_chirp_r_gpu, dopp_chirp_i_gpu, param_gpu)
         cupy.cuda.Device().synchronize()
 
     # Calculate the pulse data on the GPU using FFT
     rpf_gpu = rpf_r_gpu + 1j * rpf_i_gpu
-    # fd = np.exp(-1j * (tt - t_pca) * np.cos(-4 * np.pi / radar.wavelength * np.linalg.norm(radar.pos(tt), axis=0)))
-    # dopp_gpu = cupy.array(np.tile(fd, (radar.fft_len, 1)), dtype=np.complex128)
-    dopp_gpu = dopp_chirp_r_gpu + 1j * dopp_chirp_i_gpu
+    # dopp_gpu =
+
+    pd_gpu = cupy.fft.fft(rpf_gpu, n=radar.fft_len * upsample, axis=0) * ref_gpu
+    pd_gpu = cupy.fft.ifft(pd_gpu, axis=0)[:radar.upsample_nsam, :]
+
+    rcd_gpu = cupy.fft.ifft(cupy.fft.fft(pd_gpu, n=radar.fft_len * upsample, axis=0) * mf_gpu,
+                            axis=0)[:radar.upsample_nsam, :]
+    cupy.cuda.Device().synchronize()
 
     # Run the actual backprojection
     if do_backproject:
@@ -244,16 +270,9 @@ for ch in tqdm(np.arange(0, n_frames, chunk_sz)):
                                                             rb_gpu, rad_pan_gpu,
                                                             rad_tilt_gpu, rpf_gpu, bpjgrid_gpu,
                                                             param_gpu)
+        cupy.cuda.Device().synchronize()
         bpjgrid = bpjgrid + bpjgrid_gpu.get()
         del bpjgrid_gpu
-    pd_gpu = cupy.fft.fft(rpf_gpu, n=radar.fft_len * upsample, axis=0) * ref_gpu
-    pd_gpu = cupy.fft.ifft(pd_gpu, axis=0)[:radar.upsample_nsam:upsample, :]
-    # pd_gpu = cupy.fft.fft(pd_gpu, axis=1) * cupy.fft.fft(dopp_gpu, axis=1)
-    # pd_gpu = cupy.fft.ifft(pd_gpu, axis=1)[:radar.upsample_nsam:upsample, :] / (upsample * 2 * np.pi)**2
-    cupy.cuda.Device().synchronize()
-
-    # Run interpolation to correct sample size
-    # interpolate[blocks_per_grid_int, threads_per_block](dec_params_gpu, pd_gpu, dec_pd_gpu)
 
     if write_to_file:
         # Write to .dat files for backprojection
@@ -267,54 +286,55 @@ for ch in tqdm(np.arange(0, n_frames, chunk_sz)):
 
     # Find the point of closest approach and get all stuff associated with it
     if on_init:
+        rc_data = rcd_gpu.get()
         pulses = pd_gpu.get()
         range_prof = rpf_gpu.get()
         flight_path = fp_gpu.get()
         check_tt = tt
         on_init = False
-        disp_atts = atts[ch:min(ch + chunk_sz, n_frames)]
-    if tt[-1] > t_pca > tt[0]:
+        disp_atts = radar.att[ch:min(ch + chunk_sz, n_pulses)]
+    if tt[-1] >= t_pca >= tt[0]:
+        rc_data = rcd_gpu.get()
         pulses = pd_gpu.get()
         range_prof = rpf_gpu.get()
         flight_path = fp_gpu.get()
         check_tt = tt
-        disp_atts = atts[ch:min(ch + chunk_sz, n_frames)]
+        disp_atts = radar.att[ch:min(ch + chunk_sz, n_pulses)]
 
     # Delete the range compressed pulse block to free up memory on the GPU
     del pd_gpu
     del rpf_gpu
     del rpf_r_gpu
     del rpf_i_gpu
-    del dopp_chirp_i_gpu
-    del dopp_chirp_r_gpu
-    del dopp_gpu
+    del times_gpu
+    del rcd_gpu
+    del rad_pan_gpu
+    del rad_tilt_gpu
+    del fp_gpu
     mempool.free_all_blocks()
 
-del rad_pan_gpu
-del rad_tilt_gpu
-del fp_gpu
 del ref_gpu
 del param_gpu
 del gpx_gpu
 del gpy_gpu
 del gpz_gpu
 del gpv_gpu
+del mf_gpu
 mempool.free_all_blocks()
 
 # Apply range roll-off corrections
-if do_backproject:
+if do_backproject and abs(bpjgrid).max() > 0:
     med_curve = np.median(abs(bpjgrid), axis=0)
-    med_curve = med_curve / med_curve.max()
+    med_curve = med_curve / med_curve.max() if med_curve.max() > 0 else med_curve
     rng_corr = 1 / np.poly1d(np.polyfit(np.arange(len(med_curve)), med_curve, 3))(np.arange(len(med_curve)))
     med_curve = np.median(abs(bpjgrid), axis=1)
-    med_curve = med_curve / med_curve.max()
+    med_curve = med_curve / med_curve.max() if med_curve.max() > 0 else med_curve
     az_corr = 1 / np.poly1d(np.polyfit(np.arange(len(med_curve)), med_curve, 3))(np.arange(len(med_curve)))
     for az in range(len(az_corr)):
         for rng in range(len(rng_corr)):
             bpjgrid[az, rng] = bpjgrid[az, rng] * rng_corr[rng] * az_corr[az]
-rc_data = ifft(fft(pulses, radar.fft_len * upsample, axis=0) * match_filt[:, None], n=radar.nsam, axis=0)
 pca_idx = np.where(check_tt == t_pca)[0][0]
-dpshift_data = db(fftshift(fft(rc_data, axis=1)))
+dpshift_data = db(fftshift(fft(rc_data, axis=1), axes=1))
 
 # After run, diagnostics, etc.
 pos_pca = enu2llh(*radar.pos(t_pca), env.scp)
@@ -340,30 +360,40 @@ plt.imshow(db(rc_data), extent=[check_tt[0], check_tt[-1], radar.range_bins[0], 
 plt.axis('tight')
 
 plt.figure('Backproject')
-plt.imshow(db(bpjgrid), origin='lower')
+plt.imshow(db(bpjgrid).T, origin='lower', cmap='gray')
 
 plt.figure('Doppler Shifted Data')
 plt.imshow(dpshift_data)
 plt.axis('tight')
 
+plt.figure('Doppler UnShifted Data')
+plt.imshow(fftshift(dpshift_data, axes=1))
+plt.axis('tight')
+
+'''
 plt.figure('Original Data')
 plt.imshow(db(env.data), origin='lower', cmap='gray')
 
 plt.figure('Interpolated DTED')
 plt.imshow(env.hdata - env.scp[2], origin='lower')
+'''
 
 if n_samples == 1:
+    b0 = np.arange(radar.upsample_nsam)[rngs.min() <= radar.range_bins][-1]
+    b1 = np.arange(radar.upsample_nsam)[radar.range_bins <= rngs.min()][0]
+    boca = b0 if abs(radar.range_bins[b0] - rngs.min()) < abs(radar.range_bins[b1] - rngs.min()) else b1
     plt.figure('Cuts')
     plt.subplot(3, 1, 1)
     plt.title('Range')
     plt.plot(dpshift_data[:, dpshift_data.shape[1] // 2])
     plt.subplot(3, 1, 2)
     plt.title('Azimuth')
-    plt.plot(dpshift_data[dpshift_data.shape[0] // 2, :])
+    plt.plot(dpshift_data[b1, :])
     plt.subplot(3, 1, 3)
     plt.title('Doppler')
-    plt.plot(np.real(rc_data[rc_data.shape[0] // 2, :]))
+    plt.plot(np.real(rc_data[b1, :]))
 else:
+    boca = rc_data.shape[0] // 2
     plt.figure('Sampled Data')
     plt.scatter(gx, gy, s=.1, c=db(gv))
 
@@ -373,13 +403,17 @@ plt.subplot(3, 1, 1)
 plt.title('Doppler Chirp')
 plt.plot(radar.times, np.cos(-4 * np.pi / radar.wavelength * rngs))
 plt.plot(radar.times[np.logical_and(radar.times <= check_tt[-1], radar.times >= check_tt[0])],
-         np.real(rc_data[rc_data.shape[0] // 2, :]) / np.real(rc_data[rc_data.shape[0] // 2, :]).max())
+         np.real(rc_data[boca, :]) / np.real(rc_data[boca, :]).max())
 plt.subplot(3, 1, 2)
 plt.title('Ranges')
 plt.plot(radar.times, rngs)
+plt.plot(radar.times[np.logical_and(radar.times <= check_tt[-1], radar.times >= check_tt[0])],
+         rngs[np.logical_and(radar.times <= check_tt[-1], radar.times >= check_tt[0])])
 plt.subplot(3, 1, 3)
 plt.title('Az Diffs')
 plt.plot(radar.times, az_diffs)
+plt.plot(radar.times[np.logical_and(radar.times <= check_tt[-1], radar.times >= check_tt[0])],
+         az_diffs[np.logical_and(radar.times <= check_tt[-1], radar.times >= check_tt[0])])
 
 plt.figure('Chirp Data')
 plt.subplot(4, 1, 1)
@@ -412,6 +446,6 @@ plt.plot(np.real(iplt_test))
 plt.plot(np.real(pulses[:, pca_idx]))
 plt.subplot(3, 1, 3)
 plt.title('Range Compression')
-plt.plot(radar.range_bins, db(ifft(fft(iplt_test, n=radar.fft_len * upsample) * match_filt, n=radar.upsample_nsam)))
-plt.plot(radar.range_bins[::upsample], db(rc_data[:, pca_idx]))
+plt.plot(radar.range_bins, db(ifft(fft(iplt_test, n=radar.fft_len * upsample) * match_filt))[:radar.upsample_nsam])
+plt.plot(radar.range_bins, db(rc_data[:, pca_idx]))
 plt.legend(['CPU Comp.', 'GPU Comp.'])

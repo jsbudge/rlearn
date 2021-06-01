@@ -10,7 +10,8 @@ To be used mostly with the parser included in this folder.
 import numpy as np
 import mmap
 
-
+START_WORD = b'\x0A\xB0\xFF\x18'
+STOP_WORD = b'\xAA\xFF\x11\x55'
 COLLECTION_MODE_DIGITAL_CHANNEL_MASK = 0x000003E000000000
 COLLECTION_MODE_OPERATION_MASK = 0x1800000000000000
 COLLECTION_MODE_DIGITAL_CHANNEL_SHIFT = 37
@@ -250,3 +251,8 @@ class SDRMiniParser(object):
                 # Skip AGC/reserved data stuff
                 mm.read(7)
         return cals, nsamples, sys_times, frame_num, atts
+
+
+def readPulseFromStream(data):
+    pt = data.find(START_WORD)
+

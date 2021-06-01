@@ -64,6 +64,7 @@ class Environment(object):
         self._dec = dec_fac
         self.data_shape = (e_span / 2, n_span / 2)
         self.shape = subgrid_size
+        self.cta = cta
 
     def __call__(self, x, y, is_enu=True):
         x_i = (self._scp[0] - y) / self._conv[0] if not is_enu else x

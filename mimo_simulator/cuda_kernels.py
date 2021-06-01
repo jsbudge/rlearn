@@ -43,15 +43,14 @@ def genRangeProfile(f_path, gx, gy, gz, gv, times, rpan, rtilt, pd_r, pd_i, para
             eldiff = diff(el_to_target, rtilt[tt])
             azdiff = diff(az_to_target, rpan[tt])
             # Check to see if it's outside of our beam
-            # if abs(azdiff) <= params[5] and abs(eldiff) <= params[4]:
-            att = abs(math.sin(att_el_c * eldiff) / (att_el_c * eldiff)
-                      * math.sin(att_az_c * azdiff) / (att_az_c * azdiff))
-            fd = params[3] * math.sin(azdiff) / (params[2] * np.pi)
-            # fd = 2 * params[3] / params[2] * math.cos(azdiff)
-            # acc_val = gv[samp_point] * cmath.exp(-1j * math.sqrt(4 * wavenumber * wavenumber - azdiff * azdiff) - 1j * fd * azdiff)
-            acc_val = gv[samp_point] * cmath.exp(-1j * 2 * wavenumber * rng_to_target) * cmath.exp(1j * fd * times[tt])
-            cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
-            cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
+            if abs(azdiff) <= params[5] and abs(eldiff) <= params[4]:
+                att = abs(math.sin(att_el_c * eldiff) / (att_el_c * eldiff)
+                          * math.sin(att_az_c * azdiff) / (att_az_c * azdiff))
+                acc_val = gv[samp_point] * cmath.exp(-1j * 2 * wavenumber * (rng_to_target + params[3] / params[9])) * att * att
+                # acc_val = gv[samp_point] * cmath.exp(
+                #     -1j * 2 * wavenumber * rng_to_target) * att * att
+                cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
+                cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
 
 @cuda.jit
@@ -66,7 +65,7 @@ def backproject(f_path, gx, gy, gz,
         n_samples = rbins.size
         att_el_c = params[0]
         att_az_c = params[1]
-        exp_c = params[2]
+        exp_c = 4 * np.pi / params[2]
 
         # Grab pulse data and sum up for this pixel
         for p in range(nPulses):
@@ -122,17 +121,17 @@ def backproject(f_path, gx, gy, gz,
             else:
                 bi0 = but
                 bi1 = but + 1
-            if params[3] == 1:
+            if params[8] == 1:
                 # Linear interpolation between bins (slower but more accurate)
                 a = (cp[bi0] * (rbins[bi1] - rng_to_target) + cp[bi1] * (rng_to_target - rbins[bi0])) \
                     / (rbins[bi1] - rbins[bi0])
-            elif params[3] == 0:
+            elif params[8] == 0:
                 # This is how APS does it (for reference, I guess)
                 a = cp[bi0] if rng_to_target - rbins[bi0] < rbins[bi1] - rng_to_target else cp[bi1]
             else:
                 # This is a lagrange polynomial interpolation of the specified order
                 a = 0
-                k = params[3] + 1
+                k = params[8] + 1
                 ks = bi0 - (k - (k % 2)) / 2
                 while ks < 0:
                     ks += 1
