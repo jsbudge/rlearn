@@ -1,5 +1,6 @@
 import sys
 from socket import socket, AF_INET, SOCK_STREAM, create_connection
+from scipy.signal.windows import taylor
 
 from PyQt5.QtWidgets import QApplication, QFileDialog
 from PyQt5.QtWidgets import QLabel, QPushButton, QHBoxLayout, QVBoxLayout
@@ -27,7 +28,7 @@ COLLECTION_MODE_OPERATION_SHIFT = 59
 
 
 class QuickView(QWidget):
-    def __init__(self, pulse):
+    def __init__(self, pulse, mf=None):
         super().__init__()
         layout = QVBoxLayout()
         self.label = QLabel("Single Pulse Check")
@@ -36,8 +37,13 @@ class QuickView(QWidget):
         layout.addWidget(self.disp)
         buttons = QHBoxLayout()
         spec_but = QPushButton('Spectrum')
+        rc_but = QPushButton('Range Compression')
+        if mf is None:
+            rc_but.setVisible(False)
         spec_but.clicked.connect(lambda: self.drawSpectrum(pulse))
+        rc_but.clicked.connect(lambda: self.drawRC(pulse, mf))
         buttons.addWidget(spec_but)
+        buttons.addWidget(rc_but)
         layout.addLayout(buttons)
         self.setLayout(layout)
         xes = np.arange(len(pulse))
@@ -50,6 +56,10 @@ class QuickView(QWidget):
     def drawSpectrum(self, pulse):
         xes = np.fft.fftfreq(findPowerOf2(len(pulse)) * 4)
         self.disp.plot(xes, db(np.fft.fft(pulse, n=findPowerOf2(len(pulse)) * 4)))
+
+    def drawRC(self, pulse, filt):
+        xes = np.arange(len(filt) * 4)
+        self.disp.plot(xes, db(np.fft.ifft(np.fft.fft(pulse, n=len(filt)) * filt, n=len(filt) * 4)))
 
 
 class CPI_Window(QMainWindow):
@@ -71,6 +81,7 @@ class CPI_Window(QMainWindow):
         self.listen = False
         self.port_address = 11788
         self.data_address = 11789
+        self.data_receiving = False
         self.error = None
         self.matched_filter = None
         self.mfcount = 0
@@ -97,7 +108,7 @@ class CPI_Window(QMainWindow):
         # Parse Layout widgets
         socket_layout = QHBoxLayout()
         self.port_box = QSpinBox()
-        self.port_box.setMaximum(15000)
+        self.port_box.setMaximum(50000)
         self.port_box.setMinimum(0)
         self.port_box.setValue(self.port_address)
         listen_but = QPushButton('Change Port')
@@ -190,14 +201,16 @@ class CPI_Window(QMainWindow):
         self._signal_controlupdate.emit("Listening.".format(self.port_address))
         while True:
             connection, client_address = sock.accept()
-            connection.send(bytes([0, 0, 1, 1]))
+            connection.send(bytes([0, 0, 0, 1]))
             break
         while True:
             try:
                 while True:
                     data = connection.recv(5)
                     # print(str(data))
-                    self._signal_controlreceived.emit(data)
+                    if not self.data_receiving:
+                        self._signal_controlreceived.emit(data)
+                    connection.send(bytes([0, 1, 0, 1]))
                     if not data:
                         break
             finally:
@@ -216,6 +229,7 @@ class CPI_Window(QMainWindow):
         # sock.send(bytes([1, 0, 1, 0]))
         try:
             self._signal_dataupdate.emit("Receiving.".format(self.data_address))
+            self.data_receiving = True
             prev_search = bytes([0, 0, 0, 0])
             while not self.shutdown:
                 search_data = sock.recv(4)
@@ -235,11 +249,11 @@ class CPI_Window(QMainWindow):
                                                                                                            nsam,
                                                                                                            att,
                                                                                                            systime))
-                    pulse = np.zeros((nsam,), dtype=np.complex64)
-                    data = sock.recv(nsam * 8)
-                    for i, n in enumerate(range(0, len(data), 8)):
-                        pulse[i] = int.from_bytes(data[n:n + 4], byteorder='big', signed=True) + 1j * \
-                                   int.from_bytes(data[n + 4:n + 8], byteorder='big', signed=True) * \
+                    pulse = np.zeros((nsam,), dtype=np.complex128)
+                    data = sock.recv(nsam * 4)
+                    for i, n in enumerate(range(0, len(data), 4)):
+                        pulse[i] = int.from_bytes(data[n:n + 2], byteorder='big', signed=True) + 1j * \
+                                   int.from_bytes(data[n + 2:n + 4], byteorder='big', signed=True) * \
                                    (10 ** (att / 20))
                     if is_cal:
                         if self.matched_filter is None:
@@ -260,6 +274,7 @@ class CPI_Window(QMainWindow):
                     break
         finally:
             sock.close()
+            self.data_receiving = False
 
     @pyqtSlot()
     def _slotPlotCPI(self):
@@ -268,7 +283,7 @@ class CPI_Window(QMainWindow):
     def _plot_thread(self):
         while True:
             if self.load_filter:
-                self.matched_filter = np.fft.fft(self.matched_filter / self.mfcount, self.fft_len)
+                self.matched_filter = np.fft.fft(self.matched_filter / self.mfcount, self.fft_len) * taylor(self.fft_len, nbar=6, sll=30)
                 self._hasFilter = True
                 self._signal_statusbar.emit('Matched Filter generated.')
                 self.load_filter = False
@@ -277,7 +292,7 @@ class CPI_Window(QMainWindow):
                 fft_cpi = np.fft.fft(disp_cpi, n=self.fft_len, axis=1)
                 if self._hasFilter:
                     fft_cpi = np.fft.fft(fft_cpi * self.matched_filter[None, :], axis=1)
-                self.display.imshow(db(fft_cpi))
+                self.display.imshow(db(fft_cpi).T)
                 self.plot_flag = False
 
     def _setCPILength(self):
@@ -287,6 +302,7 @@ class CPI_Window(QMainWindow):
         if self.data_listener is not None:
             self.data_listener.join(timeout=.00001)
         self.control_listener.join(timeout=.00001)
+        self.plotter.join(timeout=.00001)
         event.accept()
 
     @pyqtSlot()
@@ -296,7 +312,7 @@ class CPI_Window(QMainWindow):
     @pyqtSlot()
     def _slotPlotPulse(self):
         if self.win is None:
-            self.win = QuickView(self.current_cpi[0])
+            self.win = QuickView(self.current_cpi[0], self.matched_filter)
         else:
             self.win.redraw(self.current_cpi[0])
         self.win.show()
@@ -386,10 +402,12 @@ class MatplotlibWidget(QWidget):
         self.canvas.flush_events()
 
 
-# Instantiate the window
-app = QApplication(sys.argv)
-win = CPI_Window()
-win.show()
+if __name__ == '__main__':
+    # Instantiate the window
+    app = QApplication(sys.argv)
+    win = CPI_Window()
+    win.show()
 
-# Run main loop
-sys.exit(app.exec_())
+    # Run main loop
+    sys.exit(app.exec_())
+
