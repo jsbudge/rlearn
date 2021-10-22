@@ -62,6 +62,10 @@ def genRangeProfile(tx_path, rx_path, gx, gy, gz, gv, rx_pan, tx_pan, rx_tilt, t
                 acc_val = gv[samp_point] * att_tx * att_rx * cmath.exp(-1j * wavenumber * (tx_rng + rx_rng))
                 cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
                 cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
+                cuda.atomic.add(pd_r, (but - 1, np.uint64(tt)), acc_val.real * .2)
+                cuda.atomic.add(pd_i, (but - 1, np.uint64(tt)), acc_val.imag * .2)
+                cuda.atomic.add(pd_r, (but + 1, np.uint64(tt)), acc_val.real * .2)
+                cuda.atomic.add(pd_i, (but + 1, np.uint64(tt)), acc_val.imag * .2)
 
 
 @cuda.jit
