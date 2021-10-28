@@ -362,8 +362,7 @@ class Yahtzee(Environment):
         self.rnd = 0
 
     def states(self):
-        return dict(state=dict(type='int', shape=(5,), num_values=6),
-                    scoring=dict(type='float', shape=(13,), min_value=0.0))
+        return dict(type='float', shape=(31,))
 
     def actions(self):
         return dict(roll=dict(type='bool', shape=(5,)),
@@ -384,8 +383,8 @@ class Yahtzee(Environment):
         self.is_scored = np.array([False for _ in range(13)])
         self.dice = [np.random.randint(1, 6) for _ in range(5)]
         self.rnd = 0
-        state = dict(state=self.dice, scoring=np.zeros((13,)), roll_mask=[True for _ in range(5)],
-                     select_mask=[True for _ in range(13)])
+        state = dict(state=np.concatenate((self.dice, self.scorecard, self.is_scored)),
+                     action_mask=[True for _ in range(5)] + [True for _ in range(13)])
         return state
 
     def execute(self, actions):
@@ -399,6 +398,6 @@ class Yahtzee(Environment):
 
         terminal = False if np.any(self.is_scored) else True
         reward = np.random.random()
-        state = dict(state=self.dice, scoring=self.scorecard, roll_mask=[True for _ in range(5)],
-                     select_mask=np.logical_not(self.is_scored))
+        state = dict(state=np.concatenate((self.dice, self.scorecard, self.is_scored)),
+                     action_mask=[True for _ in range(5)] + list(np.logical_not(self.is_scored)))
         return state, terminal, reward
