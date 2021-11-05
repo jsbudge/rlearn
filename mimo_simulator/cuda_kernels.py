@@ -20,7 +20,8 @@ def raisedCosine(x, bw, a0):
     return a0 - (1 - a0) * math.cos(2 * np.pi * xf)
 
 
-@cuda.jit
+@cuda.jit('void(float64[:], float64[:], float64[:], float64[:], float64[:], float64[:], float64[:], float64[:], '
+          'float64[:], float64[:], complex128[:], complex128[:], float64[:], float64[:], float64[:])')
 def genRangeProfile(tx_path, rx_path, gx, gy, gz, gv, rx_pan, tx_pan, rx_tilt, tx_tilt, pd_r, pd_i, shift, p_rx, p_tx):
     tt, samp_point = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and samp_point < gx.size:
@@ -59,13 +60,20 @@ def genRangeProfile(tx_path, rx_path, gx, gy, gz, gv, rx_pan, tx_pan, rx_tilt, t
                 rx_elpat = abs(math.sin(p_rx[0] * rx_eldiff) / (p_rx[0] * rx_eldiff)) if rx_eldiff != 0 else 1
                 rx_azpat = abs(math.sin(p_rx[1] * rx_azdiff) / (p_rx[1] * rx_azdiff)) if rx_azdiff != 0 else 1
                 att_rx = rx_elpat * rx_azpat
-                acc_val = gv[samp_point] * att_tx * att_rx * cmath.exp(-1j * wavenumber * (tx_rng + rx_rng))
+                acc_val = gv[samp_point] * att_tx * att_rx * cmath.exp(-1j * wavenumber * (tx_rng + rx_rng)) * \
+                          1.0 / (tx_rng + rx_rng)
                 cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
                 cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
-                cuda.atomic.add(pd_r, (but - 1, np.uint64(tt)), acc_val.real * .2)
-                cuda.atomic.add(pd_i, (but - 1, np.uint64(tt)), acc_val.imag * .2)
-                cuda.atomic.add(pd_r, (but + 1, np.uint64(tt)), acc_val.real * .2)
-                cuda.atomic.add(pd_i, (but + 1, np.uint64(tt)), acc_val.imag * .2)
+
+                # Add as a small gaussian
+                cuda.atomic.add(pd_r, (but - 1, np.uint64(tt)), acc_val.real * .6)
+                cuda.atomic.add(pd_i, (but - 1, np.uint64(tt)), acc_val.imag * .6)
+                cuda.atomic.add(pd_r, (but + 1, np.uint64(tt)), acc_val.real * .6)
+                cuda.atomic.add(pd_i, (but + 1, np.uint64(tt)), acc_val.imag * .6)
+                cuda.atomic.add(pd_r, (but - 2, np.uint64(tt)), acc_val.real * .2)
+                cuda.atomic.add(pd_i, (but - 2, np.uint64(tt)), acc_val.imag * .2)
+                cuda.atomic.add(pd_r, (but + 2, np.uint64(tt)), acc_val.real * .2)
+                cuda.atomic.add(pd_i, (but + 2, np.uint64(tt)), acc_val.imag * .2)
 
 
 @cuda.jit

@@ -29,7 +29,8 @@ import matplotlib.patches as patches
 from matplotlib import cm
 from pathlib import Path
 
-from radar import XMLRadar, ConfigRadar, RadarArray, ambiguity, genPulse, Platform, XMLChannel, Antenna
+from radar import XMLRadar, ConfigRadar, RadarArray, ambiguity, genPulse, Platform, XMLChannel, \
+    Antenna, getTVSignal, getWidebandSignal
 from rawparser import loadReferenceChirp, loadMatchedFilter, loadASHFile, getRawDataGen, getRawSDRParams
 from simlib import getElevation, enu2llh
 from useful_lib import findAllFilenames, factors, db, findPowerOf2, gaus
@@ -76,13 +77,13 @@ def genPoints(n_pts, e, offsets, method='uniform'):
             _gy = trapezoid.rvs(0.2, .8, size=n_pts) * (e.shape[1] + e.shape[1] * .4) - \
                 (e.shape[1] + e.shape[1] * .4) / 2 + offsets[1]
         elif method == 'contrast':
-            gx = np.random.rand(n_pts) * e.shape[0] - e.shape[0] / 2 + offsets[0]
-            gy = np.random.rand(n_pts) * e.shape[1] - e.shape[1] / 2 + offsets[1]
-            tsd = gaussian_filter(sobel(e.data), sigma=15)
+            gx_tmp = np.random.rand(n_pts) * e.shape[0] - e.shape[0] / 2 + offsets[0]
+            gy_tmp = np.random.rand(n_pts) * e.shape[1] - e.shape[1] / 2 + offsets[1]
+            tsd = gaussian_filter(sobel(e.data / np.max(e.data)), sigma=10)
             grads = np.gradient(tsd)
 
-            _gx = gx + env(gx, gy, override_data=grads[0])[1] * .5
-            _gy = gy + env(gx, gy, override_data=grads[1])[1] * .5
+            _gx = gx_tmp + env(gx_tmp, gy_tmp, override_data=grads[0])[1]  # + np.random.rand(n_pts) - .5
+            _gy = gy_tmp + env(gx_tmp, gy_tmp, override_data=grads[1])[1]  # + np.random.rand(n_pts) - .5
 
         _gz, _gv = e(_gx, _gy)
     return _gx, _gy, _gz, _gv
@@ -94,25 +95,29 @@ TAC = 125e6
 fs = 2e9
 DTR = np.pi / 180
 MAX_SAMPLE_SIZE = 1e6
-INT_16_MAX = 2**15
+INT_16_MAX = 2 ** 15
 plt.close('all')
 
 ''' FILENAMES '''
 fnme = '/data5/SAR_DATA/2021/09222021/SAR_09222021_163338.sar'
 output_dir = '/home/jeff/repo/mimo_simulator/'
+cust_bg = '/home/jeff/Downloads/josh.png'
 
 ''' CUSTOM OPTIONS '''
 threads_per_block = (16, 16)
 upsample = 1
-chunk_sz = 128 // upsample
+chunk_sz = 256
 n_samples = 1000000
 presum = 1
 noise_level = 0.1
 poly_interp = 1
 channel = 0
 att_value = 5
-rfi_percent = .5
-subgrid_size = (255, 255)
+n_rfi_pts = 2
+rfi_perc = .35
+wb_rfi_pts = 1
+wrfi_perc = .15
+subgrid_size = (455, 455)
 bpj_size = (150, 150)
 rand_method = 'contrast'
 scp = (40.098785, -111.659957)
@@ -123,6 +128,7 @@ introduce_rfi = False
 write_to_file = False
 use_background_image = True
 use_config_radar = False
+display_figures = True
 
 # Load in files
 files = findAllFilenames(fnme, debug_dir='/data5/SAR_Freq_Data')
@@ -131,15 +137,17 @@ scp_el = (scp[0], scp[1], getElevation(scp))
 # Initialize all the variables
 match_filt = None
 gpx_gpu = gpy_gpu = gpz_gpu = gpv_gpu = None
+rfix_gpu = rfiy_gpu = rfiz_gpu = rfip_gpu = None
+rfi_sigs = rfi_ts = None
 n_splits = rcd_gpu = rpf_gpu = None
-check_tt = sdr_w = None
+check_tt = check_pnum = sdr_w = None
 gx = gy = gz = gv = None
 rng_ax = bpj_ax = dopp_ax = slice_ax = pulse_ax = None
-att_rng = 10**(np.arange(1, 32) / 20)
+att_rng = 10 ** (np.arange(1, 32) / 20)
 
 # Make the user aware of everything that's going on
 if introduce_rfi:
-    print('Introducing RFI.')
+    print('Introducing {} RFI points.'.format(n_rfi_pts))
 if do_backproject:
     print('Backprojection enabled.')
 else:
@@ -152,7 +160,7 @@ else:
 print('Loading environment...')
 if use_background_image:
     print('Using custom background image.')
-    im = imageio.imread('/home/jeff/Downloads/josh.png')
+    im = imageio.imread(cust_bg)
     crop_im = np.flipud(np.sum(im, axis=2))
     env = Environment(llr=scp_el, bg_data=crop_im, subgrid_size=subgrid_size, dec_fac=1)
 else:
@@ -211,11 +219,6 @@ bz_gpu = cupy.array(bz, dtype=np.float64)
 blocks_per_grid_bpj = (
     int(np.ceil(bx.shape[0] / threads_per_block[0])), int(np.ceil(bx.shape[1] / threads_per_block[1])))
 
-if introduce_rfi:
-    p_hasRFI = np.zeros((n_frames,))
-else:
-    p_hasRFI = None
-
 # Write header stuff to .dat file
 init_time = 0
 if write_to_file:
@@ -235,8 +238,8 @@ if write_to_file:
                             (fl['Stop_Latitude_D'], fl['Stop_Longitude_D']))
     gim = sdr_f.xml['Common_Channel_Settings']['Gimbal_Settings']
     sdr_w.addGimbal(gim['Pan_Limits_D'], gim['Tilt_Limits_D'], gim['Gimbal_Depression_Angle_D'],
-                 (gim['Gimbal_X_Offset_M'], gim['Gimbal_Y_Offset_M'], gim['Gimbal_Z_Offset_M']),
-                 (gim['Roll_D'], gim['Pitch_D'], gim['Yaw_D']), gim['Initial_Course_Angle_R'])
+                    (gim['Gimbal_X_Offset_M'], gim['Gimbal_Y_Offset_M'], gim['Gimbal_Z_Offset_M']),
+                    (gim['Roll_D'], gim['Pitch_D'], gim['Yaw_D']), gim['Initial_Course_Angle_R'])
     sdr_w.writeXML()
     sdr_w.addGPSData(sdr_f.gps_data, sdr_f.bestpos, sdr_f.timesync, sdr_f.gimbal)
     # Write cal data
@@ -261,6 +264,23 @@ gpx_gpu = cupy.array(gx, dtype=np.float64)
 gpy_gpu = cupy.array(gy, dtype=np.float64)
 gpz_gpu = cupy.array(gz, dtype=np.float64)
 gpv_gpu = cupy.array(gv, dtype=np.float64)
+
+# RFI point initialization
+if introduce_rfi:
+    p_hasRFI = np.zeros((n_frames,))
+    tmp_prcs = np.random.rand(n_rfi_pts)
+    if wb_rfi_pts > 0:
+        tmp_wb_prcs = np.random.rand(wb_rfi_pts)
+        rfi_ts = np.concatenate((tmp_prcs / sum(tmp_prcs) * rfi_perc, tmp_wb_prcs / sum(tmp_wb_prcs) * wrfi_perc))
+    else:
+        rfi_ts = tmp_prcs / sum(tmp_prcs) * rfi_perc
+    rfi_sigs = []
+    for sig in range(n_rfi_pts):
+        rfi_sigs.append((0, 1e2, np.random.randint(10, 70)))
+    for sig in range(wb_rfi_pts):
+        rfi_sigs.append((1, 1e2, np.random.rand() * 2e9, np.random.rand() * 200e6))
+else:
+    p_hasRFI = None
 
 # Now run pulse gen/backprojection for each of the antennae
 print('Running range profile generation...')
@@ -321,7 +341,8 @@ for rx_num, chan in enumerate(ra):
                                                tx_chan.near_slant_range / c0, fs * upsample, 1]), dtype=np.float64)
             ref_gpu = cupy.array(np.tile(tx_chan.fft_chirp, (ch_sz, 1)).T, dtype=np.complex128)
             rpf_r_gpu = cupy.random.normal(0, noise_level, rpf_shape, dtype=np.float64)
-            rpf_i_gpu = cupy.random.normal(0, noise_level, rpf_shape, dtype=np.float64)
+            rpf_i_gpu = cupy.zeros_like(rpf_r_gpu)
+            # rpf_i_gpu = cupy.random.normal(0, noise_level, rpf_shape, dtype=np.float64)
 
             for rnd in range(n_splits):
                 if rnd >= 1:
@@ -347,32 +368,28 @@ for rx_num, chan in enumerate(ra):
 
             if introduce_rfi:
                 # Create RFI signals, both wide and narrow band
-                rbi_t = np.arange(tx_chan.nsam) / fs
-                rbi_envelope = gaus(np.linspace(-1, 1, ch_sz), .1, 0, .002)
-                nbi_corrupt = np.convolve(np.random.rand(ch_sz) < rfi_percent / 2,
-                                          rbi_envelope, mode='same') + 1
-                nbi_signal = np.random.rand() * .1 * np.exp(1j * 2 * np.pi * np.random.rand() * tx_chan.bandwidth * rbi_t)
-                nbi_signal = np.tile(nbi_signal, (ch_sz, 1)).T * nbi_corrupt[None, :]
+                rbi_gpu = cupy.zeros((chan.nsam, ch_sz), dtype=np.complex128)
+                nbi_corrupt = np.zeros((ch_sz,))
+                nbi_signal = np.zeros((chan.nsam, ch_sz), dtype=np.complex128)
+                for idx, sig in enumerate(rfi_sigs):
+                    isoff = np.random.rand(ch_sz) > rfi_ts[idx]
+                    for npulse in range(ch_sz):
+                        if not isoff[npulse]:
+                            if sig[0] == 0:
+                                nbi_signal[:, npulse] = sig[1] * getTVSignal(sig[2], chan.nsam)
+                            elif sig[0] == 1:
+                                nbi_signal[:, npulse] = sig[1] * getWidebandSignal(sig[2], sig[3], chan.nsam)
+                    nbi_corrupt += np.logical_not(isoff)
+                    rbi_gpu = rbi_gpu + cupy.array(nbi_signal, dtype=np.complex128)
 
-                # Don't add as much WBI since it doesn't seem as prevalent in the real world
-                wbi_corrupt = np.convolve(np.random.rand(ch_sz) < rfi_percent / 7,
-                                          rbi_envelope, mode='same') + 1
-
-                # Simple linear chirp with random bandwidth, use a percentage of the
-                wbi_signal = np.random.rand() * .1 * genPulse(np.linspace(0, 1, 10), np.linspace(0, 1, 10), tx_chan.nsam,
-                                                              tx_chan.nsam / fs, np.random.rand() * tx_chan.bandwidth,
-                                                              max(np.random.rand(), .001) * .1 * tx_chan.bandwidth)
-                wbi_signal = np.tile(wbi_signal, (ch_sz, 1)).T * wbi_corrupt[None, :]
-                rbi_gpu = cupy.array(nbi_signal + wbi_signal, dtype=np.complex128)
                 rbi_gpu = cupy.fft.fft(rbi_gpu, axis=0, n=tx_chan.fft_len)
-                rbi_gpu[:, np.logical_and(nbi_corrupt == 1, wbi_corrupt == 1)] = 1.
 
                 # Add RFI signals to the data generation FFTs
                 pd_gpu = pd_gpu + cupy.fft.ifft(
-                    cupy.fft.fft(rpf_gpu, n=tx_chan.fft_len, axis=0) * ref_gpu * rbi_gpu,
+                    cupy.fft.fft(rpf_gpu, n=tx_chan.fft_len, axis=0) * ref_gpu + rbi_gpu,
                     axis=0)[:chan.nsam, :]
 
-                p_hasRFI[ch:ch + ch_sz] = np.logical_and(nbi_corrupt != 1, wbi_corrupt != 1)
+                p_hasRFI[ch:ch + ch_sz] = nbi_corrupt > 0
 
                 # Delete the GPU RFI stuff
                 del rbi_gpu
@@ -423,6 +440,7 @@ for rx_num, chan in enumerate(ra):
             pulses[rx_num] = pd_gpu.get()
             range_prof[rx_num] = rpf_gpu.get()
             check_tt = tt
+            check_pnum = np.arange(ch, ch + ch_sz)
 
         # Delete the range compressed pulse block to free up memory on the GPU
         del rpf_gpu
@@ -456,285 +474,266 @@ if write_to_file and introduce_rfi:
             f.write(np.int8(p_hasRFI).tobytes())
     print('File saved to ' + rfi_fnme)
 
-
 '''
 ################### PLOTS AND FIGURES ##########################
 '''
 # Generate all the plot figures we'll need
-grid_num = 1
-if ra.n_channels < 4:
+if display_figures:
+    if introduce_rfi:
+        print(f'RFI produced on {sum(p_hasRFI) / ra[0].nframes * 100:.2f}% of pulses.')
+    grid_num = 1
+    if ra.n_channels < 4:
+        if do_backproject:
+            bpj_fig, bpj_ax = plt.subplots(1, ra.n_channels, num='Backproject')
+            dopp_fig, dopp_ax = plt.subplots(1, ra.n_channels, num='Doppler Shifted')
+            rng_fig, rng_ax = plt.subplots(1, ra.n_channels, num='Range Profiles')
+    else:
+        grid_num = int(np.ceil(np.sqrt(ra.n_channels)))
+        if do_backproject:
+            bpj_fig, bpj_ax = plt.subplots(grid_num, grid_num, num='Backproject')
+            dopp_fig, dopp_ax = plt.subplots(grid_num, grid_num, num='Doppler Shifted')
+            rng_fig, rng_ax = plt.subplots(grid_num, grid_num, num='Range Profiles')
+    param_fig, param_ax = plt.subplots(2, 1, num='Params')
+    chirp_fig, chirp_ax = plt.subplots(4, ra.n_channels, num='Chirp Data')
     if do_backproject:
-        bpj_fig, bpj_ax = plt.subplots(1, ra.n_channels, num='Backproject')
-        dopp_fig, dopp_ax = plt.subplots(1, ra.n_channels, num='Doppler Shifted')
-        rng_fig, rng_ax = plt.subplots(1, ra.n_channels, num='Range Profiles')
-else:
-    grid_num = int(np.ceil(np.sqrt(ra.n_channels)))
-    if do_backproject:
-        bpj_fig, bpj_ax = plt.subplots(grid_num, grid_num, num='Backproject')
-        dopp_fig, dopp_ax = plt.subplots(grid_num, grid_num, num='Doppler Shifted')
-        rng_fig, rng_ax = plt.subplots(grid_num, grid_num, num='Range Profiles')
-param_fig, param_ax = plt.subplots(2, 1, num='Params')
-chirp_fig, chirp_ax = plt.subplots(4, ra.n_channels, num='Chirp Data')
-if do_backproject:
-    slice_fig, slice_ax = plt.subplots(3, ra.n_channels, num='Slices')
-    pulse_fig, pulse_ax = plt.subplots(2, ra.n_channels, num='Pulse Data')
+        slice_fig, slice_ax = plt.subplots(3, ra.n_channels, num='Slices')
+        pulse_fig, pulse_ax = plt.subplots(2, ra.n_channels, num='Pulse Data')
 
-for ant_num, r_rx in enumerate(ra):
-    rx = ra.rx(ant_num)
-    print('Channel {}'.format(ant_num))
-    pos_pca = enu2llh(*rx.pos(t_pca), env.scp)
-    pca_slant_range = np.linalg.norm(rx.pos(t_pca))
-    print('PCA-SCP slant range is {:.2f}'.format(pca_slant_range))
-    print('PCA-SCP ground range is {:.2f}'.format(np.sqrt(pca_slant_range ** 2 - (pos_pca[2] - env.scp[2]) ** 2)))
-    print('PCA radar pan is {:.2f}'.format(rx.pan(t_pca) / DTR))
-    print('PCA radar tilt is {:.2f}'.format(rx.tilt(t_pca) / DTR))
-    print('Plane pos at PCA is {:.6f}, {:.6f}, {:.2f}'.format(*pos_pca))
-    sh_los = -rx.pos(ra.times)
-    rngs = np.linalg.norm(sh_los, axis=0)
-    pt_el = np.array([math.asin(-sh_los[2, i] / rngs[i]) for i in range(len(rngs))])
-    pt_az = np.array([math.atan2(sh_los[0, i], sh_los[1, i]) for i in range(len(rngs))])
-    ant_x_plot = ant_num // grid_num
-    ant_y_plot = ant_num % grid_num
+    for ant_num, r_rx in enumerate(ra):
+        rx = ra.rx(ant_num)
+        print('Channel {}'.format(ant_num))
+        pos_pca = enu2llh(*rx.pos(t_pca), env.scp)
+        pca_slant_range = np.linalg.norm(rx.pos(t_pca))
+        print('PCA-SCP slant range is {:.2f}'.format(pca_slant_range))
+        print('PCA-SCP ground range is {:.2f}'.format(np.sqrt(pca_slant_range ** 2 - (pos_pca[2] - env.scp[2]) ** 2)))
+        print('PCA radar pan is {:.2f}'.format(rx.pan(t_pca) / DTR))
+        print('PCA radar tilt is {:.2f}'.format(rx.tilt(t_pca) / DTR))
+        print('Plane pos at PCA is {:.6f}, {:.6f}, {:.2f}'.format(*pos_pca))
+        sh_los = -rx.pos(ra.times)
+        rngs = np.linalg.norm(sh_los, axis=0)
+        pt_el = np.array([math.asin(-sh_los[2, i] / rngs[i]) for i in range(len(rngs))])
+        pt_az = np.array([math.atan2(sh_los[0, i], sh_los[1, i]) for i in range(len(rngs))])
+        ant_x_plot = ant_num // grid_num
+        ant_y_plot = ant_num % grid_num
 
-    az_diffs = np.array([adiff(pt_az[i], rx.pan(ra.times[i])) for i in range(len(rngs))])
-    param_ax[0].set_title('Ranges')
-    param_ax[0].plot(ra.times, rngs)
-    param_ax[0].plot(ra.times[np.logical_and(ra.times <= check_tt[-1], ra.times >= check_tt[0])],
-                     rngs[np.logical_and(ra.times <= check_tt[-1], ra.times >= check_tt[0])])
-    param_ax[1].set_title('Az Diffs')
-    param_ax[1].plot(ra.times, az_diffs)
-    param_ax[1].plot(ra.times[np.logical_and(ra.times <= check_tt[-1], ra.times >= check_tt[0])],
-                     az_diffs[np.logical_and(ra.times <= check_tt[-1], ra.times >= check_tt[0])])
+        az_diffs = np.array([adiff(pt_az[i], rx.pan(ra.times[i])) for i in range(len(rngs))])
+        param_ax[0].set_title('Ranges')
+        param_ax[0].plot(ra.times, rngs)
+        param_ax[0].plot(ra.times[np.logical_and(ra.times <= check_tt[-1], ra.times >= check_tt[0])],
+                         rngs[np.logical_and(ra.times <= check_tt[-1], ra.times >= check_tt[0])])
+        param_ax[1].set_title('Az Diffs')
+        param_ax[1].plot(ra.times, az_diffs)
+        param_ax[1].plot(ra.times[np.logical_and(ra.times <= check_tt[-1], ra.times >= check_tt[0])],
+                         az_diffs[np.logical_and(ra.times <= check_tt[-1], ra.times >= check_tt[0])])
 
-    # plt.figure('Chirp Data Ant {}'.format(ant_num))
-    try:
-        chirp_ax[0, ant_num].set_title('Ref. Chirp')
-        chirp_ax[0, ant_num].plot(np.real(r_rx.chirp))
-        chirp_ax[1, ant_num].set_title('Ref. Spectrum')
-        chirp_ax[1, ant_num].plot(db(fft(r_rx.chirp)))
-        chirp_ax[2, ant_num].set_title('Matched Filter')
-        chirp_ax[2, ant_num].plot(db(r_rx.mf))
-        chirp_ax[3, ant_num].set_title('Range Compression')
-        chirp_ax[3, ant_num].plot(r_rx.upsample_rbins,
-                                  np.fft.fftshift(db(ifft(r_rx.fft_chirp * r_rx.mf, n=r_rx.upsample_nsam))))
-    except IndexError:
-        chirp_ax[0].set_title('Ref. Chirp')
-        chirp_ax[0].plot(np.real(r_rx.chirp))
-        chirp_ax[1].set_title('Ref. Spectrum')
-        chirp_ax[1].plot(db(fft(r_rx.chirp)))
-        chirp_ax[2].set_title('Matched Filter')
-        chirp_ax[2].plot(db(r_rx.mf))
-        chirp_ax[3].set_title('Range Compression')
-        chirp_ax[3].plot(r_rx.upsample_rbins,
-                         np.fft.fftshift(db(ifft(r_rx.fft_chirp * r_rx.mf, r_rx.upsample_nsam))))
+        # plt.figure('Chirp Data Ant {}'.format(ant_num))
+        try:
+            chirp_ax[0, ant_num].set_title('Ref. Chirp')
+            chirp_ax[0, ant_num].plot(np.real(r_rx.chirp))
+            chirp_ax[1, ant_num].set_title('Ref. Spectrum')
+            chirp_ax[1, ant_num].plot(db(fft(r_rx.chirp)))
+            chirp_ax[2, ant_num].set_title('Matched Filter')
+            chirp_ax[2, ant_num].plot(db(r_rx.mf))
+            chirp_ax[3, ant_num].set_title('Range Compression')
+            chirp_ax[3, ant_num].plot(r_rx.upsample_rbins,
+                                      np.fft.fftshift(db(ifft(r_rx.fft_chirp * r_rx.mf, n=r_rx.upsample_nsam))))
+        except IndexError:
+            chirp_ax[0].set_title('Ref. Chirp')
+            chirp_ax[0].plot(np.real(r_rx.chirp))
+            chirp_ax[1].set_title('Ref. Spectrum')
+            chirp_ax[1].plot(db(fft(r_rx.chirp)))
+            chirp_ax[2].set_title('Matched Filter')
+            chirp_ax[2].plot(db(r_rx.mf))
+            chirp_ax[3].set_title('Range Compression')
+            chirp_ax[3].plot(r_rx.upsample_rbins,
+                             np.fft.fftshift(db(ifft(r_rx.fft_chirp * r_rx.mf, r_rx.upsample_nsam))))
+
+        # Apply range roll-off corrections
+        if do_backproject and abs(bpjgrid[ant_num]).max() > 0:
+            dpshift_data = db(fftshift(fft(rc_data[ant_num], axis=1), axes=1))
+            med_curve = np.median(abs(bpjgrid[ant_num]), axis=0)
+            med_curve = med_curve / med_curve.max() if med_curve.max() > 0 else med_curve
+            rng_corr = 1 / np.poly1d(np.polyfit(np.arange(len(med_curve)), med_curve, 3))(np.arange(len(med_curve)))
+            med_curve = np.median(abs(bpjgrid[ant_num]), axis=1)
+            med_curve = med_curve / med_curve.max() if med_curve.max() > 0 else med_curve
+            az_corr = 1 / np.poly1d(np.polyfit(np.arange(len(med_curve)), med_curve, 3))(np.arange(len(med_curve)))
+            for az in range(len(az_corr)):
+                for rng in range(len(rng_corr)):
+                    bpjgrid[ant_num][az, rng] = bpjgrid[ant_num][az, rng] * rng_corr[rng] * az_corr[az]
+            # plt.figure('Range Profile Ant {}'.format(ant_num))
+            if ra.n_channels < 4:
+                try:
+                    rng_ax[ant_num].imshow(
+                        np.real(range_prof[ant_num][:np.arange(
+                            len(r_rx.upsample_rbins))[r_rx.upsample_rbins < rngs.max()][-1] + 5]))
+                    rng_ax[ant_num].axis('tight')
+                    # plt.figure('Backproject Ant {}'.format(ant_num))
+                    db_bpj = db(bpjgrid[ant_num]).T
+                    bpj_ax[ant_num].imshow(db_bpj, origin='lower', cmap='gray',
+                                           clim=[db_bpj.mean() - db_bpj.std() * 2, db_bpj.mean() + db_bpj.std() * 2])
+                    bpj_ax[ant_num].axis('off')
+
+                    # Calculate out image metrics
+                    met_bpj = ((db_bpj - db_bpj.mean()) / db_bpj.std() * env.data.std() + env.data.mean())
+                    dbj_hist = np.histogram(met_bpj, bins=env.bins)
+                    dbj_hist = dbj_hist[0].astype(float)
+                    dbj_hist[dbj_hist == 0] = 1e-9
+                    print('Antenna {}: HFM {:.2f} HS {:.2f}'.format(
+                        ant_num, gmean(dbj_hist) / dbj_hist.mean(),
+                        (np.percentile(dbj_hist, 75) - np.percentile(dbj_hist, 25)) /
+                        (dbj_hist.max() - dbj_hist.min())))
+
+                    # plt.figure('Doppler Shifted Data Ant {}'.format(ant_num))
+                    dopp_ax[ant_num].imshow(dpshift_data)
+                    dopp_ax[ant_num].axis('tight')
+                except TypeError:
+                    rng_ax.imshow(
+                        np.real(range_prof[ant_num][:np.arange(
+                            len(r_rx.upsample_rbins))[r_rx.upsample_rbins < rngs.max()][-1] + 5]))
+                    rng_ax.axis('tight')
+                    # plt.figure('Backproject Ant {}'.format(ant_num))
+                    db_bpj = db(bpjgrid[ant_num]).T
+                    bpj_ax.imshow(db_bpj, origin='lower', cmap='gray',
+                                  clim=[db_bpj.mean() - db_bpj.std() * 2, db_bpj.mean() + db_bpj.std() * 2])
+                    bpj_ax.axis('off')
+
+                    # plt.figure('Doppler Shifted Data Ant {}'.format(ant_num))
+                    dopp_ax.imshow(dpshift_data)
+                    dopp_ax.axis('tight')
+            else:
+                rng_ax[ant_x_plot, ant_y_plot].imshow(
+                    np.real(range_prof[ant_num][:np.arange(
+                        len(r_rx.upsample_rbins))[r_rx.upsample_rbins < rngs.max()][-1] + 5]))
+                rng_ax[ant_x_plot, ant_y_plot].axis('tight')
+                # plt.figure('Backproject Ant {}'.format(ant_num))
+                db_bpj = db(bpjgrid[ant_num]).T
+                bpj_ax[ant_x_plot, ant_y_plot].imshow(db_bpj, origin='lower', cmap='gray',
+                                                      clim=[db_bpj.mean() - db_bpj.std() * 2,
+                                                            db_bpj.mean() + db_bpj.std() * 2])
+                bpj_ax[ant_x_plot, ant_y_plot].axis('off')
+
+                # plt.figure('Doppler Shifted Data Ant {}'.format(ant_num))
+                dopp_ax[ant_x_plot, ant_y_plot].imshow(dpshift_data)
+                dopp_ax[ant_x_plot, ant_y_plot].axis('tight')
+
+            # plt.figure('Slices Ant {}'.format(ant_num))
+            try:
+                slice_ax[0, ant_num].set_title('Shifted Spectrum')
+                slice_ax[0, ant_num].plot(db(fft(pulses[ant_num][:, pca_idx], n=r_rx.fft_len)))
+                slice_ax[1, ant_num].set_title('Time Series')
+                slice_ax[1, ant_num].plot(np.real(pulses[ant_num][:, pca_idx]))
+                slice_ax[2, ant_num].set_title('Range Compression')
+                slice_ax[2, ant_num].plot(r_rx.upsample_rbins, db(rc_data[ant_num][:, pca_idx]))
+
+                # plt.figure('Pulses Ant {}'.format(ant_num))
+                pulse_ax[0, ant_num].imshow(db(pulses[ant_num]), extent=[check_tt[0], check_tt[-1],
+                                                                         ra[ant_num].range_bins[0],
+                                                                         ra[ant_num].range_bins[-1]],
+                                            origin='lower')
+                pulse_ax[0, ant_num].axis('tight')
+                pulse_ax[1, ant_num].imshow(db(rc_data[ant_num]), extent=[check_tt[0], check_tt[-1],
+                                                                          ra[ant_num].range_bins[0],
+                                                                          ra[ant_num].range_bins[-1]],
+                                            origin='lower')
+                pulse_ax[1, ant_num].axis('tight')
+            except IndexError:
+                slice_ax[0].set_title('Shifted Spectrum')
+                slice_ax[0].plot(db(fft(pulses[ant_num][:, pca_idx], n=r_rx.fft_len)))
+                slice_ax[1].set_title('Time Series')
+                slice_ax[1].plot(np.real(pulses[ant_num][:, pca_idx]))
+                slice_ax[2].set_title('Range Compression')
+                slice_ax[2].plot(r_rx.upsample_rbins, db(rc_data[ant_num][:, pca_idx]))
+
+                # plt.figure('Pulses Ant {}'.format(ant_num))
+                pulse_ax[0].imshow(db(pulses[ant_num]), extent=[check_tt[0], check_tt[-1], ra[ant_num].range_bins[0],
+                                                                ra[ant_num].range_bins[-1]],
+                                   origin='lower')
+                pulse_ax[0].axis('tight')
+                pulse_ax[1].imshow(db(rc_data[ant_num]), extent=[check_tt[0], check_tt[-1], ra[ant_num].range_bins[0],
+                                                                 ra[ant_num].range_bins[-1]],
+                                   origin='lower')
+                pulse_ax[1].axis('tight')
+
+            if n_samples == 1:
+                b0 = np.arange(ra[ant_num].upsample_nsam)[rngs.min() <= ra[ant_num].upsample_rbins][-1]
+                b1 = np.arange(ra[ant_num].upsample_nsam)[ra[ant_num].upsample_rbins <= rngs.min()][0]
+                boca = b0 if abs(
+                    ra[ant_num].upsample_rbins[b0] - rngs.min()) < \
+                    abs(ra[ant_num].upsample_rbins[b1] - rngs.min()) else b1
+                plt.figure('Cuts')
+                plt.subplot(3, 1, 1)
+                plt.title('Range')
+                plt.plot(dpshift_data[:, dpshift_data.shape[1] // 2])
+                plt.subplot(3, 1, 2)
+                plt.title('Azimuth')
+                plt.plot(dpshift_data[b1, :])
+                plt.subplot(3, 1, 3)
+                plt.title('Doppler')
+                plt.plot(np.real(rc_data[b1, :]))
 
     # Apply range roll-off corrections
-    if do_backproject and abs(bpjgrid[ant_num]).max() > 0:
-        dpshift_data = db(fftshift(fft(rc_data[ant_num], axis=1), axes=1))
-        med_curve = np.median(abs(bpjgrid[ant_num]), axis=0)
-        med_curve = med_curve / med_curve.max() if med_curve.max() > 0 else med_curve
-        rng_corr = 1 / np.poly1d(np.polyfit(np.arange(len(med_curve)), med_curve, 3))(np.arange(len(med_curve)))
-        med_curve = np.median(abs(bpjgrid[ant_num]), axis=1)
-        med_curve = med_curve / med_curve.max() if med_curve.max() > 0 else med_curve
-        az_corr = 1 / np.poly1d(np.polyfit(np.arange(len(med_curve)), med_curve, 3))(np.arange(len(med_curve)))
-        for az in range(len(az_corr)):
-            for rng in range(len(rng_corr)):
-                bpjgrid[ant_num][az, rng] = bpjgrid[ant_num][az, rng] * rng_corr[rng] * az_corr[az]
-        # plt.figure('Range Profile Ant {}'.format(ant_num))
-        if ra.n_channels < 4:
-            try:
-                rng_ax[ant_num].imshow(
-                    np.real(range_prof[ant_num][:np.arange(
-                        len(r_rx.upsample_rbins))[r_rx.upsample_rbins < rngs.max()][-1] + 5]))
-                rng_ax[ant_num].axis('tight')
-                # plt.figure('Backproject Ant {}'.format(ant_num))
-                db_bpj = db(bpjgrid[ant_num]).T
-                bpj_ax[ant_num].imshow(db_bpj, origin='lower', cmap='gray',
-                                       clim=[db_bpj.mean() - db_bpj.std() * 2, db_bpj.mean() + db_bpj.std() * 2])
-                bpj_ax[ant_num].axis('off')
+    if do_backproject:
+        ov_bpj = np.sum(bpjgrid, axis=0)
+        if abs(ov_bpj).max() > 0:
+            med_curve = np.median(abs(ov_bpj), axis=0)
+            med_curve = med_curve / med_curve.max() if med_curve.max() > 0 else med_curve
+            rng_corr = 1 / np.poly1d(np.polyfit(np.arange(len(med_curve)), med_curve, 3))(np.arange(len(med_curve)))
+            med_curve = np.median(abs(ov_bpj), axis=1)
+            med_curve = med_curve / med_curve.max() if med_curve.max() > 0 else med_curve
+            az_corr = 1 / np.poly1d(np.polyfit(np.arange(len(med_curve)), med_curve, 3))(np.arange(len(med_curve)))
+            for az in range(len(az_corr)):
+                for rng in range(len(rng_corr)):
+                    ov_bpj[az, rng] = ov_bpj[az, rng] * rng_corr[rng] * az_corr[az]
 
-                # Calculate out image metrics
-                met_bpj = ((db_bpj - db_bpj.mean()) / db_bpj.std() * env.data.std() + env.data.mean())
-                dbj_hist = np.histogram(met_bpj, bins=env.bins)
-                dbj_hist = dbj_hist[0].astype(float)
-                dbj_hist[dbj_hist == 0] = 1e-9
-                print('Antenna {}: HFM {:.2f} HS {:.2f}'.format(
-                    ant_num, gmean(dbj_hist) / dbj_hist.mean(),
-                    (np.percentile(dbj_hist, 75) - np.percentile(dbj_hist, 25)) / (dbj_hist.max() - dbj_hist.min())))
+            db_bpj = db(ov_bpj).T
+            plt.figure('Overall Backprojection')
+            plt.imshow(db_bpj, origin='lower', cmap='gray',
+                       clim=[db_bpj.mean() - db_bpj.std() * 2, db_bpj.mean() + db_bpj.std() * 2])
+            plt.axis('off')
 
-                # plt.figure('Doppler Shifted Data Ant {}'.format(ant_num))
-                dopp_ax[ant_num].imshow(dpshift_data)
-                dopp_ax[ant_num].axis('tight')
-            except TypeError:
-                rng_ax.imshow(
-                    np.real(range_prof[ant_num][:np.arange(
-                        len(r_rx.upsample_rbins))[r_rx.upsample_rbins < rngs.max()][-1] + 5]))
-                rng_ax.axis('tight')
-                # plt.figure('Backproject Ant {}'.format(ant_num))
-                db_bpj = db(bpjgrid[ant_num]).T
-                bpj_ax.imshow(db_bpj, origin='lower', cmap='gray',
-                              clim=[db_bpj.mean() - db_bpj.std() * 2, db_bpj.mean() + db_bpj.std() * 2])
-                bpj_ax.axis('off')
+    plt.figure('Original Data')
+    plt.imshow(db(env.data), origin='lower', cmap='gray', clim=[40, 100])
 
-                # plt.figure('Doppler Shifted Data Ant {}'.format(ant_num))
-                dopp_ax.imshow(dpshift_data)
-                dopp_ax.axis('tight')
-        else:
-            rng_ax[ant_x_plot, ant_y_plot].imshow(
-                np.real(range_prof[ant_num][:np.arange(
-                    len(r_rx.upsample_rbins))[r_rx.upsample_rbins < rngs.max()][-1] + 5]))
-            rng_ax[ant_x_plot, ant_y_plot].axis('tight')
-            # plt.figure('Backproject Ant {}'.format(ant_num))
-            db_bpj = db(bpjgrid[ant_num]).T
-            bpj_ax[ant_x_plot, ant_y_plot].imshow(db_bpj, origin='lower', cmap='gray',
-                                                  clim=[db_bpj.mean() - db_bpj.std() * 2,
-                                                        db_bpj.mean() + db_bpj.std() * 2])
-            bpj_ax[ant_x_plot, ant_y_plot].axis('off')
+    '''
+    plt.figure('Interpolated DTED')
+    plt.imshow(env.hdata - env.scp[2], origin='lower')
+    '''
 
-            # plt.figure('Doppler Shifted Data Ant {}'.format(ant_num))
-            dopp_ax[ant_x_plot, ant_y_plot].imshow(dpshift_data)
-            dopp_ax[ant_x_plot, ant_y_plot].axis('tight')
+    if n_samples != 1:
+        fig, ax = plt.subplots(num='Samples')
+        ax.scatter(gx, gy, s=.1, c=db(gv))
+        rect = patches.Rectangle((bx.min(), by.min()), bpj_size[0], bpj_size[1], linewidth=1, edgecolor='r',
+                                 facecolor='none')
+        ax.add_patch(rect)
 
-        # plt.figure('Slices Ant {}'.format(ant_num))
-        try:
-            slice_ax[0, ant_num].set_title('Shifted Spectrum')
-            slice_ax[0, ant_num].plot(db(fft(pulses[ant_num][:, pca_idx], n=r_rx.fft_len)))
-            slice_ax[1, ant_num].set_title('Time Series')
-            slice_ax[1, ant_num].plot(np.real(pulses[ant_num][:, pca_idx]))
-            slice_ax[2, ant_num].set_title('Range Compression')
-            slice_ax[2, ant_num].plot(r_rx.upsample_rbins, db(rc_data[ant_num][:, pca_idx]))
+    amb_fig = plt.figure('Ambiguity')
+    rads = [pair for pair in combinations(ra.channels, 2)]
+    rad_labs = [pair for pair in combinations(np.arange(len(ra)), 2)]
+    nplots = ra.n_channels + len(rads)
+    nrad = 1
+    for n, rx in enumerate(ra):
+        amb = ambiguity(rx.chirp, rx.chirp, rx.prf, 64, mag=False)
+        ax = amb_fig.add_subplot(2, ra.n_channels, nrad)
+        ax.imshow(db(amb[0]), cmap='jet', extent=[amb[1][0], amb[1][-1], amb[2][-1], amb[2][0]])
+        plt.axis('tight')
+        nrad += 1
 
-            # plt.figure('Pulses Ant {}'.format(ant_num))
-            pulse_ax[0, ant_num].imshow(db(pulses[ant_num]), extent=[check_tt[0], check_tt[-1],
-                                                                     ra[ant_num].range_bins[0],
-                                                                     ra[ant_num].range_bins[-1]],
-                                        origin='lower')
-            pulse_ax[0, ant_num].axis('tight')
-            pulse_ax[1, ant_num].imshow(db(rc_data[ant_num]), extent=[check_tt[0], check_tt[-1],
-                                                                      ra[ant_num].range_bins[0],
-                                                                      ra[ant_num].range_bins[-1]],
-                                        origin='lower')
-            pulse_ax[1, ant_num].axis('tight')
-        except IndexError:
-            slice_ax[0].set_title('Shifted Spectrum')
-            slice_ax[0].plot(db(fft(pulses[ant_num][:, pca_idx], n=r_rx.fft_len)))
-            slice_ax[1].set_title('Time Series')
-            slice_ax[1].plot(np.real(pulses[ant_num][:, pca_idx]))
-            slice_ax[2].set_title('Range Compression')
-            slice_ax[2].plot(r_rx.upsample_rbins, db(rc_data[ant_num][:, pca_idx]))
+    for n, pair in enumerate(rads):
+        amb = ambiguity(pair[0].chirp, pair[1].chirp, pair[0].prf, 64, mag=False)
+        ax = amb_fig.add_subplot(2, ra.n_channels, nrad)
+        ax.set_title('{}, {}'.format(*rad_labs[n]))
+        ax.imshow(db(amb[0]), cmap='jet', extent=[amb[1][0], amb[1][-1], amb[2][-1], amb[2][0]])
+        plt.axis('tight')
+        nrad += 1
 
-            # plt.figure('Pulses Ant {}'.format(ant_num))
-            pulse_ax[0].imshow(db(pulses[ant_num]), extent=[check_tt[0], check_tt[-1], ra[ant_num].range_bins[0],
-                                                            ra[ant_num].range_bins[-1]],
-                               origin='lower')
-            pulse_ax[0].axis('tight')
-            pulse_ax[1].imshow(db(rc_data[ant_num]), extent=[check_tt[0], check_tt[-1], ra[ant_num].range_bins[0],
-                                                             ra[ant_num].range_bins[-1]],
-                               origin='lower')
-            pulse_ax[1].axis('tight')
+    plt.show()
 
-        if n_samples == 1:
-            b0 = np.arange(ra[ant_num].upsample_nsam)[rngs.min() <= ra[ant_num].upsample_rbins][-1]
-            b1 = np.arange(ra[ant_num].upsample_nsam)[ra[ant_num].upsample_rbins <= rngs.min()][0]
-            boca = b0 if abs(
-                ra[ant_num].upsample_rbins[b0] - rngs.min()) < abs(ra[ant_num].upsample_rbins[b1] - rngs.min()) else b1
-            plt.figure('Cuts')
-            plt.subplot(3, 1, 1)
-            plt.title('Range')
-            plt.plot(dpshift_data[:, dpshift_data.shape[1] // 2])
-            plt.subplot(3, 1, 2)
-            plt.title('Azimuth')
-            plt.plot(dpshift_data[b1, :])
-            plt.subplot(3, 1, 3)
-            plt.title('Doppler')
-            plt.plot(np.real(rc_data[b1, :]))
+    pnum = np.arange(len(check_pnum))[p_hasRFI[check_pnum].astype(bool)][0] if np.any(p_hasRFI[check_pnum]) else 0
+    stft_data = np.fft.fftshift(stft(pulses[0][:, pnum], return_onesided=False)[2], axes=0)
 
-# Apply range roll-off corrections
-if do_backproject:
-    ov_bpj = np.sum(bpjgrid, axis=0)
-    if abs(ov_bpj).max() > 0:
-        med_curve = np.median(abs(ov_bpj), axis=0)
-        med_curve = med_curve / med_curve.max() if med_curve.max() > 0 else med_curve
-        rng_corr = 1 / np.poly1d(np.polyfit(np.arange(len(med_curve)), med_curve, 3))(np.arange(len(med_curve)))
-        med_curve = np.median(abs(ov_bpj), axis=1)
-        med_curve = med_curve / med_curve.max() if med_curve.max() > 0 else med_curve
-        az_corr = 1 / np.poly1d(np.polyfit(np.arange(len(med_curve)), med_curve, 3))(np.arange(len(med_curve)))
-        for az in range(len(az_corr)):
-            for rng in range(len(rng_corr)):
-                ov_bpj[az, rng] = ov_bpj[az, rng] * rng_corr[rng] * az_corr[az]
-
-        db_bpj = db(ov_bpj).T
-        plt.figure('Overall Backprojection')
-        plt.imshow(db_bpj, origin='lower', cmap='gray',
-                   clim=[db_bpj.mean() - db_bpj.std() * 2, db_bpj.mean() + db_bpj.std() * 2])
-        plt.axis('off')
-
-plt.figure('Original Data')
-plt.imshow(db(env.data), origin='lower', cmap='gray', clim=[40, 100])
-
-'''
-plt.figure('Interpolated DTED')
-plt.imshow(env.hdata - env.scp[2], origin='lower')
-'''
-
-if n_samples != 1:
-    fig, ax = plt.subplots(num='Samples')
-    ax.scatter(gx, gy, s=.1, c=db(gv))
-    rect = patches.Rectangle((bx.min(), by.min()), bpj_size[0], bpj_size[1], linewidth=1, edgecolor='r',
-                             facecolor='none')
-    ax.add_patch(rect)
-
-amb_fig = plt.figure('Ambiguity')
-rads = [pair for pair in combinations(ra.channels, 2)]
-rad_labs = [pair for pair in combinations(np.arange(len(ra)), 2)]
-nplots = ra.n_channels + len(rads)
-nrad = 1
-for n, rx in enumerate(ra):
-    amb = ambiguity(rx.chirp, rx.chirp, rx.prf, 64, mag=False)
-    ax = amb_fig.add_subplot(2, ra.n_channels, nrad)
-    ax.imshow(db(amb[0]), cmap='jet', extent=[amb[1][0], amb[1][-1], amb[2][-1], amb[2][0]])
+    plt.figure('Pulse Examination')
+    plt.subplot(2, 1, 1)
+    plt.imshow(db(stft_data))
     plt.axis('tight')
-    nrad += 1
-
-for n, pair in enumerate(rads):
-    amb = ambiguity(pair[0].chirp, pair[1].chirp, pair[0].prf, 64, mag=False)
-    ax = amb_fig.add_subplot(2, ra.n_channels, nrad)
-    ax.set_title('{}, {}'.format(*rad_labs[n]))
-    ax.imshow(db(amb[0]), cmap='jet', extent=[amb[1][0], amb[1][-1], amb[2][-1], amb[2][0]])
-    plt.axis('tight')
-    nrad += 1
-
-plt.show()
-
-pnum = 10
-stft_data = np.fft.fftshift(stft(pulses[0][:, pnum])[2], axes=0)
-
-plt.figure('Pulse Examination')
-plt.subplot(2, 1, 1)
-plt.imshow(db(stft_data))
-plt.axis('tight')
-plt.subplot(2, 1, 2)
-plt.magnitude_spectrum(pulses[0][:, pnum], pad_to=findPowerOf2(sdr_f[0].nsam), window=lambda x: x, Fs=2e9)
-
-'''
-tsd = gaussian_filter(sobel(env.data), sigma=15)
-grads = np.gradient(tsd)
-gx = np.random.rand(100000) * env.shape[0] - env.shape[0] / 2
-gy = np.random.rand(100000) * env.shape[1] - env.shape[1] / 2
-
-gx_mov = gx + env(gx, gy, override_data=grads[0])[1] * .9
-gy_mov = gy + env(gx, gy, override_data=grads[1])[1] * .9
-
-plt.figure(); plt.quiver(gy, gx, env(gx, gy, override_data=-grads[1])[1], env(gx, gy, override_data=-grads[0])[1])
-
-plt.figure()
-plt.scatter(gy, gx, s=.1)
-plt.scatter(gy_mov, gx_mov, s=.1)
-
-plt.figure()
-plt.imshow(env.data, origin='lower')
-
-plt.figure()
-plt.imshow(tsd, origin='lower')
-'''
-
+    plt.subplot(2, 1, 2)
+    plt.magnitude_spectrum(pulses[0][:, pnum], pad_to=findPowerOf2(sdr_f[0].nsam), window=lambda x: x, Fs=2e9)
