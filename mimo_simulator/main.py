@@ -29,8 +29,8 @@ import matplotlib.patches as patches
 from matplotlib import cm
 from pathlib import Path
 
-from radar import XMLRadar, ConfigRadar, RadarArray, ambiguity, genPulse, Platform, XMLChannel, \
-    Antenna, getTVSignal, getWidebandSignal
+from radar import ambiguity, genPulse, XMLPlatform, SimPlatform, XMLChannel, \
+    SimChannel, Antenna, getTVSignal, getWidebandSignal
 from rawparser import loadReferenceChirp, loadMatchedFilter, loadASHFile, getRawDataGen, getRawSDRParams
 from simlib import getElevation, enu2llh
 from useful_lib import findAllFilenames, factors, db, findPowerOf2, gaus
@@ -107,7 +107,7 @@ cust_bg = '/home/jeff/Downloads/josh.png'
 threads_per_block = (16, 16)
 upsample = 1
 chunk_sz = 256
-n_samples = 1000000
+n_samples = 2000000
 presum = 1
 noise_level = 0.1
 poly_interp = 1
@@ -117,7 +117,7 @@ n_rfi_pts = 2
 rfi_perc = .35
 wb_rfi_pts = 1
 wrfi_perc = .15
-subgrid_size = (455, 455)
+subgrid_size = (255, 255)
 bpj_size = (150, 150)
 rand_method = 'contrast'
 scp = (40.098785, -111.659957)
@@ -172,7 +172,7 @@ else:
     else:
         ash_fnme = files['ash']
         asi_fnme = files['asi']
-    env = Environment(ashfile=ash_fnme, asifile=asi_fnme, subgrid_size=subgrid_size, dec_fac=8)
+    env = Environment(llr=scp_el, ashfile=ash_fnme, asifile=asi_fnme, subgrid_size=subgrid_size, dec_fac=8)
 shift_gpu = cupy.array(np.ascontiguousarray([[0, 0]]), dtype=np.float64)
 scp_offsets = env.getOffset(*scp, False)
 
@@ -182,16 +182,35 @@ print('Loading radar list...')
 # (np.linspace(0, 1, 100), np.array([0, 0, 0]))
 # Load in from Strider:
 # ('/home/jeff/repo/mimo_simulator/waveforms/p4_400_300.wave', np.array([10, 1, 15]))
-ra_pos = [np.linspace(0, 1, 100)]
 sdr_f = SDRParse(files['sar'])
-ra = Platform(fnme, env.scp, use_xml_flightpath=False, sarfile=sdr_f)
+params = {'Flight_Line_Altitude_M': 1524.00,
+          'Gimbal_Settings': {'Gimbal_Depression_Angle_D': 45.00, 'Gimbal_X_Offset_M': -.3461,
+                                'Gimbal_Y_Offset_M': 1.3966, 'Gimbal_Z_Offset_M': -1.2522, 'Roll_D': 0.00,
+                                'Pitch_D': 0.00, 'Yaw_D': -90.00},
+          'Antenna_Settings': {'Antenna_0':
+                                   {'Antenna_X_Offset_M': -.2241, 'Antenna_Y_Offset_M': 0.0,
+                                    'Antenna_Z_Offset_M': .1344, 'Azimuth_Beamwidth_D': 27.72,
+                                    'Elevation_Beamwidth_D': 30.00, 'Doppler_Beamwidth_D': 40.00,
+                                    'Antenna_Depression_Angle_D': 45.00},
+                               'Antenna_1':
+                                   {'Antenna_X_Offset_M': -.2241, 'Antenna_Y_Offset_M': 1.0,
+                                    'Antenna_Z_Offset_M': .1344, 'Azimuth_Beamwidth_D': 27.72,
+                                    'Elevation_Beamwidth_D': 30.00, 'Doppler_Beamwidth_D': 40.00,
+                                    'Antenna_Depression_Angle_D': 45.00}
+                               }}
+gimbal = sdr_f.gimbal
+gimbal['pan'] = gimbal['pan'] + np.linspace(-1, 1, gimbal.shape[0])**2 / 100
+# ra = SimPlatform(env.scp, sdr_f.gps_data, gimbal, params)
+ra = XMLPlatform(fnme, env.scp, sarfile=sdr_f)
+ra_pos = [(np.linspace(0, 1, 100), XMLChannel(sdr_f.xml['Channel_0'], sdr_f[0], env.scp, ra.alt, 0, presum=1)),
+          (np.linspace(1, 0, 100), SimChannel(env.scp, ra, 1500e6, 10e9, 50.0, 40.0, 15.00, trans_port=1, rec_port=1))]
 for idx, sr in enumerate(ra_pos):
-    ra.addChannel(XMLChannel(sdr_f.xml['Channel_0'], sdr_f[0], env.scp, ra.alt, 0, presum=1))
+    ra.addChannel(sr[1])
     try:
-        ra[idx].genChirp(px=np.linspace(0, 1, 100), py=sr)
+        ra[idx].genChirp(px=np.linspace(0, 1, 100), py=sr[0])
         # ra[idx].loadChirp(sdr_f[idx].ref_chirp)
     except ValueError:
-        ra[idx].loadChirpFromFile(sr)
+        ra[idx].loadChirpFromFile(sr[0])
 
 # Make sure to upsample in case our backprojection is wanted
 ra.upsample(upsample)
@@ -201,7 +220,6 @@ n_frames = ra[0].nframes
 rc_data = [None for n in ra]
 range_prof = [None for n in ra]
 pulses = [None for n in ra]
-n_pulses = len(ra.times)
 
 # Load memory for CUDA processing
 mempool = cupy.get_default_memory_pool()
@@ -728,12 +746,13 @@ if display_figures:
 
     plt.show()
 
-    pnum = np.arange(len(check_pnum))[p_hasRFI[check_pnum].astype(bool)][0] if np.any(p_hasRFI[check_pnum]) else 0
-    stft_data = np.fft.fftshift(stft(pulses[0][:, pnum], return_onesided=False)[2], axes=0)
+    if introduce_rfi:
+        pnum = np.arange(len(check_pnum))[p_hasRFI[check_pnum].astype(bool)][0] if np.any(p_hasRFI[check_pnum]) else 0
+        stft_data = np.fft.fftshift(stft(pulses[0][:, pnum], return_onesided=False)[2], axes=0)
 
-    plt.figure('Pulse Examination')
-    plt.subplot(2, 1, 1)
-    plt.imshow(db(stft_data))
-    plt.axis('tight')
-    plt.subplot(2, 1, 2)
-    plt.magnitude_spectrum(pulses[0][:, pnum], pad_to=findPowerOf2(sdr_f[0].nsam), window=lambda x: x, Fs=2e9)
+        plt.figure('Pulse Examination')
+        plt.subplot(2, 1, 1)
+        plt.imshow(db(stft_data))
+        plt.axis('tight')
+        plt.subplot(2, 1, 2)
+        plt.magnitude_spectrum(pulses[0][:, pnum], pad_to=findPowerOf2(sdr_f[0].nsam), window=lambda x: x, Fs=2e9)

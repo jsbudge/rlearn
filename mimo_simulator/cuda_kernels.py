@@ -3,7 +3,6 @@ import math
 import numpy as np
 
 from numba import cuda, vectorize
-# from numba.cuda import create_xoroshiro128p_states, xoroshiro128p_uniform_float64
 
 c0 = 299792458.0
 
@@ -20,8 +19,8 @@ def raisedCosine(x, bw, a0):
     return a0 - (1 - a0) * math.cos(2 * np.pi * xf)
 
 
-@cuda.jit('void(float64[:], float64[:], float64[:], float64[:], float64[:], float64[:], float64[:], float64[:], '
-          'float64[:], float64[:], complex128[:], complex128[:], float64[:], float64[:], float64[:])')
+@cuda.jit('void(float64[:, :], float64[:, :], float64[:], float64[:], float64[:], float64[:], float64[:], float64[:], ' +
+          'float64[:], float64[:], float64[:, :], float64[:, :], float64[:, :], float64[:], float64[:])')
 def genRangeProfile(tx_path, rx_path, gx, gy, gz, gv, rx_pan, tx_pan, rx_tilt, tx_tilt, pd_r, pd_i, shift, p_rx, p_tx):
     tt, samp_point = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and samp_point < gx.size:
@@ -186,30 +185,3 @@ def backproject(tx_path, rx_path, gx, gy, gz,
             exp_phase = k * (tx_rng + rx_rng)
             acc_val += a * cmath.exp(1j * exp_phase) * att * az_win
         final_grid[px, py] = acc_val
-
-
-@cuda.jit
-def interpolate(params, pulses, interp_pulses):
-    pulse, i_bin = cuda.grid(2)
-    if pulse < interp_pulses.shape[1] and i_bin < params[0]:
-        bi = i_bin * params[3]
-        bi0 = max(int(math.floor(i_bin * params[3])), 0)
-        bi1 = min(int(math.ceil(i_bin * params[3])), int(params[0]))
-        pi0 = pulses[bi0, pulse]
-        pi1 = pulses[bi1, pulse]
-        interp_pulses[i_bin, pulse] = pi0 * (bi1 - bi) + pi1 * (bi - bi0)
-
-
-@cuda.jit
-def genDoppProfile(f_path, rpan, gx, gy, times, pd_r, pd_i, params):
-    tt, samp_point = cuda.grid(ndim=2)
-    if tt < pd_r.size and samp_point < gx.size:
-        # Get LOS vector in XYZ and spherical coordinates at pulse time
-        sh_x = f_path[0, tt] - gx[samp_point]
-        sh_y = f_path[1, tt] - gy[samp_point]
-        az_to_target = math.atan2(sh_x, sh_y)
-        azdiff = diff(az_to_target, rpan[tt])
-        fd = params[3] * math.cos(azdiff) / (params[2] * np.pi)
-        val = cmath.exp(-1j * fd * times[tt])
-        cuda.atomic.add(pd_r, np.uint64(tt), val.real)
-        cuda.atomic.add(pd_i, np.uint64(tt), val.imag)
