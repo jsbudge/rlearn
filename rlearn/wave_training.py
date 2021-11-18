@@ -9,9 +9,9 @@ from celluloid import Camera
 from useful_lib import findPowerOf2, db
 from tftb.processing import WignerVilleDistribution
 
-games = 1
+games = 100
 eval_games = 1
-max_timesteps = 400
+max_timesteps = 500
 
 # Pre-defined or custom environment
 env = Environment.create(
@@ -87,8 +87,8 @@ for l in logs[::2]:
         amp = []
         pcols = []
         for t in l[2]:
-            spow, loc = s(t)
-            pos.append(loc)
+            spow, loc1, loc2 = s(t)
+            pos.append([loc1, loc2])
             amp.append(spow + 1)
             pcols.append(cols[idx] if spow == 0 else up_cols[idx])
         pos = np.array(pos)
