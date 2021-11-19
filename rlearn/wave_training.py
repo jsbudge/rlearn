@@ -1,17 +1,26 @@
 from tensorforce import Agent, Environment
-from tensorforce.core.networks import AutoNetwork
 from wave_env import SinglePulseBackground, genPulse
 import numpy as np
 from scipy.signal.windows import taylor
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from celluloid import Camera
-from useful_lib import findPowerOf2, db
 from tftb.processing import WignerVilleDistribution
+
+
+def db(x):
+    ret = abs(x)
+    ret[ret == 0] = 1e-9
+    return 20 * np.log10(ret)
+
+
+def findPowerOf2(x):
+    return int(2**(np.ceil(np.log2(x))))
+
 
 games = 100
 eval_games = 1
-max_timesteps = 500
+max_timesteps = 100
 
 # Pre-defined or custom environment
 env = Environment.create(

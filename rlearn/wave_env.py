@@ -1,26 +1,29 @@
-from tensorforce import Agent, Environment
-from radar import SimPlatform, SimChannel, Antenna
+from tensorforce import Environment
 import numpy as np
-import pandas as pd
-from itertools import combinations
 from tqdm import tqdm
 from scipy.signal.windows import taylor
-from scipy.signal import convolve2d, find_peaks
-from scipy.ndimage import rotate, gaussian_filter, label
+from scipy.ndimage import gaussian_filter
 from tftb.processing import WignerVilleDistribution
-from scipy.ndimage.filters import median_filter
 from scipy.ndimage import binary_dilation, binary_erosion
 import matplotlib.pyplot as plt
-from scipy.interpolate import CubicSpline, UnivariateSpline
-from numba import vectorize, cuda
+from scipy.interpolate import UnivariateSpline
+from numba import cuda
 import cmath
 import math
 import cupy as cupy
 
 from celluloid import Camera
 
-from rawparser import loadASHFile, loadASIFile
-from useful_lib import findPowerOf2, db
+
+def db(x):
+    ret = abs(x)
+    ret[ret == 0] = 1e-9
+    return 20 * np.log10(ret)
+
+
+def findPowerOf2(x):
+    return int(2**(np.ceil(np.log2(x))))
+
 
 c0 = 299792458.0
 TAC = 125e6
@@ -53,16 +56,16 @@ class SinglePulseBackground(Environment):
     def __init__(self):
         super().__init__()
         self.cpi_len = 64
-        self.az_bw = 20 * DTR
+        self.az_bw = 12 * DTR
         self.el_bw = 12 * DTR
         self.dep_ang = 45 * DTR
         self.alt = 1524
         self.plp = .4
         self.fc = 9.6e9
-        self.samples = 50000
-        self.fs = fs / 8
+        self.samples = 200000
+        self.fs = fs / 4
         self.bw = 200e6
-        self.scanRate = 36 * DTR
+        self.scanRate = 45 * DTR
         self.scanDir = 1
         self.az_pt = np.pi / 2
         self.reset()
@@ -168,7 +171,7 @@ class SinglePulseBackground(Environment):
                 (cupy.fft.fft(data, self.fft_len, axis=0) * chirp_gpu * (chirp_gpu * win_gpu).conj()),
                 axis=0)[:self.nsam, :], axis=1)
         cupy.cuda.Device().synchronize()
-        rd_cpu = ret_data.get()
+        rd_cpu = ret_data.get() * taylor(self.cpi_len)[None, :]
 
         del ret_data
         del pan_gpu
@@ -230,8 +233,8 @@ class SimEnv(object):
         self.targets = []
         self.genFlightPath()
         for n in range(np.random.randint(1, 5)):
-            self.targets.append(Sub(-self.eswath / 2, self.eswath + self.eswath / 2,
-                                    -self.swath / 2, self.swath + self.swath / 2))
+            self.targets.append(Sub(0, self.eswath,
+                                    0, self.swath))
 
     def genFlightPath(self):
         # We start assuming that the bottom left corner of scene is (0, 0, 0) ENU
@@ -274,20 +277,20 @@ class Sub(object):
         self.ybounds = (min_y, max_y)
 
     def __call__(self, t):
-        pow = 1
+        pow = 0
         t0 = (t - self.tk)
         self.t_s += t0
         # Check to see if it surfaces
         if self.surfaced:
-            pow = 20
+            pow = 50
             if self.t_s > .25:
-                if np.random.rand() < .05:
-                    self.surfaced = False
+                #if np.random.rand() < .05:
+                self.surfaced = False
                 self.t_s = 0
         else:
             if self.t_s > .25:
-                if np.random.rand() < .05:
-                    self.surfaced = True
+                #if np.random.rand() < .05:
+                self.surfaced = True
                 self.t_s = 0
         acc_dir = (np.random.rand(2) - .5)
         accels = acc_dir / np.linalg.norm(acc_dir) * MAX_ALFA_ACCEL * np.random.rand()
@@ -319,8 +322,13 @@ class Sub(object):
 
 @cuda.jit(device=True)
 def wavefunction(x, y, t):
-    return .25 * cmath.exp(1j * (.15 * x + .15 * y + 2 * np.pi * 10 * t)) + \
-        .47 * cmath.exp(1j * (.45 * x + .15 * y + 2 * np.pi * 110 * t))
+    return .25 * cmath.exp(1j * (.70710678 / 100 * x + .70710678 / 100 * y + 2 * np.pi * .1 * t)) + \
+        .47 * cmath.exp(1j * (0.9486833 / 40 * x + 0.31622777 / 40 * y + 2 * np.pi * 10 * t))
+
+
+def wave_cpu(x, y, t):
+    return .25 * np.exp(1j * (.70710678 / 100 * x + .70710678 / 100 * y + 2 * np.pi * .1 * t)) + \
+        .47 * np.exp(1j * (0.9486833 / 40 * x + 0.31622777 / 40 * y + 2 * np.pi * 10 * t))
 
 
 @cuda.jit(device=True)
@@ -358,7 +366,7 @@ def genRangeProfile(path, gx, gy, pan, t, pd_r, pd_i, params):
             tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
             tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
             att = tx_elpat * tx_azpat
-            acc_val = wp.imag * att * cmath.exp(-1j * wavenumber * rng * 2) * 1.0 / (rng * 2)
+            acc_val = wp.imag * att * cmath.exp(-1j * wavenumber * rng * 2) * 1 / (rng * rng)
             cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
             cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
@@ -391,7 +399,7 @@ def genSubProfile(path, subs, pan, pd_r, pd_i, params):
             tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
             tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
             att = tx_elpat * tx_azpat
-            acc_val = spow * att * cmath.exp(-1j * wavenumber * rng * 2) * 1.0 / (rng * 2)
+            acc_val = spow * att * cmath.exp(-1j * wavenumber * rng * 2) * 1 / (rng * rng)
             cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
             cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
@@ -422,28 +430,32 @@ if __name__ == '__main__':
 
     pulse = agent.genChirp(np.linspace(0, 1, 10), agent.bw)
 
-    for cpi in tqdm(range(1500)):
-        cpi_data, done, reward = agent.execute({'wave': np.linspace(0, 1, 10), 'radar': [300]})
+    for cpi in tqdm(range(200)):
+        cpi_data, done, reward = agent.execute({'wave': np.linspace(0, 1, 10), 'radar': [100]})
         #print(agent.az_pt / DTR)
 
     logs = agent.log
-    skips = 5
+    skips = 2
     cols = ['blue', 'red', 'orange', 'yellow', 'green']
     fig, axes = plt.subplots(2)
     axes[1].set_xlim([-agent.env.eswath / 2, agent.env.eswath * 1.5])
-    axes[1].set_ylim([-agent.env.swath / 2, agent.env.swath * 1.5])
+    axes[1].set_ylim([-agent.env.gnrange, agent.env.gfrange])
     camera = Camera(fig)
     for log_idx, l in tqdm(enumerate(logs[::skips])):
-        fpos = agent.env.pos(l[2])
+        fpos = agent.env.pos(l[2][0])
         main_beam = ellipse(*(list(agent.env.getAntennaBeamLocation(l[2][0], l[3][0])) + [l[3][0]]))
         axes[1].plot(main_beam[0, :], main_beam[1, :], 'gray')
+        axes[1].scatter(fpos[0], fpos[1], marker='*', c='blue')
         for idx, s in enumerate(agent.env.targets):
-            pos = np.array(s.pos[log_idx * agent.cpi_len * skips:log_idx * agent.cpi_len * skips + agent.cpi_len])
-            amp = np.array(s.surf[log_idx * agent.cpi_len * skips:log_idx * agent.cpi_len * skips + agent.cpi_len]) + 1
+            pos = np.array(s.pos[log_idx * agent.cpi_len * skips])
+            amp = np.array(s.surf[log_idx * agent.cpi_len * skips]) + 1
             if len(s.pos) > 0:
-                axes[1].scatter(pos[:, 0], pos[:, 1], s=amp, c=cols[idx])
+                zx = wave_cpu(pos[0], pos[1], l[2][0])
+                plt_rng = np.linalg.norm(fpos - np.array([pos[0], pos[1], zx.real]))
+                axes[1].scatter(pos[0], pos[1], s=amp, c=cols[idx])
+                axes[1].text(pos[0], pos[1], f'{plt_rng:.2f}', c='black')
         axes[1].legend([f'{l[2][0]:.6f}-{l[2][-1]:.6f}'])
-        axes[0].imshow(l[0], origin='lower',
+        axes[0].imshow(np.fft.fftshift(l[0], axes=1), origin='lower',
                        extent=[0, agent.cpi_len, agent.env.nrange, agent.env.frange])
         axes[0].axis('tight')
         camera.snap()
@@ -465,3 +477,16 @@ if __name__ == '__main__':
     print(f'Detect\t\t{dbw * agent.fs / 1e6:.2f}\t\t{dt0 / agent.fs * 1e6:.2f}')
     print(f'Truth \t\t{agent.bw / 1e6:.2f}\t\t{agent.nr / agent.fs * 1e6:.2f}')
     print(f'Diffs \t\t{abs(agent.bw - dbw * agent.fs) / 1e6:.2f}\t\t{abs(agent.nr - dt0) * 1e6 / agent.fs:.2f}')
+
+    '''fig_wave = plt.figure('Waves')
+    gx, gy = np.meshgrid(np.linspace(-agent.env.eswath / 2, agent.env.eswath * 1.5, 1000),
+                         np.linspace(-agent.env.swath / 2, agent.env.swath * 1.5, 1000))
+    ax = plt.axes()
+    cam_wave = Camera(fig_wave)
+    for log_idx, l in tqdm(enumerate(logs[::skips])):
+        wav_vals = wave_cpu(gx, gy, l[2][0])
+        ax.imshow(wav_vals.real)
+        cam_wave.snap()
+
+    anim_wave = cam_wave.animate()'''
+
