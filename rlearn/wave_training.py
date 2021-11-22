@@ -1,5 +1,5 @@
 from tensorforce import Agent, Environment
-from wave_env import SinglePulseBackground, genPulse
+from wave_env import SinglePulseBackground, genPulse, ambiguity
 import numpy as np
 from scipy.signal.windows import taylor
 from tqdm import tqdm
@@ -18,9 +18,9 @@ def findPowerOf2(x):
     return int(2**(np.ceil(np.log2(x))))
 
 
-games = 100
+games = 5
 eval_games = 1
-max_timesteps = 100
+max_timesteps = 400
 
 # Pre-defined or custom environment
 env = Environment.create(
@@ -110,3 +110,14 @@ for l in logs[::2]:
 
 animation = camera.animate()
 animation.save('test.mp4')
+
+window_pulse = np.fft.ifft(fftpulse * taylor(findPowerOf2(nr)))
+amb = ambiguity(pulse, window_pulse, actions['radar'][0] * 2, 150)
+
+plt.figure('Ambiguity')
+plt.subplot(3, 1, 1)
+plt.imshow(amb[0])
+plt.subplot(3, 1, 2)
+plt.plot(amb[0][:, 75])
+plt.subplot(3, 1, 3)
+plt.plot(amb[0][75, :])

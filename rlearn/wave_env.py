@@ -7,7 +7,8 @@ from tftb.processing import WignerVilleDistribution
 from scipy.ndimage import binary_dilation, binary_erosion
 import matplotlib.pyplot as plt
 from scipy.interpolate import UnivariateSpline
-from numba import cuda
+from numba import cuda, njit
+from tensorflow import keras
 import cmath
 import math
 import cupy as cupy
@@ -55,7 +56,7 @@ class SinglePulseBackground(Environment):
 
     def __init__(self):
         super().__init__()
-        self.cpi_len = 64
+        self.cpi_len = 128
         self.az_bw = 12 * DTR
         self.el_bw = 12 * DTR
         self.dep_ang = 45 * DTR
@@ -63,8 +64,8 @@ class SinglePulseBackground(Environment):
         self.plp = .4
         self.fc = 9.6e9
         self.samples = 200000
-        self.fs = fs / 4
-        self.bw = 200e6
+        self.fs = fs / 8
+        self.bw = 100e6
         self.scanRate = 45 * DTR
         self.scanDir = 1
         self.az_pt = np.pi / 2
@@ -72,6 +73,7 @@ class SinglePulseBackground(Environment):
         self.data_block = (self.nsam, self.cpi_len)
         MPP = c0 / 2 / self.fs
         self.range_bins = cupy.array(self.env.nrange + np.arange(self.nsam) * MPP, dtype=np.float64)
+        self.det_model = keras.models.load_model('./id_model')
 
     def states(self):
         return dict(type='float', shape=(self.nsam, self.cpi_len))
@@ -82,36 +84,30 @@ class SinglePulseBackground(Environment):
 
     def execute(self, actions):
         self.tf = self.tf[-1] + np.linspace(0, 1 / actions['radar'][0], self.cpi_len)
-        chirp = np.fft.fft(self.genChirp(actions['wave'], self.bw), self.fft_len)
-        cpi = self.genCPI(chirp)
+        chirp = self.genChirp(actions['wave'], self.bw)
+        fft_chirp = np.fft.fft(self.genChirp(actions['wave'], self.bw), self.fft_len)
+        win_chirp = np.fft.ifft(fft_chirp * taylor(self.fft_len))
+        cpi = self.genCPI(fft_chirp)
         state = db(cpi)
         reward = 0
 
         # We've reached the end of the data, pull out
         done = False if self.tf[-1] < 10 else True
 
-        # Sidelobe score
-        ml_width = 0
-        slidx = 0
-        rc_chirp = db(np.fft.ifft(chirp * (chirp * taylor(self.fft_len)).conj().T, self.fft_len * 8))
-        rc_grad = np.gradient(rc_chirp)
-        rc_chirp = (rc_chirp - rc_chirp.mean()) / rc_chirp.std()
-        for ml_width in range(1, 500):
-            if np.sign(rc_grad[ml_width]) != np.sign(rc_grad[ml_width - 1]):
-                break
-        for slidx in range(ml_width + 1, ml_width + 500):
-            if np.sign(rc_grad[slidx]) != np.sign(rc_grad[slidx - 1]):
-                break
-        sll = 1 - rc_chirp[slidx]
-        mll = 1 - (ml_width * c0 / (self.fs * 8))
-        reward += sll + mll
+        # Ambiguity function score
+        amb, _, _ = ambiguity(chirp, win_chirp, actions['radar'][0], 150)
+        thumb = np.zeros(amb.shape)
+        thumb[amb.shape[0] // 2, amb.shape[1] // 2] = 1
+        amb_sc = 1 / np.linalg.norm(amb - thumb)
+        reward += amb_sc
 
         # Detectability score
-        # dbw, dt0 = self.detect(chirp)
-        # det_sc = abs(dt0 - self.nr) / self.nr + abs(dbw - self.bw / self.fs) * self.fs / self.bw
-        # reward += det_sc
+        det_chirp = chirp[:min(self.nr, 500)] + np.random.rand(min(self.nr, 500)) + 1j * np.random.rand(min(self.nr, 500))
+        wdd = WignerVilleDistribution(det_chirp).run()[0]
+        det_sc = self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
+        reward += det_sc
 
-        self.log.append([db(state), [sll, 1 - mll], self.tf, self.az_pan + 0.0])
+        self.log.append([db(state), [amb_sc, det_sc], self.tf, self.az_pan + 0.0])
 
         return db(state), done, reward
 
@@ -424,6 +420,32 @@ def ellipse(x, y, a, b, ang):
     return fin_ell + np.array([x, y])[:, None]
 
 
+@njit
+def apply_shift(ray: np.ndarray, freq_shift: np.float64, samp_rate: np.float64) -> np.ndarray:
+    # apply frequency shift
+    precache = 2j * np.pi * freq_shift / samp_rate
+    new_ray = np.empty_like(ray)
+    for idx, val in enumerate(ray):
+        new_ray[idx] = val * np.exp(precache * idx)
+    return new_ray
+
+
+def ambiguity(s1, s2, prf, dopp_bins, mag=True):
+    fdopp = np.linspace(-prf / 2, prf / 2, dopp_bins)
+    fft_sz = findPowerOf2(len(s1)) * 2
+    s1f = np.fft.fft(s1, fft_sz).conj().T
+    shift_grid = np.zeros((len(s2), dopp_bins), dtype=np.complex64)
+    for n in range(dopp_bins):
+        shift_grid[:, n] = apply_shift(s2, fdopp[n], fs)
+    s2f = np.fft.fft(shift_grid, n=fft_sz, axis=0)
+    A = np.fft.fftshift(np.fft.ifft(s2f * s1f[:, None], axis=0, n=fft_sz * 2),
+                        axes=0)[fft_sz - dopp_bins // 2: fft_sz + dopp_bins // 2]
+    if mag:
+        return abs(A / abs(A).max()) ** 2, fdopp, np.linspace(-len(s1) / 2 / fs, len(s1) / 2 / fs, len(s1))
+    else:
+        return A / abs(A).max(), fdopp, np.linspace(-dopp_bins / 2 * fs / c0, dopp_bins / 2 * fs / c0, dopp_bins)
+
+
 if __name__ == '__main__':
     agent = SinglePulseBackground()
     test = SimEnv(agent.alt, agent.az_bw, agent.el_bw, agent.dep_ang)
@@ -477,6 +499,16 @@ if __name__ == '__main__':
     print(f'Detect\t\t{dbw * agent.fs / 1e6:.2f}\t\t{dt0 / agent.fs * 1e6:.2f}')
     print(f'Truth \t\t{agent.bw / 1e6:.2f}\t\t{agent.nr / agent.fs * 1e6:.2f}')
     print(f'Diffs \t\t{abs(agent.bw - dbw * agent.fs) / 1e6:.2f}\t\t{abs(agent.nr - dt0) * 1e6 / agent.fs:.2f}')
+
+    amb = ambiguity(pulse, pulse, 100, 30)
+
+    plt.figure('Ambiguity')
+    plt.imshow(amb[0])
+
+    # scores = np.array([l[1] for l in logs])
+
+    # plt.figure('Score breakdown')
+
 
     '''fig_wave = plt.figure('Waves')
     gx, gy = np.meshgrid(np.linspace(-agent.env.eswath / 2, agent.env.eswath * 1.5, 1000),
