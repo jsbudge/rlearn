@@ -1,7 +1,8 @@
 import numpy as np
 from tqdm import tqdm
 import keras
-from keras.layers import Input, Conv2D, Flatten, Dense, BatchNormalization, MaxPooling2D, AveragePooling2D
+from keras.layers import Input, Conv2D, Flatten, Dense, BatchNormalization, MaxPooling2D, AveragePooling2D, \
+    Dropout, GaussianNoise
 from keras.callbacks import TerminateOnNaN, EarlyStopping, ReduceLROnPlateau
 from wave_env import genPulse
 from tqdm import tqdm
@@ -38,6 +39,7 @@ segment_t0 = 6e-6
 pulse_limits = (500e-9, 5e-6)
 band_limits = (10e6, fs / 2)
 segment_sz = int(np.ceil(segment_t0 * fs))
+nsam = 1400
 
 inp = Input(shape=(segment_sz, segment_sz, 1))
 lay = BatchNormalization()(inp)
@@ -46,7 +48,9 @@ lay = Conv2D(10, (16, 16))(lay)
 lay = MaxPooling2D((4, 4))(lay)
 lay = Conv2D(10, (16, 16), activation=keras.layers.LeakyReLU(alpha=.3))(lay)
 lay = Flatten()(lay)
+lay = Dropout(.4)(lay)
 lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.3))(lay)
+lay = GaussianNoise(1)(lay)
 outp = Dense(2, activation='softmax')(lay)
 
 id_model = keras.Model(inputs=inp, outputs=outp)
@@ -65,14 +69,13 @@ for rnd in range(runs):
     ys = []
     for b in tqdm(range(batch_sz)):
         # Generate random data for training
-        bgn = np.random.rand(segment_sz) + 1j * np.random.rand(segment_sz)
+        bgn = (np.random.rand(segment_sz) + 1j * np.random.rand(segment_sz)) * np.random.rand() * 2
         if np.random.rand() < .5:
             nr = int((np.random.rand() * (pulse_limits[1] - pulse_limits[0]) + pulse_limits[0]) * fs)
             bw = np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0]
             start_loc = np.random.randint(0, segment_sz - 10)
             yt.append([True, False])
-            pulse = genPulse(ramp, np.random.rand(100), nr, nr / fs, 9.6e9, bw) * \
-                    (np.random.rand() * (1 - np.mean(abs(bgn))) + np.mean(abs(bgn)))
+            pulse = genPulse(ramp, np.random.rand(100), nr, nr / fs, 9.6e9, bw)
             bgn[start_loc:min(start_loc+nr, segment_sz)] += pulse[:min(nr, segment_sz - start_loc)]
         else:
             yt.append([False, True])
@@ -80,14 +83,13 @@ for rnd in range(runs):
 
         # Repeat for validation
         if b % 2 == 0:
-            bgn = np.random.rand(segment_sz) + 1j * np.random.rand(segment_sz)
+            bgn = (np.random.rand(segment_sz) + 1j * np.random.rand(segment_sz)) * np.random.rand() * 2
             if np.random.rand() < .5:
                 nr = int((np.random.rand() * (pulse_limits[1] - pulse_limits[0]) + pulse_limits[0]) * fs)
                 bw = np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0]
                 start_loc = np.random.randint(0, segment_sz - 10)
                 ys.append([True, False])
-                pulse = genPulse(ramp, np.random.rand(100), nr, nr / fs, 9.6e9, bw) * \
-                        (np.random.rand() * (1 - np.mean(abs(bgn))) + np.mean(abs(bgn)))
+                pulse = genPulse(ramp, np.random.rand(100), nr, nr / fs, 9.6e9, bw)
                 bgn[start_loc:min(start_loc+nr, segment_sz)] += pulse[:min(nr, segment_sz - start_loc)]
             else:
                 ys.append([False, True])
