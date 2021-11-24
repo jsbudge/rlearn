@@ -18,9 +18,9 @@ def findPowerOf2(x):
     return int(2**(np.ceil(np.log2(x))))
 
 
-games = 1
+games = 2
 eval_games = 1
-max_timesteps = 200
+max_timesteps = 500
 
 # Pre-defined or custom environment
 env = Environment.create(
@@ -28,7 +28,7 @@ env = Environment.create(
 )
 
 # Instantiate a Tensorforce agent
-agent = Agent.create(agent='a2c', environment=env, batch_size=32, discount=.2, learning_rate=1e-4, memory=max_timesteps)
+agent = Agent.create(agent='a2c', environment=env, batch_size=32, discount=.9, learning_rate=1e-5, memory=max_timesteps)
 
 # Training loop
 print('Training...')
@@ -69,7 +69,7 @@ logs = plot_env.log
 log_num = 10
 
 nr = int((plot_env.env.max_pl * plot_env.plp) * plot_env.fs)
-pulse = genPulse(np.linspace(0, 1, 10), logs[log_num][4], nr, nr / plot_env.fs,
+pulse = genPulse(np.linspace(0, 1, 10), logs[log_num][5], nr, nr / plot_env.fs,
                  plot_env.fc, plot_env.bw)
 fftpulse = np.fft.fft(pulse, findPowerOf2(nr) * 1)
 rc_pulse = db(np.fft.ifft(fftpulse * (fftpulse * taylor(findPowerOf2(nr))).conj().T, findPowerOf2(nr) * 8))
@@ -85,7 +85,7 @@ fig, axes = plt.subplots(3)
 camera = Camera(fig)
 for l in logs[::2]:
     fpos = plot_env.env.pos(l[2][0])
-    main_beam = ellipse(*(list(plot_env.env.getAntennaBeamLocation(l[2][0], l[3][0])) + [l[3][0]]))
+    main_beam = ellipse(*(list(plot_env.env.getAntennaBeamLocation(l[2][0], l[3][0], l[4][0])) + [l[3][0]]))
     axes[1].plot(main_beam[0, :], main_beam[1, :], 'gray')
     axes[1].scatter(fpos[0], fpos[1], marker='*', c='blue')
     for idx, s in enumerate(plot_env.env.targets):
@@ -104,7 +104,7 @@ for l in logs[::2]:
     axes[0].imshow(np.fft.fftshift(l[0], axes=1))
     axes[0].axis('tight')
     axes[2].plot(db(
-        np.fft.fft(genPulse(np.linspace(0, 1, 10), l[4], nr, nr / plot_env.fs, plot_env.fc, plot_env.bw),
+        np.fft.fft(genPulse(np.linspace(0, 1, 10), l[5], nr, nr / plot_env.fs, plot_env.fc, plot_env.bw),
                    plot_env.fft_len)), c='blue')
     camera.snap()
 

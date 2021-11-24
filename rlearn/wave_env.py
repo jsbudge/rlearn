@@ -57,7 +57,7 @@ class SinglePulseBackground(Environment):
     def __init__(self):
         super().__init__()
         self.cpi_len = 128
-        self.az_bw = 12 * DTR
+        self.az_bw = 6 * DTR
         self.el_bw = 12 * DTR
         self.dep_ang = 45 * DTR
         self.alt = 1524
@@ -67,27 +67,35 @@ class SinglePulseBackground(Environment):
         self.fs = fs / 8
         self.bw = 100e6
         self.az_pt = np.pi / 2
+        self.el_pt = 45 * DTR
         self.az_lims = (np.pi / 4, 3 * np.pi / 4)
+        self.el_lims = (30 * DTR, 50 * DTR)
         self.reset()
         self.data_block = (self.nsam, self.cpi_len)
-        MPP = c0 / 2 / self.fs
-        self.range_bins = cupy.array(self.env.nrange + np.arange(self.nsam) * MPP, dtype=np.float64)
+        self.MPP = c0 / 2 / self.fs
+        self.range_bins = cupy.array(self.env.nrange + np.arange(self.nsam) * self.MPP, dtype=np.float64)
         self.det_model = keras.models.load_model('./id_model')
 
     def states(self):
-        return dict(type='float', shape=(self.nsam, self.cpi_len))
+        return dict(cpi=dict(type='float', shape=(self.nsam, self.cpi_len)),
+                    pos=dict(type='float', shape=(2,)))
 
     def actions(self):
         return dict(wave=dict(type='float', shape=(10,), min_value=0, max_value=1),
                     radar=dict(type='float', shape=(1,), min_value=10, max_value=500),
-                    scan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]))
+                    scan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
+                    elscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]))
 
     def execute(self, actions):
         self.tf = self.tf[-1] + np.linspace(0, 1 / actions['radar'][0], self.cpi_len)
+        self.az_pt = actions['scan'][0]
+        self.el_pt = actions['elscan'][0]
+        self.range_bins = cupy.array(self.env.h_agl / np.sin(self.el_pt + self.el_bw / 2) + np.arange(self.nsam) * self.MPP,
+                                     dtype=np.float64)
         chirp = self.genChirp(actions['wave'], self.bw)
         fft_chirp = np.fft.fft(self.genChirp(actions['wave'], self.bw), self.fft_len)
         win_chirp = np.fft.ifft(fft_chirp * taylor(self.fft_len))
-        cpi = self.genCPI(fft_chirp, actions['scan'])
+        cpi = self.genCPI(fft_chirp)
         state = db(cpi)
         reward = 0
 
@@ -98,7 +106,7 @@ class SinglePulseBackground(Environment):
         amb, _, _ = ambiguity(chirp, win_chirp, actions['radar'][0], 150)
         thumb = np.zeros(amb.shape)
         thumb[amb.shape[0] // 2, amb.shape[1] // 2] = 1
-        amb_sc = 1 / np.linalg.norm(amb - thumb)
+        amb_sc = 1 / np.linalg.norm(amb - thumb) * len(self.env.targets)
         reward += amb_sc
 
         # Detectability score
@@ -122,14 +130,15 @@ class SinglePulseBackground(Environment):
             att = np.mean(tx_elpat * tx_azpat)
             det_chirp[:self.nr] += chirp * att
             wdd = WignerVilleDistribution(det_chirp).run()[0]
-            det_sc += self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
-            ftarg += np.mean(att * pw) / 50
-        reward += det_sc / len(self.env.targets) * ftarg / len(self.env.targets)
+            det_sc += self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1] / 5
+            ftarg += (1 / abs(np.mean(eldiff)) + 1 / abs(np.mean(azdiff))) / 200
+        reward += det_sc
+        reward += ftarg
 
-        self.log.append([db(state), [amb_sc, det_sc / len(self.env.targets) * ftarg],
-                         self.tf, actions['scan'], actions['wave']])
+        self.log.append([state, [amb_sc, det_sc, ftarg],
+                         self.tf, actions['scan'], actions['elscan'], actions['wave']])
 
-        return db(state), done, reward
+        return {'cpi': state, 'pos': np.array([actions['scan'][0], actions['elscan'][0]])}, done, reward
 
     def reset(self, num_parallel=None):
         self.tf = np.linspace(0, self.cpi_len / 500.0, self.cpi_len)
@@ -139,9 +148,9 @@ class SinglePulseBackground(Environment):
                          np.floor(2 * self.env.nrange / c0 * TAC)) * self.fs / TAC)
         self.nr = int(self.env.max_pl * self.plp * self.fs)
         self.fft_len = findPowerOf2(self.nsam + self.nr)
-        return np.zeros((self.nsam, self.cpi_len))
+        return {'cpi': np.zeros((self.nsam, self.cpi_len)), 'pos': np.array([self.az_pt, self.el_pt])}
 
-    def genCPI(self, chirp, az_loc):
+    def genCPI(self, chirp):
         twin = taylor(self.fft_len)
         win_gpu = cupy.array(np.tile(twin, (self.cpi_len, 1)).T, dtype=np.complex128)
         chirp_gpu = cupy.array(np.tile(chirp, (self.cpi_len, 1)).T, dtype=np.complex128)
@@ -151,8 +160,10 @@ class SinglePulseBackground(Environment):
         sub_blocks = (int(np.ceil(self.cpi_len / THREADS_PER_BLOCK[0])),
                       int(np.ceil(len(self.env.targets) / THREADS_PER_BLOCK[1])))
         pos_gpu = cupy.array(np.ascontiguousarray(self.env.pos(self.tf)), dtype=np.float64)
-        az_pan = az_loc * np.ones((self.cpi_len,))
+        az_pan = self.az_pt * np.ones((self.cpi_len,))
+        el_pan = self.el_pt * np.ones((self.cpi_len,))
         pan_gpu = cupy.array(np.ascontiguousarray(az_pan), dtype=np.float64)
+        el_gpu = cupy.array(np.ascontiguousarray(el_pan), dtype=np.float64)
         p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc, self.env.nrange / c0,
                                      self.fs, self.dep_ang, self.env.eswath, self.env.swath]), dtype=np.float64)
         data_r = cupy.zeros(self.data_block, dtype=np.float64)
@@ -165,11 +176,11 @@ class SinglePulseBackground(Environment):
         sub_pos = cupy.array(np.ascontiguousarray(sv), dtype=np.float64)
         times = cupy.array(np.ascontiguousarray(self.tf), dtype=np.float64)
 
-        genRangeProfile[blocks_per_grid, THREADS_PER_BLOCK](pos_gpu, gx, gy, pan_gpu,
+        genRangeProfile[blocks_per_grid, THREADS_PER_BLOCK](pos_gpu, gx, gy, pan_gpu, el_gpu,
                                                             times, data_r, data_i, p_gpu)
         cupy.cuda.Device().synchronize()
 
-        genSubProfile[sub_blocks, THREADS_PER_BLOCK](pos_gpu, sub_pos, pan_gpu, data_r, data_i, p_gpu)
+        genSubProfile[sub_blocks, THREADS_PER_BLOCK](pos_gpu, sub_pos, pan_gpu, el_gpu, data_r, data_i, p_gpu)
         cupy.cuda.Device().synchronize()
 
         data = data_r + 1j * data_i
@@ -183,6 +194,7 @@ class SinglePulseBackground(Environment):
 
         del ret_data
         del pan_gpu
+        del el_gpu
         del p_gpu
         del data_r
         del data_i
@@ -230,9 +242,10 @@ class SimEnv(object):
         gmrange = (gfrange + gnrange) / 2
         blen = np.tan(az_bw / 2) * gmrange
         self.swath = (gfrange - gnrange)
-        self.eswath = blen * 2
+        self.eswath = blen * 4
         self.nrange = nrange
         self.frange = frange
+        self.mrange = (frange + nrange) / 2
         self.gnrange = gnrange
         self.gmrange = gmrange
         self.gfrange = gfrange
@@ -240,9 +253,8 @@ class SimEnv(object):
         self.h_agl = h_agl
         self.targets = []
         self.genFlightPath()
-        for n in range(np.random.randint(1, 5)):
-            self.targets.append(Sub(0, self.eswath,
-                                    0, self.swath))
+        self.targets.append(Sub(0, self.eswath,
+                                0, self.swath))
 
     def genFlightPath(self):
         # We start assuming that the bottom left corner of scene is (0, 0, 0) ENU
@@ -262,10 +274,10 @@ class SimEnv(object):
         # Environment pulse info
         self.max_pl = (self.nrange * 2 / c0 - 1 / TAC) * .99
 
-    def getAntennaBeamLocation(self, t, ang):
+    def getAntennaBeamLocation(self, t, az_ang, el_ang):
         fpos = self.pos(t)
-        eshift = np.cos(ang) * self.gmrange
-        nshift = np.sin(ang) * self.gmrange
+        eshift = np.cos(az_ang) * self.h_agl / np.tan(el_ang)
+        nshift = np.sin(az_ang) * self.h_agl / np.tan(el_ang)
         return fpos[0] + eshift, fpos[1] + nshift, self.gbwidth, (self.gfrange - self.gnrange) / 2
 
 
@@ -344,8 +356,8 @@ def cpudiff(x, y):
 
 
 @cuda.jit(
-    'void(float64[:, :], float64[:], float64[:], float64[:], float64[:], float64[:, :], float64[:, :], float64[:])')
-def genRangeProfile(path, gx, gy, pan, t, pd_r, pd_i, params):
+    'void(float64[:, :], float64[:], float64[:], float64[:], float64[:], float64[:], float64[:, :], float64[:, :], float64[:])')
+def genRangeProfile(path, gx, gy, pan, el, t, pd_r, pd_i, params):
     tt, samp_point = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and samp_point < gx.size:
         # Load in all the parameters that don't change
@@ -367,7 +379,7 @@ def genRangeProfile(path, gx, gy, pan, t, pd_r, pd_i, params):
         if n_samples > but > 0:
             el_tx = math.asin(-s_z / rng)
             az_tx = math.atan2(s_x, s_y)
-            eldiff = diff(el_tx, params[5])
+            eldiff = diff(el_tx, el[tt])
             azdiff = diff(az_tx, pan[tt])
             tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
             tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
@@ -377,8 +389,8 @@ def genRangeProfile(path, gx, gy, pan, t, pd_r, pd_i, params):
             cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
 
-@cuda.jit('void(float64[:, :], float64[:, :, :], float64[:], float64[:, :], float64[:, :], float64[:])')
-def genSubProfile(path, subs, pan, pd_r, pd_i, params):
+@cuda.jit('void(float64[:, :], float64[:, :, :], float64[:], float64[:], float64[:, :], float64[:, :], float64[:])')
+def genSubProfile(path, subs, pan, el, pd_r, pd_i, params):
     tt, subnum = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and subnum < subs.shape[0]:
         # Load in all the parameters that don't change
@@ -400,7 +412,7 @@ def genSubProfile(path, subs, pan, pd_r, pd_i, params):
         if n_samples > but > 0:
             el_tx = math.asin(-s_z / rng)
             az_tx = math.atan2(s_x, s_y)
-            eldiff = diff(el_tx, params[5])
+            eldiff = diff(el_tx, el[tt])
             azdiff = diff(az_tx, pan[tt])
             tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
             tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
@@ -475,7 +487,7 @@ if __name__ == '__main__':
     camera = Camera(fig)
     for log_idx, l in tqdm(enumerate(logs[::skips])):
         fpos = agent.env.pos(l[2][0])
-        main_beam = ellipse(*(list(agent.env.getAntennaBeamLocation(l[2][0], l[3][0])) + [l[3][0]]))
+        main_beam = ellipse(*(list(agent.env.getAntennaBeamLocation(l[2][0], l[3][0], l[4][0])) + [l[3][0]]))
         axes[1].plot(main_beam[0, :], main_beam[1, :], 'gray')
         axes[1].scatter(fpos[0], fpos[1], marker='*', c='blue')
         for idx, s in enumerate(agent.env.targets):
