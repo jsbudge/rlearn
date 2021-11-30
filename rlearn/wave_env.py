@@ -2,6 +2,7 @@ from tensorforce import Environment
 import numpy as np
 from tqdm import tqdm
 from scipy.signal.windows import taylor
+from scipy.spatial.distance import mahalanobis
 from scipy.ndimage import gaussian_filter
 from tftb.processing import WignerVilleDistribution
 from scipy.ndimage import binary_dilation, binary_erosion
@@ -57,7 +58,7 @@ class SinglePulseBackground(Environment):
     def __init__(self):
         super().__init__()
         self.cpi_len = 128
-        self.az_bw = 6 * DTR
+        self.az_bw = 9 * DTR
         self.el_bw = 12 * DTR
         self.dep_ang = 45 * DTR
         self.alt = 1524
@@ -69,7 +70,7 @@ class SinglePulseBackground(Environment):
         self.az_pt = np.pi / 2
         self.el_pt = 45 * DTR
         self.az_lims = (np.pi / 4, 3 * np.pi / 4)
-        self.el_lims = (30 * DTR, 50 * DTR)
+        self.el_lims = (30 * DTR, 70 * DTR)
         self.reset()
         self.data_block = (self.nsam, self.cpi_len)
         self.MPP = c0 / 2 / self.fs
@@ -86,8 +87,8 @@ class SinglePulseBackground(Environment):
                     scan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
                     elscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]))
 
-    def execute(self, actions):
-        self.tf = self.tf[-1] + np.linspace(0, 1 / actions['radar'][0], self.cpi_len)
+    def execute(self, actions=actions, rtype=0):
+        self.tf = self.tf[-1] + np.arange(1, self.cpi_len + 1) * 1 / actions['radar'][0]
         self.az_pt = actions['scan'][0]
         self.el_pt = actions['elscan'][0]
         self.range_bins = cupy.array(self.env.h_agl / np.sin(self.el_pt + self.el_bw / 2) + np.arange(self.nsam) * self.MPP,
@@ -95,7 +96,7 @@ class SinglePulseBackground(Environment):
         chirp = self.genChirp(actions['wave'], self.bw)
         fft_chirp = np.fft.fft(self.genChirp(actions['wave'], self.bw), self.fft_len)
         win_chirp = np.fft.ifft(fft_chirp * taylor(self.fft_len))
-        cpi = self.genCPI(fft_chirp)
+        cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
         state = db(cpi)
         reward = 0
 
@@ -106,14 +107,14 @@ class SinglePulseBackground(Environment):
         amb, _, _ = ambiguity(chirp, win_chirp, actions['radar'][0], 150)
         thumb = np.zeros(amb.shape)
         thumb[amb.shape[0] // 2, amb.shape[1] // 2] = 1
-        amb_sc = 1 / np.linalg.norm(amb - thumb) * len(self.env.targets)
+        amb_sc = 1 - np.linalg.norm(amb / np.linalg.norm(amb) - thumb)
         reward += amb_sc
 
         # Detectability score
         net_sz = self.det_model.layers[0].input_shape[0][1]
         fpos = -self.env.pos(self.tf)
         det_sc = 0
-        ftarg = 0
+        ft_el = 0
         for s in self.env.targets:
             det_chirp = np.random.rand(max(self.nr, net_sz)) + 1j * np.random.rand(max(self.nr, net_sz))
             pw, pe, pn = s(self.tf)
@@ -128,21 +129,80 @@ class SinglePulseBackground(Environment):
             tx_elpat = abs(np.sin(np.pi / self.el_bw * eldiff) / (np.pi / self.el_bw * eldiff))
             tx_azpat = abs(np.sin(np.pi / self.az_bw * azdiff) / (np.pi / self.az_bw * azdiff))
             att = np.mean(tx_elpat * tx_azpat)
-            det_chirp[:self.nr] += chirp * att
+            det_chirp[:self.nr] += chirp * att * .5
             wdd = WignerVilleDistribution(det_chirp).run()[0]
-            det_sc += self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1] / 5
-            ftarg += (1 / abs(np.mean(eldiff)) + 1 / abs(np.mean(azdiff))) / 200
+            det_sc += self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
+            mu_x, mu_y, az_width, el_width = self.env.getAntennaBeamLocation(np.mean(self.tf), self.az_pt, self.el_pt)
+            rot = np.array([[np.cos(self.az_pt), -np.sin(self.az_pt)], [np.sin(self.az_pt), np.cos(self.az_pt)]])
+            mahal_cov = rot.dot(np.diag([az_width ** 2, el_width ** 2])).dot(np.linalg.pinv(rot))
+            uv = np.array([mu_y, mu_x]) - np.array([pe.mean(), pn.mean()])
+            ft_el += 1 / np.sqrt(uv.dot(np.linalg.pinv(mahal_cov)).dot(uv.T))
         reward += det_sc
-        reward += ftarg
+        reward += ft_el
 
-        self.log.append([state, [amb_sc, det_sc, ftarg],
+        self.log.append([state, [amb_sc, det_sc, ft_el],
                          self.tf, actions['scan'], actions['elscan'], actions['wave']])
 
         return {'cpi': state, 'pos': np.array([actions['scan'][0], actions['elscan'][0]])}, done, reward
 
+    def calcReward(self, actions, rtype=0):
+        # Rtype key:
+        # 0: Detection
+        # 1: Movement
+        tf = self.tf[-1] + np.arange(1, self.cpi_len + 1) * 1 / actions['radar'][0]
+        az_pt = actions['scan'][0]
+        el_pt = actions['elscan'][0]
+        self.range_bins = cupy.array(
+            self.env.h_agl / np.sin(self.el_pt + self.el_bw / 2) + np.arange(self.nsam) * self.MPP,
+            dtype=np.float64)
+        chirp = self.genChirp(actions['wave'], self.bw)
+        fft_chirp = np.fft.fft(self.genChirp(actions['wave'], self.bw), self.fft_len)
+        win_chirp = np.fft.ifft(fft_chirp * taylor(self.fft_len))
+        cpi = self.genCPI(fft_chirp, tf, az_pt, el_pt)
+        state = db(cpi)
+        reward = 0
+
+        # Ambiguity function score
+        amb, _, _ = ambiguity(chirp, win_chirp, actions['radar'][0], 150)
+        thumb = np.zeros(amb.shape)
+        thumb[amb.shape[0] // 2, amb.shape[1] // 2] = 1
+        amb_sc = 1 - np.linalg.norm(amb / np.linalg.norm(amb) - thumb)
+        reward += amb_sc if rtype == 0 else 0
+
+        # Detectability score
+        net_sz = self.det_model.layers[0].input_shape[0][1]
+        fpos = -self.env.pos(self.tf)
+        det_sc = 0
+        ft_el = 0
+        for s in self.env.targets:
+            det_chirp = np.random.rand(max(self.nr, net_sz)) + 1j * np.random.rand(max(self.nr, net_sz))
+            pw, pe, pn = s(self.tf)
+            fpos[0, :] += pe
+            fpos[1, :] += pn
+            fpos[2, :] += pw * 20 / 50
+            rng = np.linalg.norm(fpos, axis=0)
+            el_tx = np.arcsin(-fpos[2, :] / rng)
+            az_tx = np.arctan2(fpos[0, :], fpos[1, :])
+            eldiff = cpudiff(el_tx, self.dep_ang)
+            azdiff = cpudiff(az_tx, actions['scan'])
+            tx_elpat = abs(np.sin(np.pi / self.el_bw * eldiff) / (np.pi / self.el_bw * eldiff))
+            tx_azpat = abs(np.sin(np.pi / self.az_bw * azdiff) / (np.pi / self.az_bw * azdiff))
+            att = np.mean(tx_elpat * tx_azpat)
+            det_chirp[:self.nr] += chirp * att * .5
+            wdd = WignerVilleDistribution(det_chirp).run()[0]
+            det_sc += self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
+            mu_x, mu_y, az_width, el_width = self.env.getAntennaBeamLocation(np.mean(self.tf), self.az_pt, self.el_pt)
+            rot = np.array([[np.cos(self.az_pt), -np.sin(self.az_pt)], [np.sin(self.az_pt), np.cos(self.az_pt)]])
+            mahal_cov = rot.dot(np.diag([az_width ** 2, el_width ** 2])).dot(np.linalg.pinv(rot))
+            uv = np.array([mu_y, mu_x]) - np.array([pe.mean(), pn.mean()])
+            ft_el += 1 / np.sqrt(uv.dot(np.linalg.pinv(mahal_cov)).dot(uv.T))
+        reward += det_sc if rtype == 0 else 0
+        reward += ft_el if rtype == 1 else 0
+        return reward
+
     def reset(self, num_parallel=None):
         self.tf = np.linspace(0, self.cpi_len / 500.0, self.cpi_len)
-        self.env = SimEnv(self.alt, self.az_bw, self.el_bw, self.dep_ang)
+        self.env = SimEnv(self.alt, self.az_bw, self.el_bw, self.dep_ang, f_ts=50)
         self.log = []
         self.nsam = int((np.ceil((2 * self.env.frange / c0 + self.env.max_pl * self.plp) * TAC) -
                          np.floor(2 * self.env.nrange / c0 * TAC)) * self.fs / TAC)
@@ -150,7 +210,7 @@ class SinglePulseBackground(Environment):
         self.fft_len = findPowerOf2(self.nsam + self.nr)
         return {'cpi': np.zeros((self.nsam, self.cpi_len)), 'pos': np.array([self.az_pt, self.el_pt])}
 
-    def genCPI(self, chirp):
+    def genCPI(self, chirp, tf, az_pt, el_pt):
         twin = taylor(self.fft_len)
         win_gpu = cupy.array(np.tile(twin, (self.cpi_len, 1)).T, dtype=np.complex128)
         chirp_gpu = cupy.array(np.tile(chirp, (self.cpi_len, 1)).T, dtype=np.complex128)
@@ -159,9 +219,9 @@ class SinglePulseBackground(Environment):
             int(np.ceil(self.cpi_len / THREADS_PER_BLOCK[0])), int(np.ceil(self.samples / THREADS_PER_BLOCK[1])))
         sub_blocks = (int(np.ceil(self.cpi_len / THREADS_PER_BLOCK[0])),
                       int(np.ceil(len(self.env.targets) / THREADS_PER_BLOCK[1])))
-        pos_gpu = cupy.array(np.ascontiguousarray(self.env.pos(self.tf)), dtype=np.float64)
-        az_pan = self.az_pt * np.ones((self.cpi_len,))
-        el_pan = self.el_pt * np.ones((self.cpi_len,))
+        pos_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf)), dtype=np.float64)
+        az_pan = az_pt * np.ones((self.cpi_len,))
+        el_pan = el_pt * np.ones((self.cpi_len,))
         pan_gpu = cupy.array(np.ascontiguousarray(az_pan), dtype=np.float64)
         el_gpu = cupy.array(np.ascontiguousarray(el_pan), dtype=np.float64)
         p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc, self.env.nrange / c0,
@@ -172,9 +232,9 @@ class SinglePulseBackground(Environment):
         gy = cupy.array(np.random.rand(self.samples), dtype=np.float64)
         sv = []
         for sub in self.env.targets:
-            sv.append([sub(t) for t in self.tf])
+            sv.append([sub(t) for t in tf])
         sub_pos = cupy.array(np.ascontiguousarray(sv), dtype=np.float64)
-        times = cupy.array(np.ascontiguousarray(self.tf), dtype=np.float64)
+        times = cupy.array(np.ascontiguousarray(tf), dtype=np.float64)
 
         genRangeProfile[blocks_per_grid, THREADS_PER_BLOCK](pos_gpu, gx, gy, pan_gpu, el_gpu,
                                                             times, data_r, data_i, p_gpu)
@@ -234,15 +294,15 @@ class SimEnv(object):
     max_pl = 0
     wave = None
 
-    def __init__(self, h_agl, az_bw, el_bw, dep_ang):
+    def __init__(self, h_agl, az_bw, el_bw, dep_ang, f_ts=10):
         nrange = h_agl / np.sin(dep_ang + el_bw / 2)
         frange = h_agl / np.sin(dep_ang - el_bw / 2)
         gnrange = h_agl / np.tan(dep_ang + el_bw / 2)
         gfrange = h_agl / np.tan(dep_ang - el_bw / 2)
         gmrange = (gfrange + gnrange) / 2
         blen = np.tan(az_bw / 2) * gmrange
-        self.swath = (gfrange - gnrange)
-        self.eswath = blen * 4
+        self.swath = (gfrange - gnrange) * 2
+        self.eswath = blen * 8
         self.nrange = nrange
         self.frange = frange
         self.mrange = (frange + nrange) / 2
@@ -252,6 +312,7 @@ class SimEnv(object):
         self.gbwidth = blen
         self.h_agl = h_agl
         self.targets = []
+        self.f_ts = f_ts
         self.genFlightPath()
         self.targets.append(Sub(0, self.eswath,
                                 0, self.swath))
@@ -259,8 +320,8 @@ class SimEnv(object):
     def genFlightPath(self):
         # We start assuming that the bottom left corner of scene is (0, 0, 0) ENU
         # Platform motion (assuming 100 Hz signal, so this is 10 sec)
-        npts = 50
-        tt = np.linspace(0, 10, npts)
+        npts = int(50 * self.f_ts / 10)
+        tt = np.linspace(0, self.f_ts, npts)
         e = gaussian_filter(
             np.linspace(self.eswath / 4, self.eswath - self.eswath / 4, npts) + (np.random.rand(npts) - .5) * 3, 3)
         n = gaussian_filter(-self.gnrange + (np.random.rand(npts) - .5) * 3, 3)
@@ -269,7 +330,8 @@ class SimEnv(object):
         rn = UnivariateSpline(tt, n, s=.7, k=3)
         ru = UnivariateSpline(tt, u, s=.7, k=3)
         self.pos = lambda t: np.array([re(t), rn(t), ru(t)])
-        self.spd = np.linalg.norm(np.gradient(self.pos(np.linspace(0, 10, 100)), axis=1), axis=0).mean()
+        self.spd = np.linalg.norm(np.gradient(self.pos(np.linspace(0, self.f_ts, int(100 * self.f_ts / 10))),
+                                              axis=1), axis=0).mean()
 
         # Environment pulse info
         self.max_pl = (self.nrange * 2 / c0 - 1 / TAC) * .99

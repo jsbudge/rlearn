@@ -18,9 +18,9 @@ def findPowerOf2(x):
     return int(2**(np.ceil(np.log2(x))))
 
 
-games = 2
+games = 10000
 eval_games = 1
-max_timesteps = 500
+max_timesteps = 128
 
 # Pre-defined or custom environment
 env = Environment.create(
@@ -28,21 +28,34 @@ env = Environment.create(
 )
 
 # Instantiate a Tensorforce agent
-agent = Agent.create(agent='a2c', environment=env, batch_size=32, discount=.9, learning_rate=1e-5, memory=max_timesteps)
+agent = Agent.create(agent='a2c', environment=env, batch_size=32, discount=.9, learning_rate=1e-4,
+                     memory=max_timesteps)
 
 # Training loop
 print('Training...')
 for rnd in tqdm(range(games)):
+    ep_states = []
+    ep_internals = []
+    ep_actions = []
+    ep_terminal = []
+    ep_reward = []
     # Initialize episode
     states = env.reset()
+    internals = agent.initial_internals()
     terminal = False
     rnd_num = 0
 
     while not terminal:
-        # Episode timestep
-        actions = agent.act(states=states)
+        ep_states.append(states)
+        ep_internals.append(internals)
+        actions, internals = agent.act(states=states, internals=internals, independent=True)
+        ep_actions.append(actions)
         states, terminal, reward = env.execute(actions=actions)
-        agent.observe(terminal=terminal, reward=reward)
+        ep_terminal.append(terminal)
+        ep_reward.append(reward)
+    agent.experience(states=ep_states, internals=ep_internals, actions=ep_actions,
+                     terminal=ep_terminal, reward=ep_reward)
+    agent.update()
 
 # Testing loop
 print('Evaluation...')
@@ -74,11 +87,14 @@ pulse = genPulse(np.linspace(0, 1, 10), logs[log_num][5], nr, nr / plot_env.fs,
 fftpulse = np.fft.fft(pulse, findPowerOf2(nr) * 1)
 rc_pulse = db(np.fft.ifft(fftpulse * (fftpulse * taylor(findPowerOf2(nr))).conj().T, findPowerOf2(nr) * 8))
 plt.figure('Pulse')
-plt.plot(rc_pulse)
+plt.plot(np.fft.fftshift(rc_pulse))
 
-wd = WignerVilleDistribution(pulse)
-wd.run()
-wd.plot(kind='contour', show_tf=True)
+try:
+    wd = WignerVilleDistribution(pulse)
+    wd.run()
+    wd.plot(kind='contour', show_tf=True)
+except IndexError:
+    print('Pulse too small?')
 
 cols = ['red', 'blue', 'green', 'orange', 'yellow', 'purple', 'black', 'cyan']
 fig, axes = plt.subplots(3)
@@ -100,7 +116,7 @@ for l in logs[::2]:
         pos = np.array(pos)
         if len(pos) > 0:
             axes[1].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
-    axes[1].legend([f'{(l[2][-1] - l[2][0]) * 1e6:.2f}us: {l[2][-1]:.6f}'])
+    axes[1].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
     axes[0].imshow(np.fft.fftshift(l[0], axes=1))
     axes[0].axis('tight')
     axes[2].plot(db(

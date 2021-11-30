@@ -128,4 +128,4 @@ for n in range(Xs.shape[0]):
         plt.title(f'{pos_res[n, 0] * 100:.2f}')
         plt.imshow(Xs[n, :, :])
 
-id_model.save('./id_model')
+ # id_model.save('./id_model')
