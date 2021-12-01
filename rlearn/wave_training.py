@@ -1,4 +1,4 @@
-from tensorforce import Agent, Environment
+from tensorforce import Agent, Environment, Runner
 from wave_env import SinglePulseBackground, genPulse, ambiguity, ellipse
 import numpy as np
 from scipy.signal.windows import taylor
@@ -18,9 +18,10 @@ def findPowerOf2(x):
     return int(2**(np.ceil(np.log2(x))))
 
 
-games = 10000
+games = 15
 eval_games = 1
 max_timesteps = 128
+batch_sz = 32
 
 # Pre-defined or custom environment
 env = Environment.create(
@@ -28,34 +29,11 @@ env = Environment.create(
 )
 
 # Instantiate a Tensorforce agent
-agent = Agent.create(agent='a2c', environment=env, batch_size=32, discount=.9, learning_rate=1e-4,
+agent = Agent.create(agent='a2c', environment=env, batch_size=batch_sz, discount=.99, learning_rate=1e-3,
                      memory=max_timesteps)
 
-# Training loop
-print('Training...')
-for rnd in tqdm(range(games)):
-    ep_states = []
-    ep_internals = []
-    ep_actions = []
-    ep_terminal = []
-    ep_reward = []
-    # Initialize episode
-    states = env.reset()
-    internals = agent.initial_internals()
-    terminal = False
-    rnd_num = 0
-
-    while not terminal:
-        ep_states.append(states)
-        ep_internals.append(internals)
-        actions, internals = agent.act(states=states, internals=internals, independent=True)
-        ep_actions.append(actions)
-        states, terminal, reward = env.execute(actions=actions)
-        ep_terminal.append(terminal)
-        ep_reward.append(reward)
-    agent.experience(states=ep_states, internals=ep_internals, actions=ep_actions,
-                     terminal=ep_terminal, reward=ep_reward)
-    agent.update()
+runner = Runner(agent=agent, environment=env, max_episode_timesteps=max_timesteps)
+runner.run(num_episodes=games)
 
 # Testing loop
 print('Evaluation...')
@@ -100,7 +78,7 @@ cols = ['red', 'blue', 'green', 'orange', 'yellow', 'purple', 'black', 'cyan']
 fig, axes = plt.subplots(3)
 camera = Camera(fig)
 for l in logs[::2]:
-    fpos = plot_env.env.pos(l[2][0])
+    fpos = plot_env.env.pos(l[2])[:, 0]
     main_beam = ellipse(*(list(plot_env.env.getAntennaBeamLocation(l[2][0], l[3][0], l[4][0])) + [l[3][0]]))
     axes[1].plot(main_beam[0, :], main_beam[1, :], 'gray')
     axes[1].scatter(fpos[0], fpos[1], marker='*', c='blue')
@@ -140,6 +118,7 @@ plt.plot(amb[0][75, :])
 
 plt.figure('Rewards')
 scores = np.array([l[1] for l in logs])
+times = np.array([l[2][0] for l in logs])
 for sc_part in range(scores.shape[1] + 1, -1, -1):
-    plt.plot(np.sum(scores[:, :sc_part], axis=1))
-    plt.fill_between(np.arange(len(rewards)), np.sum(scores[:, :sc_part], axis=1))
+    plt.plot(times, np.sum(scores[:, :sc_part], axis=1))
+    plt.fill_between(times, np.sum(scores[:, :sc_part], axis=1))

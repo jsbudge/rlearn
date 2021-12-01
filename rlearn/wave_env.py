@@ -74,40 +74,44 @@ class SinglePulseBackground(Environment):
         self.reset()
         self.data_block = (self.nsam, self.cpi_len)
         self.MPP = c0 / 2 / self.fs
-        self.range_bins = cupy.array(self.env.nrange + np.arange(self.nsam) * self.MPP, dtype=np.float64)
+        self.maxPRF = min(c0 / (self.env.nrange + self.nsam * self.MPP), 500.0)
         self.det_model = keras.models.load_model('./id_model')
+        self.ave = 0
+        self.std = 0
 
     def states(self):
         return dict(cpi=dict(type='float', shape=(self.nsam, self.cpi_len)),
-                    pos=dict(type='float', shape=(2,)))
+                    pos=dict(type='float', shape=(2,)),
+                    currwave=dict(type='float', shape=(10,)))
 
     def actions(self):
         return dict(wave=dict(type='float', shape=(10,), min_value=0, max_value=1),
-                    radar=dict(type='float', shape=(1,), min_value=10, max_value=500),
+                    radar=dict(type='float', shape=(1,), min_value=10, max_value=self.maxPRF),
                     scan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
                     elscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]))
 
-    def execute(self, actions=actions, rtype=0):
+    def execute(self, actions):
         self.tf = self.tf[-1] + np.arange(1, self.cpi_len + 1) * 1 / actions['radar'][0]
+        # We've reached the end of the data, pull out
+        done = False if self.tf[-1] < 10 else 2
+        self.tf[self.tf >= 10] = 9.99
         self.az_pt = actions['scan'][0]
         self.el_pt = actions['elscan'][0]
-        self.range_bins = cupy.array(self.env.h_agl / np.sin(self.el_pt + self.el_bw / 2) + np.arange(self.nsam) * self.MPP,
-                                     dtype=np.float64)
         chirp = self.genChirp(actions['wave'], self.bw)
-        fft_chirp = np.fft.fft(self.genChirp(actions['wave'], self.bw), self.fft_len)
+        fft_chirp = np.fft.fft(chirp, self.fft_len)
         win_chirp = np.fft.ifft(fft_chirp * taylor(self.fft_len))
         cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
-        state = db(cpi)
+        state = abs(cpi)
+        self.ave = (np.mean(state) + self.ave) / 2
+        self.std = np.std(state)
+        state = (state - self.ave) / self.std
         reward = 0
-
-        # We've reached the end of the data, pull out
-        done = False if self.tf[-1] < 10 else True
 
         # Ambiguity function score
         amb, _, _ = ambiguity(chirp, win_chirp, actions['radar'][0], 150)
         thumb = np.zeros(amb.shape)
         thumb[amb.shape[0] // 2, amb.shape[1] // 2] = 1
-        amb_sc = 1 - np.linalg.norm(amb / np.linalg.norm(amb) - thumb)
+        amb_sc = 1 / np.linalg.norm(amb / np.linalg.norm(amb) - thumb)**3
         reward += amb_sc
 
         # Detectability score
@@ -115,6 +119,7 @@ class SinglePulseBackground(Environment):
         fpos = -self.env.pos(self.tf)
         det_sc = 0
         ft_el = 0
+        ft_az = 0
         for s in self.env.targets:
             det_chirp = np.random.rand(max(self.nr, net_sz)) + 1j * np.random.rand(max(self.nr, net_sz))
             pw, pe, pn = s(self.tf)
@@ -124,91 +129,37 @@ class SinglePulseBackground(Environment):
             rng = np.linalg.norm(fpos, axis=0)
             el_tx = np.arcsin(-fpos[2, :] / rng)
             az_tx = np.arctan2(fpos[0, :], fpos[1, :])
-            eldiff = cpudiff(el_tx, self.dep_ang)
+            eldiff = cpudiff(el_tx, actions['elscan'])
             azdiff = cpudiff(az_tx, actions['scan'])
             tx_elpat = abs(np.sin(np.pi / self.el_bw * eldiff) / (np.pi / self.el_bw * eldiff))
             tx_azpat = abs(np.sin(np.pi / self.az_bw * azdiff) / (np.pi / self.az_bw * azdiff))
-            att = np.mean(tx_elpat * tx_azpat)
-            det_chirp[:self.nr] += chirp * att * .5
+            att = np.max(tx_elpat * tx_azpat) * 4
+            det_chirp[:self.nr] += chirp * 250
             wdd = WignerVilleDistribution(det_chirp).run()[0]
-            det_sc += self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
-            mu_x, mu_y, az_width, el_width = self.env.getAntennaBeamLocation(np.mean(self.tf), self.az_pt, self.el_pt)
-            rot = np.array([[np.cos(self.az_pt), -np.sin(self.az_pt)], [np.sin(self.az_pt), np.cos(self.az_pt)]])
-            mahal_cov = rot.dot(np.diag([az_width ** 2, el_width ** 2])).dot(np.linalg.pinv(rot))
-            uv = np.array([mu_y, mu_x]) - np.array([pe.mean(), pn.mean()])
-            ft_el += 1 / np.sqrt(uv.dot(np.linalg.pinv(mahal_cov)).dot(uv.T))
+            # det_sc += self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
+            ft_az += att
         reward += det_sc
-        reward += ft_el
+        reward += ft_az
 
-        self.log.append([state, [amb_sc, det_sc, ft_el],
+        self.log.append([state, [amb_sc, det_sc, ft_az],
                          self.tf, actions['scan'], actions['elscan'], actions['wave']])
 
-        return {'cpi': state, 'pos': np.array([actions['scan'][0], actions['elscan'][0]])}, done, reward
+        full_state = {'cpi': state, 'pos': np.array([self.az_pt, self.el_pt]),
+                      'currwave': actions['wave']}
 
-    def calcReward(self, actions, rtype=0):
-        # Rtype key:
-        # 0: Detection
-        # 1: Movement
-        tf = self.tf[-1] + np.arange(1, self.cpi_len + 1) * 1 / actions['radar'][0]
-        az_pt = actions['scan'][0]
-        el_pt = actions['elscan'][0]
-        self.range_bins = cupy.array(
-            self.env.h_agl / np.sin(self.el_pt + self.el_bw / 2) + np.arange(self.nsam) * self.MPP,
-            dtype=np.float64)
-        chirp = self.genChirp(actions['wave'], self.bw)
-        fft_chirp = np.fft.fft(self.genChirp(actions['wave'], self.bw), self.fft_len)
-        win_chirp = np.fft.ifft(fft_chirp * taylor(self.fft_len))
-        cpi = self.genCPI(fft_chirp, tf, az_pt, el_pt)
-        state = db(cpi)
-        reward = 0
-
-        # Ambiguity function score
-        amb, _, _ = ambiguity(chirp, win_chirp, actions['radar'][0], 150)
-        thumb = np.zeros(amb.shape)
-        thumb[amb.shape[0] // 2, amb.shape[1] // 2] = 1
-        amb_sc = 1 - np.linalg.norm(amb / np.linalg.norm(amb) - thumb)
-        reward += amb_sc if rtype == 0 else 0
-
-        # Detectability score
-        net_sz = self.det_model.layers[0].input_shape[0][1]
-        fpos = -self.env.pos(self.tf)
-        det_sc = 0
-        ft_el = 0
-        for s in self.env.targets:
-            det_chirp = np.random.rand(max(self.nr, net_sz)) + 1j * np.random.rand(max(self.nr, net_sz))
-            pw, pe, pn = s(self.tf)
-            fpos[0, :] += pe
-            fpos[1, :] += pn
-            fpos[2, :] += pw * 20 / 50
-            rng = np.linalg.norm(fpos, axis=0)
-            el_tx = np.arcsin(-fpos[2, :] / rng)
-            az_tx = np.arctan2(fpos[0, :], fpos[1, :])
-            eldiff = cpudiff(el_tx, self.dep_ang)
-            azdiff = cpudiff(az_tx, actions['scan'])
-            tx_elpat = abs(np.sin(np.pi / self.el_bw * eldiff) / (np.pi / self.el_bw * eldiff))
-            tx_azpat = abs(np.sin(np.pi / self.az_bw * azdiff) / (np.pi / self.az_bw * azdiff))
-            att = np.mean(tx_elpat * tx_azpat)
-            det_chirp[:self.nr] += chirp * att * .5
-            wdd = WignerVilleDistribution(det_chirp).run()[0]
-            det_sc += self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
-            mu_x, mu_y, az_width, el_width = self.env.getAntennaBeamLocation(np.mean(self.tf), self.az_pt, self.el_pt)
-            rot = np.array([[np.cos(self.az_pt), -np.sin(self.az_pt)], [np.sin(self.az_pt), np.cos(self.az_pt)]])
-            mahal_cov = rot.dot(np.diag([az_width ** 2, el_width ** 2])).dot(np.linalg.pinv(rot))
-            uv = np.array([mu_y, mu_x]) - np.array([pe.mean(), pn.mean()])
-            ft_el += 1 / np.sqrt(uv.dot(np.linalg.pinv(mahal_cov)).dot(uv.T))
-        reward += det_sc if rtype == 0 else 0
-        reward += ft_el if rtype == 1 else 0
-        return reward
+        return full_state, done, reward
 
     def reset(self, num_parallel=None):
         self.tf = np.linspace(0, self.cpi_len / 500.0, self.cpi_len)
-        self.env = SimEnv(self.alt, self.az_bw, self.el_bw, self.dep_ang, f_ts=50)
+        self.env = SimEnv(self.alt, self.az_bw, self.el_bw, self.dep_ang, f_ts=10)
         self.log = []
         self.nsam = int((np.ceil((2 * self.env.frange / c0 + self.env.max_pl * self.plp) * TAC) -
                          np.floor(2 * self.env.nrange / c0 * TAC)) * self.fs / TAC)
         self.nr = int(self.env.max_pl * self.plp * self.fs)
         self.fft_len = findPowerOf2(self.nsam + self.nr)
-        return {'cpi': np.zeros((self.nsam, self.cpi_len)), 'pos': np.array([self.az_pt, self.el_pt])}
+        return {'cpi': np.zeros((self.nsam, self.cpi_len)),
+                'pos': np.array([self.az_pt, self.el_pt]),
+                'currwave': np.ones((10,)) * .5}
 
     def genCPI(self, chirp, tf, az_pt, el_pt):
         twin = taylor(self.fft_len)
@@ -224,7 +175,8 @@ class SinglePulseBackground(Environment):
         el_pan = el_pt * np.ones((self.cpi_len,))
         pan_gpu = cupy.array(np.ascontiguousarray(az_pan), dtype=np.float64)
         el_gpu = cupy.array(np.ascontiguousarray(el_pan), dtype=np.float64)
-        p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc, self.env.nrange / c0,
+        p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc,
+                                     self.alt / np.sin(self.el_pt + self.el_bw / 2) / c0,
                                      self.fs, self.dep_ang, self.env.eswath, self.env.swath]), dtype=np.float64)
         data_r = cupy.zeros(self.data_block, dtype=np.float64)
         data_i = cupy.zeros(self.data_block, dtype=np.float64)
@@ -272,17 +224,6 @@ class SinglePulseBackground(Environment):
     def genChirp(self, py, bandwidth):
         return genPulse(np.linspace(0, 1, len(py)), py, self.nr, self.nr / self.fs, 0, bandwidth)
 
-    def detect(self, signal):
-        wd = WignerVilleDistribution(signal)
-        wd.run()
-        tfr = wd.tfr
-        bmask = tfr > np.mean(tfr) + np.std(tfr)
-        bmask = binary_erosion(binary_dilation(bmask, iterations=1), iterations=1)
-        bandwidth = sum(wd.freqs[np.sum(bmask, axis=1) > 0]) / sum(wd.freqs) / 2
-        tfs = wd.ts[np.sum(bmask, axis=0) > 0]
-        t0 = (tfs.max() - tfs.min())
-        return bandwidth, t0
-
 
 class SimEnv(object):
     swath = 0
@@ -294,15 +235,15 @@ class SimEnv(object):
     max_pl = 0
     wave = None
 
-    def __init__(self, h_agl, az_bw, el_bw, dep_ang, f_ts=10):
+    def __init__(self, h_agl, az_bw, el_bw, dep_ang, f_ts=11):
         nrange = h_agl / np.sin(dep_ang + el_bw / 2)
         frange = h_agl / np.sin(dep_ang - el_bw / 2)
         gnrange = h_agl / np.tan(dep_ang + el_bw / 2)
         gfrange = h_agl / np.tan(dep_ang - el_bw / 2)
         gmrange = (gfrange + gnrange) / 2
         blen = np.tan(az_bw / 2) * gmrange
-        self.swath = (gfrange - gnrange) * 2
-        self.eswath = blen * 8
+        self.swath = (gfrange - gnrange)
+        self.eswath = blen * 2
         self.nrange = nrange
         self.frange = frange
         self.mrange = (frange + nrange) / 2
@@ -326,6 +267,9 @@ class SimEnv(object):
             np.linspace(self.eswath / 4, self.eswath - self.eswath / 4, npts) + (np.random.rand(npts) - .5) * 3, 3)
         n = gaussian_filter(-self.gnrange + (np.random.rand(npts) - .5) * 3, 3)
         u = gaussian_filter(self.h_agl + (np.random.rand(npts) - .5) * 3, 3)
+        e = (np.random.rand(npts) - .5) + self.eswath / 2
+        n = (np.random.rand(npts) - .5) - self.gmrange
+        u = self.h_agl + (np.random.rand(npts) - .5)
         re = UnivariateSpline(tt, e, s=.7, k=3)
         rn = UnivariateSpline(tt, n, s=.7, k=3)
         ru = UnivariateSpline(tt, u, s=.7, k=3)
