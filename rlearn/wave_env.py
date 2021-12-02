@@ -2,10 +2,11 @@ from tensorforce import Environment
 import numpy as np
 from tqdm import tqdm
 from scipy.signal.windows import taylor
+from scipy.signal import fftconvolve
 from scipy.spatial.distance import mahalanobis
 from scipy.ndimage import gaussian_filter
 from tftb.processing import WignerVilleDistribution
-from scipy.ndimage import binary_dilation, binary_erosion
+from scipy.ndimage import binary_dilation, binary_erosion, label
 import matplotlib.pyplot as plt
 from scipy.interpolate import UnivariateSpline, interp1d
 from numba import cuda, njit
@@ -35,6 +36,8 @@ DTR = np.pi / 180
 MAX_ALFA_ACCEL = 0.35185185185185186
 MAX_ALFA_SPEED = 21.1111111111111111
 THREADS_PER_BLOCK = (16, 16)
+EP_LEN_S = 60
+WAVEPOINTS = 20
 
 
 # Container class for radar data and parameters
@@ -64,13 +67,16 @@ class SinglePulseBackground(Environment):
         self.alt = 1524
         self.plp = .4
         self.fc = 9.6e9
-        self.samples = 200000
-        self.fs = fs / 8
-        self.bw = 100e6
+        self.samples = 400000
+        self.fs = fs / 4
+        self.bw = 240e6
         self.az_pt = np.pi / 2
         self.el_pt = 45 * DTR
         self.az_lims = (np.pi / 4, 3 * np.pi / 4)
         self.el_lims = (30 * DTR, 70 * DTR)
+        self.cfar_kernel = np.ones((40, 11))
+        self.cfar_kernel[17:24, 3:8] = 0
+        self.cfar_kernel = self.cfar_kernel / np.sum(self.cfar_kernel)
         self.reset()
         self.data_block = (self.nsam, self.cpi_len)
         self.MPP = c0 / 2 / self.fs
@@ -81,11 +87,12 @@ class SinglePulseBackground(Environment):
 
     def states(self):
         return dict(cpi=dict(type='float', shape=(self.nsam, self.cpi_len)),
-                    pos=dict(type='float', shape=(2,)),
-                    currwave=dict(type='float', shape=(10,)))
+                    currscan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
+                    currelscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]),
+                    currwave=dict(type='float', shape=(WAVEPOINTS,), min_value=0, max_value=1))
 
     def actions(self):
-        return dict(wave=dict(type='float', shape=(10,), min_value=0, max_value=1),
+        return dict(wave=dict(type='float', shape=(WAVEPOINTS,), min_value=0, max_value=1),
                     radar=dict(type='float', shape=(1,), min_value=10, max_value=self.maxPRF),
                     scan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
                     elscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]))
@@ -93,73 +100,68 @@ class SinglePulseBackground(Environment):
     def execute(self, actions):
         self.tf = self.tf[-1] + np.arange(1, self.cpi_len + 1) * 1 / actions['radar'][0]
         # We've reached the end of the data, pull out
-        done = False if self.tf[-1] < 10 else 2
-        self.tf[self.tf >= 10] = 9.99
+        done = False if self.tf[-1] < EP_LEN_S else 2
+        self.tf[self.tf >= EP_LEN_S] = EP_LEN_S - .01
+        motion = (abs(self.az_pt - actions['scan'][0]) + abs(self.el_pt - actions['elscan'][0]))**.1 - .5
         self.az_pt = actions['scan'][0]
         self.el_pt = actions['elscan'][0]
-        chirp = self.genChirp(actions['wave'], self.bw)
+        waveform = np.ones(WAVEPOINTS + 2)
+        waveform[0] = 0
+        waveform[1:-1] = actions['wave']
+        chirp = self.genChirp(waveform, self.bw)
         fft_chirp = np.fft.fft(chirp, self.fft_len)
         win_chirp = np.fft.ifft(fft_chirp * taylor(self.fft_len))
         cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
         state = abs(cpi)
-        self.ave = (np.mean(state) + self.ave) / 2
-        self.std = np.std(state)
-        state = (state - self.ave) / self.std
+        state = (state - np.mean(state)) / np.std(state)
         reward = 0
 
         # Ambiguity function score
         amb, _, _ = ambiguity(chirp, win_chirp, actions['radar'][0], 150)
         thumb = np.zeros(amb.shape)
         thumb[amb.shape[0] // 2, amb.shape[1] // 2] = 1
-        amb_sc = 1 / np.linalg.norm(amb / np.linalg.norm(amb) - thumb)**3
+        amb_sc = 1 / np.linalg.norm(amb / np.linalg.norm(amb) - thumb)**4
         reward += amb_sc
 
         # Detectability score
-        net_sz = self.det_model.layers[0].input_shape[0][1]
-        fpos = -self.env.pos(self.tf)
-        det_sc = 0
-        ft_el = 0
-        ft_az = 0
-        for s in self.env.targets:
-            det_chirp = np.random.rand(max(self.nr, net_sz)) + 1j * np.random.rand(max(self.nr, net_sz))
-            pw, pe, pn = s(self.tf)
-            fpos[0, :] += pe
-            fpos[1, :] += pn
-            fpos[2, :] += pw * 20 / 50
-            rng = np.linalg.norm(fpos, axis=0)
-            el_tx = np.arcsin(-fpos[2, :] / rng)
-            az_tx = np.arctan2(fpos[0, :], fpos[1, :])
-            eldiff = cpudiff(el_tx, actions['elscan'])
-            azdiff = cpudiff(az_tx, actions['scan'])
-            tx_elpat = abs(np.sin(np.pi / self.el_bw * eldiff) / (np.pi / self.el_bw * eldiff))
-            tx_azpat = abs(np.sin(np.pi / self.az_bw * azdiff) / (np.pi / self.az_bw * azdiff))
-            att = np.max(tx_elpat * tx_azpat) * 4
-            det_chirp[:self.nr] += chirp * 250
-            wdd = WignerVilleDistribution(det_chirp).run()[0]
-            # det_sc += self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
-            ft_az += att
+        #net_sz = self.det_model.layers[0].input_shape[0][1]
+        #det_chirp = np.random.rand(max(self.nr, net_sz)) + 1j * np.random.rand(max(self.nr, net_sz))
+        #det_chirp[:self.nr] += chirp
+        #wdd = WignerVilleDistribution(det_chirp).run()[0]
+        det_sc = 0 #self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
         reward += det_sc
-        reward += ft_az
 
-        self.log.append([state, [amb_sc, det_sc, ft_az],
-                         self.tf, actions['scan'], actions['elscan'], actions['wave']])
+        # Movement score
+        # Find targets using basic CFAR
+        thresh = fftconvolve(state, self.cfar_kernel, mode='same')
+        det_targets = state > thresh + 4
+        det_targets[:, :3] = 0
+        det_targets[:, -3:] = 0
+        if np.any(det_targets):
+            t_score = state[det_targets].mean() / state.max() + 1 / abs(np.where(det_targets)[0].mean() - det_targets.shape[0] // 2)
+        else:
+            t_score = motion
 
-        full_state = {'cpi': state, 'pos': np.array([self.az_pt, self.el_pt]),
+        self.log.append([det_targets, [amb_sc, det_sc, t_score],
+                         self.tf, actions['scan'], actions['elscan'], waveform])
+
+        full_state = {'cpi': state, 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
                       'currwave': actions['wave']}
 
         return full_state, done, reward
 
     def reset(self, num_parallel=None):
         self.tf = np.linspace(0, self.cpi_len / 500.0, self.cpi_len)
-        self.env = SimEnv(self.alt, self.az_bw, self.el_bw, self.dep_ang, f_ts=10)
+        self.env = SimEnv(self.alt, self.az_bw, self.el_bw, self.dep_ang, f_ts=EP_LEN_S)
         self.log = []
         self.nsam = int((np.ceil((2 * self.env.frange / c0 + self.env.max_pl * self.plp) * TAC) -
                          np.floor(2 * self.env.nrange / c0 * TAC)) * self.fs / TAC)
         self.nr = int(self.env.max_pl * self.plp * self.fs)
         self.fft_len = findPowerOf2(self.nsam + self.nr)
+        init_wave = np.ones(WAVEPOINTS) * .5
         return {'cpi': np.zeros((self.nsam, self.cpi_len)),
-                'pos': np.array([self.az_pt, self.el_pt]),
-                'currwave': np.ones((10,)) * .5}
+                'currscan': [self.az_pt], 'currelscan': [self.el_pt],
+                'currwave': init_wave}
 
     def genCPI(self, chirp, tf, az_pt, el_pt):
         twin = taylor(self.fft_len)
@@ -255,21 +257,22 @@ class SimEnv(object):
         self.targets = []
         self.f_ts = f_ts
         self.genFlightPath()
-        self.targets.append(Sub(0, self.eswath,
-                                0, self.swath))
+        for n in range(1):
+            self.targets.append(Sub(0, self.eswath,
+                                    0, self.swath, f_ts))
 
     def genFlightPath(self):
         # We start assuming that the bottom left corner of scene is (0, 0, 0) ENU
-        # Platform motion (assuming 100 Hz signal, so this is 10 sec)
+        # Platform motion (assuming 100 Hz signal)
         npts = int(50 * self.f_ts / 10)
         tt = np.linspace(0, self.f_ts, npts)
         e = gaussian_filter(
             np.linspace(self.eswath / 4, self.eswath - self.eswath / 4, npts) + (np.random.rand(npts) - .5) * 3, 3)
         n = gaussian_filter(-self.gnrange + (np.random.rand(npts) - .5) * 3, 3)
         u = gaussian_filter(self.h_agl + (np.random.rand(npts) - .5) * 3, 3)
-        e = (np.random.rand(npts) - .5) + self.eswath / 2
-        n = (np.random.rand(npts) - .5) - self.gmrange
-        u = self.h_agl + (np.random.rand(npts) - .5)
+        e = np.zeros(npts) + self.eswath / 2
+        n = np.zeros(npts) - self.gmrange
+        u = self.h_agl + np.zeros(npts)
         re = UnivariateSpline(tt, e, s=.7, k=3)
         rn = UnivariateSpline(tt, n, s=.7, k=3)
         ru = UnivariateSpline(tt, u, s=.7, k=3)
@@ -289,6 +292,7 @@ class SimEnv(object):
 
 class Sub(object):
     pos = None
+    vel = None
     surf = None
 
     def __init__(self, min_x, max_x, min_y, max_y, f_ts=11):
@@ -336,11 +340,15 @@ class Sub(object):
         pe = UnivariateSpline(np.linspace(0, f_ts, f_ts * 100), pos[1, :])
         surf = interp1d(np.linspace(0, f_ts, f_ts * 100), is_surfaced, fill_value=0)
         self.pos = lambda t: np.array([pe(t), pn(t)])
+        vn = np.gradient(pos[0, :]) / 100
+        ve = np.gradient(pos[1, :]) / 100
+        self.vel = lambda t: np.array([ve(t), vn(t)])
         self.surf = surf
 
 
 @cuda.jit(device=True)
 def wavefunction(x, y, t):
+    t = 0
     return .25 * cmath.exp(1j * (.70710678 / 100 * x + .70710678 / 100 * y + 2 * np.pi * .1 * t)) + \
         .47 * cmath.exp(1j * (0.9486833 / 40 * x + 0.31622777 / 40 * y + 2 * np.pi * 10 * t))
 
@@ -409,33 +417,24 @@ def genSubProfile(path, subs, pan, el, pd_r, pd_i, params):
         tz = 20 if spow > 0 else 0
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
-        s_x = tx - path[0, tt]
-        s_y = ty - path[1, tt]
-        s_z = tz - path[2, tt]
-        rng = math.sqrt(s_x * s_x + s_y * s_y + s_z * s_z)
-        rng_bin = (rng * 2 / c0 - 2 * params[3]) * params[4]
-        but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
-        if n_samples > but > 0:
-            el_tx = math.asin(-s_z / rng)
-            az_tx = math.atan2(s_x, s_y)
-            eldiff = diff(el_tx, el[tt])
-            azdiff = diff(az_tx, pan[tt])
-            tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
-            tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
-            att = tx_elpat * tx_azpat
-            acc_val = spow * att * cmath.exp(-1j * wavenumber * rng * 2) * 1 / (rng * rng)
-            cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
-            cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
-
-            # Add as a small gaussian
-            cuda.atomic.add(pd_r, (but - 1, np.uint64(tt)), acc_val.real * .6)
-            cuda.atomic.add(pd_i, (but - 1, np.uint64(tt)), acc_val.imag * .6)
-            cuda.atomic.add(pd_r, (but + 1, np.uint64(tt)), acc_val.real * .6)
-            cuda.atomic.add(pd_i, (but + 1, np.uint64(tt)), acc_val.imag * .6)
-            cuda.atomic.add(pd_r, (but - 2, np.uint64(tt)), acc_val.real * .2)
-            cuda.atomic.add(pd_i, (but - 2, np.uint64(tt)), acc_val.imag * .2)
-            cuda.atomic.add(pd_r, (but + 2, np.uint64(tt)), acc_val.real * .2)
-            cuda.atomic.add(pd_i, (but + 2, np.uint64(tt)), acc_val.imag * .2)
+        for n in range(-3, 3):
+            s_x = tx - path[0, tt]
+            s_y = ty - path[1, tt]
+            s_z = tz - path[2, tt]
+            rng = math.sqrt(s_x * s_x + s_y * s_y + s_z * s_z) + c0 / params[4] * n
+            rng_bin = (rng * 2 / c0 - 2 * params[3]) * params[4]
+            but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
+            if n_samples > but > 0:
+                el_tx = math.asin(-s_z / rng)
+                az_tx = math.atan2(s_x, s_y)
+                eldiff = diff(el_tx, el[tt])
+                azdiff = diff(az_tx, pan[tt])
+                tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
+                tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
+                att = tx_elpat * tx_azpat
+                acc_val = spow * att * cmath.exp(-1j * wavenumber * rng * 2) * 1 / (rng * rng)
+                cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
+                cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
 
 def ellipse(x, y, a, b, ang):
@@ -478,10 +477,10 @@ if __name__ == '__main__':
     agent = SinglePulseBackground()
     test = SimEnv(agent.alt, agent.az_bw, agent.el_bw, agent.dep_ang)
 
-    pulse = agent.genChirp(np.linspace(0, 1, 10), agent.bw)
+    pulse = agent.genChirp(np.linspace(0, 1, WAVEPOINTS), agent.bw)
 
     for cpi in tqdm(range(200)):
-        cpi_data, done, reward = agent.execute({'wave': np.linspace(0, 1, 10), 'radar': [100], 'scan': [np.pi / 2]})
+        cpi_data, done, reward = agent.execute({'wave': np.linspace(0, 1, WAVEPOINTS), 'radar': [100], 'scan': [np.pi / 2]})
         #print(agent.az_pt / DTR)
 
     logs = agent.log
