@@ -3,6 +3,7 @@ import numpy as np
 from tqdm import tqdm
 from scipy.signal.windows import taylor
 from scipy.signal import fftconvolve
+from scipy.linalg import convolution_matrix
 from scipy.spatial.distance import mahalanobis
 from scipy.ndimage import gaussian_filter
 from tftb.processing import WignerVilleDistribution
@@ -25,7 +26,7 @@ def db(x):
 
 
 def findPowerOf2(x):
-    return int(2**(np.ceil(np.log2(x))))
+    return int(2 ** (np.ceil(np.log2(x))))
 
 
 c0 = 299792458.0
@@ -37,7 +38,7 @@ MAX_ALFA_ACCEL = 0.35185185185185186
 MAX_ALFA_SPEED = 21.1111111111111111
 THREADS_PER_BLOCK = (16, 16)
 EP_LEN_S = 60
-WAVEPOINTS = 20
+WAVEPOINTS = 50
 
 
 # Container class for radar data and parameters
@@ -67,17 +68,21 @@ class SinglePulseBackground(Environment):
         self.alt = 1524
         self.plp = .4
         self.fc = 9.6e9
-        self.samples = 400000
-        self.fs = fs / 4
-        self.bw = 240e6
+        self.samples = 300000
+        self.fs = fs / 8
+        self.bw = 120e6
         self.az_pt = np.pi / 2
         self.el_pt = 45 * DTR
-        self.az_lims = (np.pi / 4, 3 * np.pi / 4)
+        self.az_lims = (0, np.pi)
         self.el_lims = (30 * DTR, 70 * DTR)
+
+        # Generate CFAR kernel
         self.cfar_kernel = np.ones((40, 11))
         self.cfar_kernel[17:24, 3:8] = 0
         self.cfar_kernel = self.cfar_kernel / np.sum(self.cfar_kernel)
+        self.det_targets = []
         self.reset()
+
         self.data_block = (self.nsam, self.cpi_len)
         self.MPP = c0 / 2 / self.fs
         self.maxPRF = min(c0 / (self.env.nrange + self.nsam * self.MPP), 500.0)
@@ -93,7 +98,7 @@ class SinglePulseBackground(Environment):
 
     def actions(self):
         return dict(wave=dict(type='float', shape=(WAVEPOINTS,), min_value=0, max_value=1),
-                    radar=dict(type='float', shape=(1,), min_value=10, max_value=self.maxPRF),
+                    radar=dict(type='float', shape=(1,), min_value=100, max_value=self.maxPRF),
                     scan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
                     elscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]))
 
@@ -102,48 +107,68 @@ class SinglePulseBackground(Environment):
         # We've reached the end of the data, pull out
         done = False if self.tf[-1] < EP_LEN_S else 2
         self.tf[self.tf >= EP_LEN_S] = EP_LEN_S - .01
-        motion = (abs(self.az_pt - actions['scan'][0]) + abs(self.el_pt - actions['elscan'][0]))**.1 - .5
+        motion = (abs(self.az_pt - actions['scan'][0]) + abs(self.el_pt - actions['elscan'][0])) ** .1 - .5
         self.az_pt = actions['scan'][0]
         self.el_pt = actions['elscan'][0]
-        waveform = np.ones(WAVEPOINTS + 2)
-        waveform[0] = 0
-        waveform[1:-1] = actions['wave']
-        chirp = self.genChirp(waveform, self.bw)
+        chirp = self.genChirp(actions['wave'], self.bw)
         fft_chirp = np.fft.fft(chirp, self.fft_len)
-        win_chirp = np.fft.ifft(fft_chirp * taylor(self.fft_len))
         cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
         state = abs(cpi)
         state = (state - np.mean(state)) / np.std(state)
         reward = 0
 
-        # Ambiguity function score
-        amb, _, _ = ambiguity(chirp, win_chirp, actions['radar'][0], 150)
-        thumb = np.zeros(amb.shape)
-        thumb[amb.shape[0] // 2, amb.shape[1] // 2] = 1
-        amb_sc = 1 / np.linalg.norm(amb / np.linalg.norm(amb) - thumb)**4
+        # Ambiguity score
+        rc_chirp = db(np.fft.ifft(fft_chirp * fft_chirp.conj().T))
+        rc_chirp = rc_chirp / np.linalg.norm(rc_chirp)
+        tack = np.zeros(len(rc_chirp), dtype=np.complex128)
+        tack[len(rc_chirp) // 2] = rc_chirp.max()
+        amb_sc = 1 - np.linalg.norm(rc_chirp - tack)
         reward += amb_sc
 
+        # PRF shift score
+        prf_sc = 0
+
         # Detectability score
-        #net_sz = self.det_model.layers[0].input_shape[0][1]
-        #det_chirp = np.random.rand(max(self.nr, net_sz)) + 1j * np.random.rand(max(self.nr, net_sz))
-        #det_chirp[:self.nr] += chirp
-        #wdd = WignerVilleDistribution(det_chirp).run()[0]
-        det_sc = 0 #self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
+        net_sz = self.det_model.layers[0].input_shape[0][1]
+        det_chirp = (np.random.rand(max(self.nr, net_sz)) - .5 + 1j * (np.random.rand(max(self.nr, net_sz)) - .5)) / 100
+        det_chirp[:self.nr] += chirp
+        wdd = WignerVilleDistribution(det_chirp).run()[0]
+        det_sc = self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
         reward += det_sc
 
         # Movement score
         # Find targets using basic CFAR
         thresh = fftconvolve(state, self.cfar_kernel, mode='same')
-        det_targets = state > thresh + 4
+        det_targets = state > thresh + 7
         det_targets[:, :3] = 0
         det_targets[:, -3:] = 0
-        if np.any(det_targets):
-            t_score = state[det_targets].mean() / state.max() + 1 / abs(np.where(det_targets)[0].mean() - det_targets.shape[0] // 2)
-        else:
-            t_score = motion
+        t_score = 0
+        labels, ntargets = label(det_targets)
+        # Run through targets and add any that we might need
+        for lab in range(ntargets):
+            rngs, vels = np.where(labels == lab)
+            rng = c0 / 2 * (rngs.mean() / self.fs + 2 * self.alt / c0 / np.sin(self.el_pt + self.el_bw / 2))
+            vel = vels.mean() * actions['radar'][0] / self.fc * c0
+            if len(self.det_targets) == 0:
+                self.det_targets.append(Target(rng, vel, self.tf[-1]))
+            else:
+                for targ in self.det_targets:
+                    if targ(rng, vel, self.tf[-1]):
+                        break
+        # Disassociate targets
+        for targ in self.det_targets:
+            if targ.dissac(self.tf[-1]):
+                self.det_targets.remove(targ)
+        if len(self.det_targets) > 0:
+            for targ in self.det_targets:
+                t_score += 1 + .5 / abs(targ.rng - c0 / 2 * (2 * self.alt / c0 / np.sin(self.el_pt)))
+                prf_sc += 1 / abs(targ.vel)
+        t_score += motion
+        reward += t_score
+        reward += prf_sc
 
-        self.log.append([det_targets, [amb_sc, det_sc, t_score],
-                         self.tf, actions['scan'], actions['elscan'], waveform])
+        self.log.append([cpi, [amb_sc, det_sc, t_score, prf_sc],
+                         self.tf, actions['scan'], actions['elscan'], actions['wave'], len(self.det_targets)])
 
         full_state = {'cpi': state, 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
                       'currwave': actions['wave']}
@@ -179,7 +204,8 @@ class SinglePulseBackground(Environment):
         el_gpu = cupy.array(np.ascontiguousarray(el_pan), dtype=np.float64)
         p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc,
                                      self.alt / np.sin(self.el_pt + self.el_bw / 2) / c0,
-                                     self.fs, self.dep_ang, self.env.eswath, self.env.swath]), dtype=np.float64)
+                                     self.fs, self.dep_ang, self.env.eswath, self.env.swath,
+                                     np.random.randint(1, 15)]), dtype=np.float64)
         data_r = cupy.zeros(self.data_block, dtype=np.float64)
         data_i = cupy.zeros(self.data_block, dtype=np.float64)
         gx = cupy.array(np.random.rand(self.samples), dtype=np.float64)
@@ -257,7 +283,7 @@ class SimEnv(object):
         self.targets = []
         self.f_ts = f_ts
         self.genFlightPath()
-        for n in range(1):
+        for n in range(2):
             self.targets.append(Sub(0, self.eswath,
                                     0, self.swath, f_ts))
 
@@ -288,6 +314,33 @@ class SimEnv(object):
         eshift = np.cos(az_ang) * self.h_agl / np.tan(el_ang)
         nshift = np.sin(az_ang) * self.h_agl / np.tan(el_ang)
         return fpos[0] + eshift, fpos[1] + nshift, self.gbwidth, (self.gfrange - self.gnrange) / 2
+
+
+class Target(object):
+    def __init__(self, rng, vel, t):
+        self.rng = rng
+        self.vel = vel
+        self.track = [[rng, vel, t]]
+        self.last_assoc = t
+
+    def __call__(self, rng, vel, t):
+        # First, check to see what the expected new position is
+        if abs(self.rng + (t - self.last_assoc) * self.vel - rng) < 5:
+            if abs(self.vel - vel) < 10:
+                # Passes the checks, associate it
+                self.rng = rng
+                self.vel = vel
+                self.track.append([rng, vel, t])
+                self.last_assoc = t
+                return True
+        # Failed!
+        return False
+
+    def dissac(self, t):
+        # Send a disassociate signal if it has been too long between detections
+        if t - self.last_assoc > .1:
+            return True
+        return False
 
 
 class Sub(object):
@@ -347,15 +400,21 @@ class Sub(object):
 
 
 @cuda.jit(device=True)
-def wavefunction(x, y, t):
-    t = 0
-    return .25 * cmath.exp(1j * (.70710678 / 100 * x + .70710678 / 100 * y + 2 * np.pi * .1 * t)) + \
-        .47 * cmath.exp(1j * (0.9486833 / 40 * x + 0.31622777 / 40 * y + 2 * np.pi * 10 * t))
+def wavefunction(x, y, t, ws):
+    nwaves = int(ws % 4) + 1
+    wave = 1j * 0
+    for n in range(nwaves):
+        wdir = cmath.exp(1j * ws)
+        wave += ws / 10.0 * cmath.exp(
+            1j * (wdir.real / (ws * 10) * x + wdir.imag / (ws * 10) * y + 2 * np.pi * ws / 4.0 * t))
+    return wave
+    # return .25 * cmath.exp(1j * (.70710678 / 100 * x + .70710678 / 100 * y + 2 * np.pi * .1 * t)) + \
+    #   .47 * cmath.exp(1j * (0.9486833 / 40 * x + 0.31622777 / 40 * y + 2 * np.pi * 10 * t))
 
 
 def wave_cpu(x, y, t):
     return .25 * np.exp(1j * (.70710678 / 100 * x + .70710678 / 100 * y + 2 * np.pi * .1 * t)) + \
-        .47 * np.exp(1j * (0.9486833 / 40 * x + 0.31622777 / 40 * y + 2 * np.pi * 10 * t))
+           .47 * np.exp(1j * (0.9486833 / 40 * x + 0.31622777 / 40 * y + 2 * np.pi * 10 * t))
 
 
 @cuda.jit(device=True)
@@ -370,7 +429,8 @@ def cpudiff(x, y):
 
 
 @cuda.jit(
-    'void(float64[:, :], float64[:], float64[:], float64[:], float64[:], float64[:], float64[:, :], float64[:, :], float64[:])')
+    'void(float64[:, :], float64[:], float64[:], float64[:], float64[:], ' +
+    'float64[:], float64[:, :], float64[:, :], float64[:])')
 def genRangeProfile(path, gx, gy, pan, el, t, pd_r, pd_i, params):
     tt, samp_point = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and samp_point < gx.size:
@@ -381,7 +441,7 @@ def genRangeProfile(path, gx, gy, pan, el, t, pd_r, pd_i, params):
         tx = gx[samp_point] * (params[6] * 2) - params[6] / 2
         ty = gy[samp_point] * (params[7] * 2) - params[7] / 2
 
-        wp = wavefunction(tx, ty, t[tt])
+        wp = wavefunction(tx, ty, t[tt], params[8])
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
         s_x = tx - path[0, tt]
@@ -480,8 +540,9 @@ if __name__ == '__main__':
     pulse = agent.genChirp(np.linspace(0, 1, WAVEPOINTS), agent.bw)
 
     for cpi in tqdm(range(200)):
-        cpi_data, done, reward = agent.execute({'wave': np.linspace(0, 1, WAVEPOINTS), 'radar': [100], 'scan': [np.pi / 2]})
-        #print(agent.az_pt / DTR)
+        cpi_data, done, reward = agent.execute({'wave': np.linspace(0, 1, WAVEPOINTS),
+                                                'radar': [100], 'scan': [np.pi / 2]})
+        # print(agent.az_pt / DTR)
 
     logs = agent.log
     skips = 2
@@ -535,7 +596,6 @@ if __name__ == '__main__':
 
     # plt.figure('Score breakdown')
 
-
     '''fig_wave = plt.figure('Waves')
     gx, gy = np.meshgrid(np.linspace(-agent.env.eswath / 2, agent.env.eswath * 1.5, 1000),
                          np.linspace(-agent.env.swath / 2, agent.env.swath * 1.5, 1000))
@@ -547,4 +607,3 @@ if __name__ == '__main__':
         cam_wave.snap()
 
     anim_wave = cam_wave.animate()'''
-
