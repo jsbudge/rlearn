@@ -138,8 +138,10 @@ class SinglePulseBackground(Environment):
 
         # Movement score
         # Find targets using basic CFAR
-        thresh = fftconvolve(state, self.cfar_kernel, mode='same')
-        det_targets = state > thresh + 7
+        # First, remove sea spikes using a simple averaging filter
+        det_state = fftconvolve(state, np.ones((5, 5)) / 25.0)
+        thresh = fftconvolve(det_state, self.cfar_kernel, mode='same')
+        det_targets = det_state > thresh + 5
         det_targets[:, :3] = 0
         det_targets[:, -3:] = 0
         t_score = 0
