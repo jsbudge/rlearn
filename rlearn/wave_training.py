@@ -24,7 +24,7 @@ def findPowerOf2(x):
     return int(2**(np.ceil(np.log2(x))))
 
 
-games = 10
+games = 1
 eval_games = 1
 max_timesteps = 128
 batch_sz = 32

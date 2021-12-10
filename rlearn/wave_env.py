@@ -38,7 +38,7 @@ MAX_ALFA_ACCEL = 0.35185185185185186
 MAX_ALFA_SPEED = 21.1111111111111111
 THREADS_PER_BLOCK = (16, 16)
 EP_LEN_S = 60
-WAVEPOINTS = 50
+WAVEPOINTS = 100
 
 
 # Container class for radar data and parameters
@@ -68,13 +68,23 @@ class SinglePulseBackground(Environment):
         self.alt = 1524
         self.plp = .4
         self.fc = 9.6e9
-        self.samples = 300000
+        self.samples = 200000
         self.fs = fs / 8
         self.bw = 120e6
         self.az_pt = np.pi / 2
         self.el_pt = 45 * DTR
         self.az_lims = (0, np.pi)
         self.el_lims = (30 * DTR, 70 * DTR)
+
+        # Add in extra phase centers
+        self.antenna_locs = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]
+        self.antenna_locs = np.array(self.antenna_locs).T
+        self.el_rot = lambda el, loc: np.array([[1, 0, 0],
+                                [0, np.cos(el), -np.sin(el)],
+                                [0, np.sin(el), np.cos(el)]]).dot(loc)
+        self.az_rot = lambda az, loc: np.array([[np.cos(az), -np.sin(az), 0],
+                                                [np.sin(az), np.cos(az), 0],
+                                                [0, 0, 1]]).dot(loc)
 
         # Generate CFAR kernel
         self.cfar_kernel = np.ones((40, 11))
@@ -86,7 +96,10 @@ class SinglePulseBackground(Environment):
         self.data_block = (self.nsam, self.cpi_len)
         self.MPP = c0 / 2 / self.fs
         self.maxPRF = min(c0 / (self.env.nrange + self.nsam * self.MPP), 500.0)
-        self.det_model = keras.models.load_model('./id_model')
+        try:
+            self.det_model = keras.models.load_model('./id_model')
+        except OSError:
+            self.det_model = None
         self.ave = 0
         self.std = 0
 
@@ -129,11 +142,15 @@ class SinglePulseBackground(Environment):
         prf_sc = 0
 
         # Detectability score
-        net_sz = self.det_model.layers[0].input_shape[0][1]
-        det_chirp = (np.random.rand(max(self.nr, net_sz)) - .5 + 1j * (np.random.rand(max(self.nr, net_sz)) - .5)) / 100
-        det_chirp[:self.nr] += chirp
-        wdd = WignerVilleDistribution(det_chirp).run()[0]
-        det_sc = self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
+        if self.det_model is not None:
+            net_sz = self.det_model.layers[0].input_shape[0][1]
+            det_chirp = (np.random.rand(max(self.nr, net_sz)) - .5 + 1j *
+                         (np.random.rand(max(self.nr, net_sz)) - .5)) / 100
+            det_chirp[:self.nr] += chirp
+            wdd = WignerVilleDistribution(det_chirp).run()[0]
+            det_sc = self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
+        else:
+            det_sc = 0
         reward += det_sc
 
         # Movement score
@@ -199,7 +216,6 @@ class SinglePulseBackground(Environment):
             int(np.ceil(self.cpi_len / THREADS_PER_BLOCK[0])), int(np.ceil(self.samples / THREADS_PER_BLOCK[1])))
         sub_blocks = (int(np.ceil(self.cpi_len / THREADS_PER_BLOCK[0])),
                       int(np.ceil(len(self.env.targets) / THREADS_PER_BLOCK[1])))
-        pos_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf)), dtype=np.float64)
         az_pan = az_pt * np.ones((self.cpi_len,))
         el_pan = el_pt * np.ones((self.cpi_len,))
         pan_gpu = cupy.array(np.ascontiguousarray(az_pan), dtype=np.float64)
@@ -217,14 +233,14 @@ class SinglePulseBackground(Environment):
             sv.append([sub(t) for t in tf])
         sub_pos = cupy.array(np.ascontiguousarray(sv), dtype=np.float64)
         times = cupy.array(np.ascontiguousarray(tf), dtype=np.float64)
-
-        genRangeProfile[blocks_per_grid, THREADS_PER_BLOCK](pos_gpu, gx, gy, pan_gpu, el_gpu,
-                                                            times, data_r, data_i, p_gpu)
-        cupy.cuda.Device().synchronize()
-
-        genSubProfile[sub_blocks, THREADS_PER_BLOCK](pos_gpu, sub_pos, pan_gpu, el_gpu, data_r, data_i, p_gpu)
-        cupy.cuda.Device().synchronize()
-
+        alocs = self.el_rot(el_pt, self.az_rot(az_pt, self.antenna_locs))
+        for ant in range(self.antenna_locs.shape[1]):
+            pos_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf) + alocs[:, ant][:, None]), dtype=np.float64)
+            genRangeProfile[blocks_per_grid, THREADS_PER_BLOCK](pos_gpu, gx, gy, pan_gpu, el_gpu,
+                                                                times, data_r, data_i, p_gpu)
+            cupy.cuda.Device().synchronize()
+            genSubProfile[sub_blocks, THREADS_PER_BLOCK](pos_gpu, sub_pos, pan_gpu, el_gpu, data_r, data_i, p_gpu)
+            cupy.cuda.Device().synchronize()
         data = data_r + 1j * data_i
 
         ret_data = cupy.fft.fft(
@@ -403,7 +419,7 @@ class Sub(object):
 
 @cuda.jit(device=True)
 def wavefunction(x, y, t, ws):
-    nwaves = int(ws % 4) + 1
+    nwaves = int(ws % 8) + 1
     wave = 1j * 0
     for n in range(nwaves):
         wdir = cmath.exp(1j * ws)
