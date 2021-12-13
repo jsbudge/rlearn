@@ -66,7 +66,7 @@ class SinglePulseBackground(Environment):
         self.el_bw = 12 * DTR
         self.dep_ang = 45 * DTR
         self.alt = 1524
-        self.plp = .4
+        self.plp = 1
         self.fc = 9.6e9
         self.samples = 200000
         self.fs = fs / 8
@@ -77,7 +77,7 @@ class SinglePulseBackground(Environment):
         self.el_lims = (30 * DTR, 70 * DTR)
 
         # Add in extra phase centers
-        self.antenna_locs = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]
+        self.antenna_locs = [(1, 0, 0), (-1, 0, 0), (0, 1, 0)]
         self.antenna_locs = np.array(self.antenna_locs).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                 [0, np.cos(el), -np.sin(el)],
@@ -85,6 +85,7 @@ class SinglePulseBackground(Environment):
         self.az_rot = lambda az, loc: np.array([[np.cos(az), -np.sin(az), 0],
                                                 [np.sin(az), np.cos(az), 0],
                                                 [0, 0, 1]]).dot(loc)
+        self.n_ants = self.antenna_locs.shape[1]
 
         # Generate CFAR kernel
         self.cfar_kernel = np.ones((40, 11))
@@ -107,10 +108,10 @@ class SinglePulseBackground(Environment):
         return dict(cpi=dict(type='float', shape=(self.nsam, self.cpi_len)),
                     currscan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
                     currelscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]),
-                    currwave=dict(type='float', shape=(WAVEPOINTS,), min_value=0, max_value=1))
+                    currwave=dict(type='float', shape=(WAVEPOINTS, self.n_ants), min_value=0, max_value=1))
 
     def actions(self):
-        return dict(wave=dict(type='float', shape=(WAVEPOINTS,), min_value=0, max_value=1),
+        return dict(wave=dict(type='float', shape=(WAVEPOINTS, self.n_ants), min_value=0, max_value=1),
                     radar=dict(type='float', shape=(1,), min_value=100, max_value=self.maxPRF),
                     scan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
                     elscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]))
@@ -123,57 +124,75 @@ class SinglePulseBackground(Environment):
         motion = (abs(self.az_pt - actions['scan'][0]) + abs(self.el_pt - actions['elscan'][0])) ** .1 - .5
         self.az_pt = actions['scan'][0]
         self.el_pt = actions['elscan'][0]
-        chirp = self.genChirp(actions['wave'], self.bw)
-        fft_chirp = np.fft.fft(chirp, self.fft_len)
+        chirps = np.zeros((self.nr, self.n_ants), dtype=np.complex128)
+        for n in range(self.n_ants):
+            chirps[:, n] = self.genChirp(actions['wave'][:, n], self.bw)
+        fft_chirp = np.fft.fft(chirps, self.fft_len, axis=0)
+
+        # Generate the CPI using chirps; generates a nsam x cpi_len x n_ants block of FFT data
         cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
-        state = abs(cpi)
-        state = (state - np.mean(state)) / np.std(state)
+        state = np.zeros((self.nsam, self.cpi_len, self.n_ants))
+        for n in range(self.n_ants):
+            rda = genRDAMap(cpi[:, :, n], fft_chirp[:, n], self.nsam)
+            st = abs(rda)
+            if np.std(st) > 0:
+                st = (st - np.mean(st)) / np.std(st)
+            else:
+                pass
+            state[:, :, n] = st
         reward = 0
+        t_score = 0
 
         # Ambiguity score
-        rc_chirp = db(np.fft.ifft(fft_chirp * fft_chirp.conj().T))
-        rc_chirp = rc_chirp / np.linalg.norm(rc_chirp)
-        tack = np.zeros(len(rc_chirp), dtype=np.complex128)
-        tack[len(rc_chirp) // 2] = rc_chirp.max()
-        amb_sc = 1 - np.linalg.norm(rc_chirp - tack)
+        spike_cov = np.zeros((self.n_ants, self.n_ants))
+        for rx in range(self.n_ants):
+            for tx in range(self.n_ants):
+                rc_chirp = db(np.fft.ifft(fft_chirp[:, rx] * fft_chirp[:, tx].conj().T))
+                rc_chirp = rc_chirp / np.linalg.norm(rc_chirp)
+                spike_cov[rx, tx] = rc_chirp.max()
+        amb_sc = 1 - np.linalg.norm(spike_cov - np.eye(self.n_ants))
         reward += amb_sc
 
         # PRF shift score
         prf_sc = 0
 
         # Detectability score
+        det_sc = 0
+        '''
         if self.det_model is not None:
             net_sz = self.det_model.layers[0].input_shape[0][1]
             det_chirp = (np.random.rand(max(self.nr, net_sz)) - .5 + 1j *
                          (np.random.rand(max(self.nr, net_sz)) - .5)) / 100
-            det_chirp[:self.nr] += chirp
+            det_chirp[:self.nr] += chirps[:, 0]
             wdd = WignerVilleDistribution(det_chirp).run()[0]
             det_sc = self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
         else:
             det_sc = 0
         reward += det_sc
+        '''
 
         # Movement score
         # Find targets using basic CFAR
         # First, remove sea spikes using a simple averaging filter
-        det_state = fftconvolve(state, np.ones((5, 5)) / 25.0)
-        thresh = fftconvolve(det_state, self.cfar_kernel, mode='same')
-        det_targets = det_state > thresh + 5
-        det_targets[:, :3] = 0
-        det_targets[:, -3:] = 0
-        t_score = 0
-        labels, ntargets = label(det_targets)
-        # Run through targets and add any that we might need
-        for lab in range(ntargets):
-            rngs, vels = np.where(labels == lab)
-            rng = c0 / 2 * (rngs.mean() / self.fs + 2 * self.alt / c0 / np.sin(self.el_pt + self.el_bw / 2))
-            vel = vels.mean() * actions['radar'][0] / self.fc * c0
-            if len(self.det_targets) == 0:
-                self.det_targets.append(Target(rng, vel, self.tf[-1]))
-            else:
-                for targ in self.det_targets:
-                    if targ(rng, vel, self.tf[-1]):
-                        break
+        for ant in range(self.n_ants):
+            det_state = fftconvolve(state[:, :, ant], np.ones((5, 5)) / 25.0, mode='same')
+            thresh = fftconvolve(det_state, self.cfar_kernel, mode='same')
+            det_targets = det_state > thresh + 5
+            det_targets[:, :3] = 0
+            det_targets[:, -3:] = 0
+            t_score = 0
+            labels, ntargets = label(det_targets)
+            # Run through targets and add any that we might need
+            for lab in range(ntargets):
+                rngs, vels = np.where(labels == lab)
+                rng = c0 / 2 * (rngs.mean() / self.fs + 2 * self.alt / c0 / np.sin(self.el_pt + self.el_bw / 2))
+                vel = vels.mean() * actions['radar'][0] / self.fc * c0
+                if len(self.det_targets) == 0:
+                    self.det_targets.append(Target(rng, vel, self.tf[-1]))
+                else:
+                    for targ in self.det_targets:
+                        if targ(rng, vel, self.tf[-1]):
+                            break
         # Disassociate targets
         for targ in self.det_targets:
             if targ.dissac(self.tf[-1]):
@@ -186,10 +205,10 @@ class SinglePulseBackground(Environment):
         reward += t_score
         reward += prf_sc
 
-        self.log.append([cpi, [amb_sc, det_sc, t_score, prf_sc],
+        self.log.append([state, [amb_sc, det_sc, t_score, prf_sc],
                          self.tf, actions['scan'], actions['elscan'], actions['wave'], len(self.det_targets)])
 
-        full_state = {'cpi': state, 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
+        full_state = {'cpi': state[:, :, 0], 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
                       'currwave': actions['wave']}
 
         return full_state, done, reward
@@ -202,16 +221,12 @@ class SinglePulseBackground(Environment):
                          np.floor(2 * self.env.nrange / c0 * TAC)) * self.fs / TAC)
         self.nr = int(self.env.max_pl * self.plp * self.fs)
         self.fft_len = findPowerOf2(self.nsam + self.nr)
-        init_wave = np.ones(WAVEPOINTS) * .5
+        init_wave = np.ones((WAVEPOINTS, self.n_ants)) * .5
         return {'cpi': np.zeros((self.nsam, self.cpi_len)),
                 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
                 'currwave': init_wave}
 
     def genCPI(self, chirp, tf, az_pt, el_pt):
-        twin = taylor(self.fft_len)
-        win_gpu = cupy.array(np.tile(twin, (self.cpi_len, 1)).T, dtype=np.complex128)
-        chirp_gpu = cupy.array(np.tile(chirp, (self.cpi_len, 1)).T, dtype=np.complex128)
-
         blocks_per_grid = (
             int(np.ceil(self.cpi_len / THREADS_PER_BLOCK[0])), int(np.ceil(self.samples / THREADS_PER_BLOCK[1])))
         sub_blocks = (int(np.ceil(self.cpi_len / THREADS_PER_BLOCK[0])),
@@ -224,8 +239,6 @@ class SinglePulseBackground(Environment):
                                      self.alt / np.sin(self.el_pt + self.el_bw / 2) / c0,
                                      self.fs, self.dep_ang, self.env.eswath, self.env.swath,
                                      np.random.randint(1, 15)]), dtype=np.float64)
-        data_r = cupy.zeros(self.data_block, dtype=np.float64)
-        data_i = cupy.zeros(self.data_block, dtype=np.float64)
         gx = cupy.array(np.random.rand(self.samples), dtype=np.float64)
         gy = cupy.array(np.random.rand(self.samples), dtype=np.float64)
         sv = []
@@ -234,21 +247,24 @@ class SinglePulseBackground(Environment):
         sub_pos = cupy.array(np.ascontiguousarray(sv), dtype=np.float64)
         times = cupy.array(np.ascontiguousarray(tf), dtype=np.float64)
         alocs = self.el_rot(el_pt, self.az_rot(az_pt, self.antenna_locs))
-        for ant in range(self.antenna_locs.shape[1]):
-            pos_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf) + alocs[:, ant][:, None]), dtype=np.float64)
-            genRangeProfile[blocks_per_grid, THREADS_PER_BLOCK](pos_gpu, gx, gy, pan_gpu, el_gpu,
-                                                                times, data_r, data_i, p_gpu)
-            cupy.cuda.Device().synchronize()
-            genSubProfile[sub_blocks, THREADS_PER_BLOCK](pos_gpu, sub_pos, pan_gpu, el_gpu, data_r, data_i, p_gpu)
-            cupy.cuda.Device().synchronize()
-        data = data_r + 1j * data_i
-
-        ret_data = cupy.fft.fft(
-            cupy.fft.ifft(
-                (cupy.fft.fft(data, self.fft_len, axis=0) * chirp_gpu * (chirp_gpu * win_gpu).conj()),
-                axis=0)[:self.nsam, :], axis=1)
-        cupy.cuda.Device().synchronize()
-        rd_cpu = ret_data.get() * taylor(self.cpi_len)[None, :]
+        rd_cpu = np.zeros((self.fft_len, self.cpi_len, self.n_ants), dtype=np.complex128)
+        for rx in range(self.n_ants):
+            posrx_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf) + alocs[:, rx][:, None]), dtype=np.float64)
+            data_r = cupy.zeros(self.data_block, dtype=np.float64)
+            data_i = cupy.zeros(self.data_block, dtype=np.float64)
+            for tx in range(self.n_ants):
+                chirp_gpu = cupy.array(np.tile(chirp[:, tx], (self.cpi_len, 1)).T, dtype=np.complex128)
+                postx_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf) + alocs[:, tx][:, None]), dtype=np.float64)
+                genRangeProfile[blocks_per_grid, THREADS_PER_BLOCK](posrx_gpu, postx_gpu, gx, gy, pan_gpu, el_gpu,
+                                                                    times, data_r, data_i, p_gpu)
+                cupy.cuda.Device().synchronize()
+                genSubProfile[sub_blocks, THREADS_PER_BLOCK](posrx_gpu, postx_gpu, sub_pos, pan_gpu, el_gpu,
+                                                             data_r, data_i, p_gpu)
+                cupy.cuda.Device().synchronize()
+                data = data_r + 1j * data_i
+                ret_data = cupy.fft.fft(data, self.fft_len, axis=0) * chirp_gpu
+                cupy.cuda.Device().synchronize()
+                rd_cpu[:, :, rx] += ret_data.get()
 
         del ret_data
         del pan_gpu
@@ -257,8 +273,8 @@ class SinglePulseBackground(Environment):
         del data_r
         del data_i
         del times
-        del pos_gpu
-        del win_gpu
+        del posrx_gpu
+        del postx_gpu
         del chirp_gpu
         del sub_pos
         del gx
@@ -269,6 +285,23 @@ class SinglePulseBackground(Environment):
 
     def genChirp(self, py, bandwidth):
         return genPulse(np.linspace(0, 1, len(py)), py, self.nr, self.nr / self.fs, 0, bandwidth)
+
+
+def genRDAMap(cpi, chirp, nsam):
+    twin = taylor(cpi.shape[0])
+    win_gpu = cupy.array(np.tile(twin, (cpi.shape[1], 1)).T, dtype=np.complex128)
+    chirp_gpu = cupy.array(np.tile(chirp, (cpi.shape[1], 1)).T, dtype=np.complex128)
+    cpi_gpu = cupy.array(cpi, dtype=np.complex128)
+    rda_gpu = cupy.fft.fft(cupy.fft.ifft(cpi_gpu * (chirp_gpu * win_gpu).conj(), axis=0)[:nsam, :], axis=1)
+    cupy.cuda.Device().synchronize()
+    rda = rda_gpu.get() * taylor(cpi.shape[1])[None, :]
+
+    del win_gpu
+    del chirp_gpu
+    del rda_gpu
+    del cpi_gpu
+    cupy.get_default_memory_pool().free_all_blocks()
+    return rda
 
 
 class SimEnv(object):
@@ -447,9 +480,9 @@ def cpudiff(x, y):
 
 
 @cuda.jit(
-    'void(float64[:, :], float64[:], float64[:], float64[:], float64[:], ' +
+    'void(float64[:, :], float64[:, :], float64[:], float64[:], float64[:], float64[:], ' +
     'float64[:], float64[:, :], float64[:, :], float64[:])')
-def genRangeProfile(path, gx, gy, pan, el, t, pd_r, pd_i, params):
+def genRangeProfile(pathrx, pathtx, gx, gy, pan, el, t, pd_r, pd_i, params):
     tt, samp_point = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and samp_point < gx.size:
         # Load in all the parameters that don't change
@@ -462,55 +495,78 @@ def genRangeProfile(path, gx, gy, pan, el, t, pd_r, pd_i, params):
         wp = wavefunction(tx, ty, t[tt], params[8])
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
-        s_x = tx - path[0, tt]
-        s_y = ty - path[1, tt]
-        s_z = wp.real - path[2, tt]
-        rng = math.sqrt(s_x * s_x + s_y * s_y + s_z * s_z)
+        s_tx = tx - pathtx[0, tt]
+        s_ty = ty - pathtx[1, tt]
+        s_tz = wp.real - pathtx[2, tt]
+        rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz) + c0 / params[4]
+        s_rx = tx - pathrx[0, tt]
+        s_ry = ty - pathrx[1, tt]
+        s_rz = wp.real - pathrx[2, tt]
+        rngrx = math.sqrt(s_rx * s_rx + s_ry * s_ry + s_rz * s_rz) + c0 / params[4]
+        rng = (rngtx + rngrx)
         rng_bin = (rng * 2 / c0 - 2 * params[3]) * params[4]
         but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
         if n_samples > but > 0:
-            el_tx = math.asin(-s_z / rng)
-            az_tx = math.atan2(s_x, s_y)
+            el_tx = math.asin(-s_tz / rngtx)
+            az_tx = math.atan2(s_tx, s_ty)
             eldiff = diff(el_tx, el[tt])
             azdiff = diff(az_tx, pan[tt])
             tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
             tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
-            att = tx_elpat * tx_azpat
-            acc_val = wp.imag * att * cmath.exp(-1j * wavenumber * rng * 2) * 1 / (rng * rng)
+            el_rx = math.asin(-s_rz / rngrx)
+            az_rx = math.atan2(s_rx, s_ry)
+            eldiff = diff(el_rx, el[tt])
+            azdiff = diff(az_rx, pan[tt])
+            rx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
+            rx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
+            att = tx_elpat * tx_azpat * rx_elpat * rx_azpat
+            acc_val = wp.imag * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
             cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
             cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
 
-@cuda.jit('void(float64[:, :], float64[:, :, :], float64[:], float64[:], float64[:, :], float64[:, :], float64[:])')
-def genSubProfile(path, subs, pan, el, pd_r, pd_i, params):
+@cuda.jit('void(float64[:, :], float64[:, :], float64[:, :, :], float64[:], float64[:], ' +
+          'float64[:, :], float64[:, :], float64[:])')
+def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
     tt, subnum = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and subnum < subs.shape[0]:
         # Load in all the parameters that don't change
         n_samples = pd_r.shape[0]
         wavenumber = 2 * np.pi / params[2]
 
-        tx = subs[subnum, tt, 1]
-        ty = subs[subnum, tt, 2]
+        sub_x = subs[subnum, tt, 1]
+        sub_y = subs[subnum, tt, 2]
         spow = subs[subnum, tt, 0]
-        tz = 20 if spow > 0 else 0
+        sub_z = 20 if spow > 0 else 0
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
         for n in range(-3, 3):
-            s_x = tx - path[0, tt]
-            s_y = ty - path[1, tt]
-            s_z = tz - path[2, tt]
-            rng = math.sqrt(s_x * s_x + s_y * s_y + s_z * s_z) + c0 / params[4] * n
-            rng_bin = (rng * 2 / c0 - 2 * params[3]) * params[4]
+            s_tx = sub_x - pathtx[0, tt]
+            s_ty = sub_y - pathtx[1, tt]
+            s_tz = sub_z - pathtx[2, tt]
+            rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz) + c0 / params[4] * n
+            s_rx = sub_x - pathrx[0, tt]
+            s_ry = sub_y - pathrx[1, tt]
+            s_rz = sub_z - pathrx[2, tt]
+            rngrx = math.sqrt(s_rx * s_rx + s_ry * s_ry + s_rz * s_rz) + c0 / params[4] * n
+            rng = (rngtx + rngrx)
+            rng_bin = (rng / c0 - 2 * params[3]) * params[4]
             but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
             if n_samples > but > 0:
-                el_tx = math.asin(-s_z / rng)
-                az_tx = math.atan2(s_x, s_y)
+                el_tx = math.asin(-s_tz / rngtx)
+                az_tx = math.atan2(s_tx, s_ty)
                 eldiff = diff(el_tx, el[tt])
                 azdiff = diff(az_tx, pan[tt])
                 tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
                 tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
-                att = tx_elpat * tx_azpat
-                acc_val = spow * att * cmath.exp(-1j * wavenumber * rng * 2) * 1 / (rng * rng)
+                el_rx = math.asin(-s_rz / rngrx)
+                az_rx = math.atan2(s_rx, s_ry)
+                eldiff = diff(el_rx, el[tt])
+                azdiff = diff(az_rx, pan[tt])
+                rx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
+                rx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
+                att = tx_elpat * tx_azpat * rx_elpat * rx_azpat
+                acc_val = spow * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
                 cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
                 cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
