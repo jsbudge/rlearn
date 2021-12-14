@@ -37,7 +37,7 @@ DTR = np.pi / 180
 MAX_ALFA_ACCEL = 0.35185185185185186
 MAX_ALFA_SPEED = 21.1111111111111111
 THREADS_PER_BLOCK = (16, 16)
-EP_LEN_S = 60
+EP_LEN_S = 20
 WAVEPOINTS = 100
 
 
@@ -66,18 +66,18 @@ class SinglePulseBackground(Environment):
         self.el_bw = 12 * DTR
         self.dep_ang = 45 * DTR
         self.alt = 1524
-        self.plp = 1
+        self.plp = .5
         self.fc = 9.6e9
         self.samples = 200000
-        self.fs = fs / 8
-        self.bw = 120e6
+        self.fs = fs / 4
+        self.bw = 200e6
         self.az_pt = np.pi / 2
         self.el_pt = 45 * DTR
-        self.az_lims = (0, np.pi)
-        self.el_lims = (30 * DTR, 70 * DTR)
+        self.az_lims = (-np.pi / 2, np.pi / 2)
+        self.el_lims = (40 * DTR, 50 * DTR)
 
         # Add in extra phase centers
-        self.antenna_locs = [(1, 0, 0), (-1, 0, 0), (0, 1, 0)]
+        self.antenna_locs = [(1, 0, 0), (-1, 0, 0)]
         self.antenna_locs = np.array(self.antenna_locs).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                 [0, np.cos(el), -np.sin(el)],
@@ -133,7 +133,7 @@ class SinglePulseBackground(Environment):
         cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
         state = np.zeros((self.nsam, self.cpi_len, self.n_ants))
         for n in range(self.n_ants):
-            rda = genRDAMap(cpi[:, :, n], fft_chirp[:, n], self.nsam)
+            rda = genRDAMap(cpi[:, :, 0], fft_chirp[:, n], self.nsam)
             st = abs(rda)
             if np.std(st) > 0:
                 st = (st - np.mean(st)) / np.std(st)
@@ -144,13 +144,7 @@ class SinglePulseBackground(Environment):
         t_score = 0
 
         # Ambiguity score
-        spike_cov = np.zeros((self.n_ants, self.n_ants))
-        for rx in range(self.n_ants):
-            for tx in range(self.n_ants):
-                rc_chirp = db(np.fft.ifft(fft_chirp[:, rx] * fft_chirp[:, tx].conj().T))
-                rc_chirp = rc_chirp / np.linalg.norm(rc_chirp)
-                spike_cov[rx, tx] = rc_chirp.max()
-        amb_sc = 1 - np.linalg.norm(spike_cov - np.eye(self.n_ants))
+        amb_sc = 1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_ants))
         reward += amb_sc
 
         # PRF shift score
@@ -174,34 +168,66 @@ class SinglePulseBackground(Environment):
         # Movement score
         # Find targets using basic CFAR
         # First, remove sea spikes using a simple averaging filter
-        for ant in range(self.n_ants):
+        poss_targets = []
+        det_state = fftconvolve(state[:, :, 0], np.ones((5, 5)) / 25.0, mode='same')
+        thresh = fftconvolve(det_state, self.cfar_kernel, mode='same')
+        det_targets = det_state > thresh + 7
+        det_targets[:, :3] = 0
+        det_targets[:, -3:] = 0
+        labels, ntargets = label(det_targets)
+        if ntargets > 0:
+            for lab in range(ntargets):
+                rngs, vels = np.where(labels == lab)
+                rng = c0 / 2 * (rngs.mean() / self.fs + 2 * self.alt / c0 / np.sin(self.el_pt + self.el_bw / 2))
+                vel = vels.mean() * actions['radar'][0] / self.fc * c0
+                poss_targets.append([Target(rng, vel, self.tf[-1]), 0])
+        for ant in range(1, self.n_ants):
             det_state = fftconvolve(state[:, :, ant], np.ones((5, 5)) / 25.0, mode='same')
             thresh = fftconvolve(det_state, self.cfar_kernel, mode='same')
             det_targets = det_state > thresh + 5
             det_targets[:, :3] = 0
             det_targets[:, -3:] = 0
-            t_score = 0
             labels, ntargets = label(det_targets)
             # Run through targets and add any that we might need
-            for lab in range(ntargets):
-                rngs, vels = np.where(labels == lab)
-                rng = c0 / 2 * (rngs.mean() / self.fs + 2 * self.alt / c0 / np.sin(self.el_pt + self.el_bw / 2))
-                vel = vels.mean() * actions['radar'][0] / self.fc * c0
-                if len(self.det_targets) == 0:
-                    self.det_targets.append(Target(rng, vel, self.tf[-1]))
-                else:
-                    for targ in self.det_targets:
-                        if targ(rng, vel, self.tf[-1]):
+            if ntargets > 0:
+                for lab in range(ntargets):
+                    rngs, vels = np.where(labels == lab)
+                    rng = c0 / 2 * (rngs.mean() / self.fs + 2 * self.alt / c0 / np.sin(self.el_pt + self.el_bw / 2))
+                    vel = vels.mean() * actions['radar'][0] / self.fc * c0
+                    for pt in poss_targets:
+                        if pt[0](rng, vel, self.tf[-1]) and pt[1] != ant:
+                            adist = np.linalg.norm(self.antenna_locs[:, pt[1]] - self.antenna_locs[:, ant])
+                            if adist < abs(pt[0].rng - rng):
+                                adist += abs(pt[0].rng - rng)
+                            doa = -np.pi - \
+                                  abs(np.arccos((adist**2 + pt[0].rng**2 - rng**2) / (2 * adist * pt[0].rng))) - \
+                                  abs(np.arccos((adist**2 + rng**2 - pt[0].rng**2) / (2 * adist * rng)))
+                            pt[0].setAng(doa)
+                            pt[1] = ant
                             break
         # Disassociate targets
+        for targ in poss_targets:
+            if targ[1] == self.n_ants - 1:
+                if len(self.det_targets) > 0:
+                    for dt in self.det_targets:
+                        if dt(targ[0].rng, targ[0].vel, self.tf[-1], ang=targ[0].ang):
+                            dt.assoc(targ[0].rng, targ[0].vel, self.tf[-1])
+                            poss_targets.remove(targ)
+                            break
+                    if targ in poss_targets:
+                        self.det_targets.append(targ[0])
+                        poss_targets.remove(targ)
+                else:
+                    self.det_targets.append(targ[0])
         for targ in self.det_targets:
             if targ.dissac(self.tf[-1]):
                 self.det_targets.remove(targ)
         if len(self.det_targets) > 0:
             for targ in self.det_targets:
                 t_score += 1 + .5 / abs(targ.rng - c0 / 2 * (2 * self.alt / c0 / np.sin(self.el_pt)))
-                prf_sc += 1 / abs(targ.vel)
-        t_score += motion
+                prf_sc += 1 - 2 * cpudiff(actions['scan'][0], targ.ang) / np.pi
+        else:
+            t_score += motion
         reward += t_score
         reward += prf_sc
 
@@ -373,19 +399,28 @@ class Target(object):
         self.vel = vel
         self.track = [[rng, vel, t]]
         self.last_assoc = t
+        self.ang = None
 
-    def __call__(self, rng, vel, t):
+    def __call__(self, rng, vel, t, ang=None):
         # First, check to see what the expected new position is
         if abs(self.rng + (t - self.last_assoc) * self.vel - rng) < 5:
             if abs(self.vel - vel) < 10:
                 # Passes the checks, associate it
-                self.rng = rng
-                self.vel = vel
-                self.track.append([rng, vel, t])
-                self.last_assoc = t
-                return True
+                if ang is None:
+                    return True
+                elif cpudiff(ang, self.ang) > 4 * DTR:
+                    return False
         # Failed!
         return False
+
+    def setAng(self, ang):
+        self.ang = (self.ang + ang) / 2 if self.ang is not None else ang
+
+    def assoc(self, rng, vel, t):
+        self.rng = rng
+        self.vel = vel
+        self.track.append([rng, vel, t])
+        self.last_assoc = t
 
     def dissac(self, t):
         # Send a disassociate signal if it has been too long between detections
@@ -591,7 +626,7 @@ def apply_shift(ray: np.ndarray, freq_shift: np.float64, samp_rate: np.float64) 
     return new_ray
 
 
-def ambiguity(s1, s2, prf, dopp_bins, mag=True):
+def ambiguity(s1, s2, prf, dopp_bins, mag=True, normalize=True):
     fdopp = np.linspace(-prf / 2, prf / 2, dopp_bins)
     fft_sz = findPowerOf2(len(s1)) * 2
     s1f = np.fft.fft(s1, fft_sz).conj().T
@@ -601,10 +636,12 @@ def ambiguity(s1, s2, prf, dopp_bins, mag=True):
     s2f = np.fft.fft(shift_grid, n=fft_sz, axis=0)
     A = np.fft.fftshift(np.fft.ifft(s2f * s1f[:, None], axis=0, n=fft_sz * 2),
                         axes=0)[fft_sz - dopp_bins // 2: fft_sz + dopp_bins // 2]
+    if normalize:
+        A = A / abs(A).max()
     if mag:
-        return abs(A / abs(A).max()) ** 2, fdopp, np.linspace(-len(s1) / 2 / fs, len(s1) / 2 / fs, len(s1))
+        return abs(A) ** 2, fdopp, np.linspace(-len(s1) / 2 / fs, len(s1) / 2 / fs, len(s1))
     else:
-        return A / abs(A).max(), fdopp, np.linspace(-dopp_bins / 2 * fs / c0, dopp_bins / 2 * fs / c0, dopp_bins)
+        return A, fdopp, np.linspace(-dopp_bins / 2 * fs / c0, dopp_bins / 2 * fs / c0, dopp_bins)
 
 
 if __name__ == '__main__':

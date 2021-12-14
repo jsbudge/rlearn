@@ -24,10 +24,10 @@ def findPowerOf2(x):
     return int(2 ** (np.ceil(np.log2(x))))
 
 
-games = 100
+games = 500
 eval_games = 1
 max_timesteps = 128
-batch_sz = 32
+batch_sz = 64
 
 # Pre-defined or custom environment
 env = Environment.create(
@@ -98,7 +98,7 @@ camera = Camera(fig)
 for l in logs:
     fpos = plot_env.env.pos(l[2])[:, 0]
     dopp_freqs = np.fft.fftshift(np.fft.fftfreq(l[0].shape[1], (l[2][1] - l[2][0]))) / plot_env.fc * c0
-    bm_x, bm_y, bm_a, bm_b = plot_env.env.getAntennaBeamLocation(l[2][0], l[3][0], l[4][0])
+    bm_x, bm_y, bm_a, bm_b = plot_env.env.getAntennaBeamLocation(l[2][0], np.pi/2 + l[3][0], l[4][0])
     main_beam = ellipse(bm_x, -bm_y, bm_a, bm_b, l[3][0])
     axes[plot_env.n_ants].plot(main_beam[0, :], main_beam[1, :], 'gray')
     axes[plot_env.n_ants].scatter(fpos[0], fpos[1], marker='*', c='blue')
@@ -130,10 +130,12 @@ for l in logs:
                 plot_env.fft_len)), c=cols[ant])
     camera.snap()
 
-animation = camera.animate(interval=100)
+animation = camera.animate(interval=500)
 animation.save('test.mp4')
 
 plt.figure('Ambiguity')
+cmin = None
+cmax = None
 for x in range(plot_env.n_ants):
     pulse = genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, x],
                      plot_env.nr, plot_env.nr / plot_env.fs, plot_env.fc, plot_env.bw)
@@ -141,9 +143,11 @@ for x in range(plot_env.n_ants):
     for y in range(plot_env.n_ants):
         plt.subplot(plot_env.n_ants, plot_env.n_ants, x * plot_env.n_ants + y + 1)
         amb = ambiguity(genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, y],
-                                 plot_env.nr, plot_env.nr / plot_env.fs, plot_env.fc, plot_env.bw), window_pulse,
-                        actions['radar'][0] * 2, 150)
-        plt.imshow(amb[0])
+                                 plot_env.nr, plot_env.nr / plot_env.fs, plot_env.fc, plot_env.bw),
+                        window_pulse, actions['radar'][0] * 2, 150, mag=True, normalize=False)
+        cmin = np.min(amb[0]) if cmin is None else cmin
+        cmax = np.max(amb[0]) if cmax is None else cmax
+        plt.imshow(amb[0], clim=[cmin, cmax])
 plt.tight_layout()
 
 plt.figure('Rewards')
