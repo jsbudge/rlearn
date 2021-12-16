@@ -3,6 +3,7 @@ import numpy as np
 from tqdm import tqdm
 from scipy.signal.windows import taylor
 from scipy.signal import fftconvolve
+from scipy.special import gamma as gam_func
 from scipy.linalg import convolution_matrix
 from scipy.spatial.distance import mahalanobis
 from scipy.ndimage import gaussian_filter
@@ -265,13 +266,21 @@ class SinglePulseBackground(Environment):
                                      self.alt / np.sin(self.el_pt + self.el_bw / 2) / c0,
                                      self.fs, self.dep_ang, self.env.eswath, self.env.swath,
                                      np.random.randint(1, 15)]), dtype=np.float64)
-        gx = cupy.array(np.random.rand(self.samples), dtype=np.float64)
-        gy = cupy.array(np.random.rand(self.samples), dtype=np.float64)
+        zo_t = np.zeros((len(self.tf), *self.env.bg[0].shape), dtype=np.complex128)
+        gpts = np.random.rand(self.samples, 2)
+        gpts[:, 0] *= self.env.eswath
+        gpts[:, 1] *= self.env.swath
+        gz = np.zeros((self.samples, len(self.tf)))
+        gv = np.zeros((2, self.samples, len(self.tf)))
+        for t in range(len(self.tf)):
+            zo_t[t, ...] = self.env.getBGFreqMap(self.tf[t])
         sv = []
+        bg_gpu = cupy.array(zo_t, dtype=np.complex128)
+        bg_gpu = cupy.fft.ifft2(bg_gpu, axes=(1, 2))
+        gpts_gpu = cupy.array(gpts, dtype=np.float64)
         for sub in self.env.targets:
             sv.append([sub(t) for t in tf])
         sub_pos = cupy.array(np.ascontiguousarray(sv), dtype=np.float64)
-        times = cupy.array(np.ascontiguousarray(tf), dtype=np.float64)
         alocs = self.el_rot(el_pt, self.az_rot(az_pt, self.antenna_locs))
         rd_cpu = np.zeros((self.fft_len, self.cpi_len, self.n_ants), dtype=np.complex128)
         for rx in range(self.n_ants):
@@ -281,8 +290,8 @@ class SinglePulseBackground(Environment):
             for tx in range(self.n_ants):
                 chirp_gpu = cupy.array(np.tile(chirp[:, tx], (self.cpi_len, 1)).T, dtype=np.complex128)
                 postx_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf) + alocs[:, tx][:, None]), dtype=np.float64)
-                genRangeProfile[blocks_per_grid, THREADS_PER_BLOCK](posrx_gpu, postx_gpu, gx, gy, pan_gpu, el_gpu,
-                                                                    times, data_r, data_i, p_gpu)
+                genRangeProfile[blocks_per_grid, THREADS_PER_BLOCK](posrx_gpu, postx_gpu, gpts_gpu, bg_gpu, pan_gpu,
+                                                                    el_gpu, data_r, data_i, p_gpu)
                 cupy.cuda.Device().synchronize()
                 genSubProfile[sub_blocks, THREADS_PER_BLOCK](posrx_gpu, postx_gpu, sub_pos, pan_gpu, el_gpu,
                                                              data_r, data_i, p_gpu)
@@ -298,13 +307,12 @@ class SinglePulseBackground(Environment):
         del p_gpu
         del data_r
         del data_i
-        del times
         del posrx_gpu
         del postx_gpu
         del chirp_gpu
         del sub_pos
-        del gx
-        del gy
+        del gpts_gpu
+        del bg_gpu
         cupy.get_default_memory_pool().free_all_blocks()
 
         return rd_cpu
@@ -360,6 +368,7 @@ class SimEnv(object):
         self.targets = []
         self.f_ts = f_ts
         self.genFlightPath()
+        self.bg = wavefunction((self.eswath, self.swath))
         for n in range(2):
             self.targets.append(Sub(0, self.eswath,
                                     0, self.swath, f_ts))
@@ -391,6 +400,64 @@ class SimEnv(object):
         eshift = np.cos(az_ang) * self.h_agl / np.tan(el_ang)
         nshift = np.sin(az_ang) * self.h_agl / np.tan(el_ang)
         return fpos[0] + eshift, fpos[1] + nshift, self.gbwidth, (self.gfrange - self.gnrange) / 2
+
+    def getBGFreqMap(self, t):
+        zo = \
+            1 / np.sqrt(2) * (
+                        self.bg[0] * np.exp(1j * self.bg[2] * t) + self.bg[1].conj() * np.exp(-1j * self.bg[2] * t))
+        zo[0, 0] = 0
+        return np.fft.fftshift(zo)
+
+    def getBG(self, pts, t):
+        zo = \
+            1 / np.sqrt(2) * (self.bg[0] * np.exp(1j * self.bg[2] * t) + self.bg[1].conj() * np.exp(-1j * self.bg[2] * t))
+        zo[0, 0] = 0
+        bg = np.fft.ifft2(np.fft.fftshift(zo)).real
+        bg = bg / np.max(bg) * 2
+        gx, gy = np.gradient(bg)
+
+        x_i = pts[:, 0] / self.eswath * bg.shape[0]
+        y_i = pts[:, 1] / self.swath * bg.shape[1]
+        x0 = np.round(x_i).astype(int)
+        y0 = np.round(y_i).astype(int)
+        x1 = x0 + np.sign(x_i - x0).astype(int)
+        y1 = y0 + np.sign(y_i - y0).astype(int)
+
+        # Make sure that the indexing values are valid
+        try:
+            x1[x1 >= bg.shape[0]] = bg.shape[0] - 1
+            x1[x1 < 0] = 0
+            x0[x0 >= bg.shape[0]] = bg.shape[0] - 1
+            x0[x0 < 0] = 0
+
+            # Similar process with the y values
+            y1[y1 >= bg.shape[1]] = bg.shape[1] - 1
+            y1[y1 < 0] = 0
+            y0[y0 >= bg.shape[1]] = bg.shape[1] - 1
+            y0[y0 < 0] = 0
+        except TypeError:
+            x1 = x1 if x1 < bg.shape[0] else bg.shape[0] - 1
+            x0 = x0 if x0 < bg.shape[0] else bg.shape[0] - 1
+            y0 = y0 if y0 < bg.shape[1] else bg.shape[1] - 1
+            y1 = y1 if y1 < bg.shape[1] else bg.shape[1] - 1
+
+        # Get differences
+        xdiff = x_i - x0
+        ydiff = y_i - y0
+        gx1 = np.zeros((pts.shape[0], 3))
+        gx1[:, 0] = 1
+        gx1[:, 2] = gx[x1, y1] * xdiff * ydiff + gx[x1, y0] * xdiff * (1 - ydiff) + gx[x0, y1] * \
+                    (1 - xdiff) * ydiff + gx[x0, y0] * (1 - xdiff) * (1 - ydiff)
+        gx2 = np.zeros((pts.shape[0], 3))
+        gx2[:, 1] = 1
+        gx2[:, 2] = gy[x1, y1] * xdiff * ydiff + gy[x1, y0] * xdiff * (1 - ydiff) + gy[x0, y1] * \
+                (1 - xdiff) * ydiff + gy[x0, y0] * (1 - xdiff) * (1 - ydiff)
+        n_dir = np.cross(gx1, gx2)
+        n_sph = np.array([np.arccos(n_dir[:, 2] / np.linalg.norm(n_dir, axis=1)),
+                          np.arctan2(n_dir[:, 1], n_dir[:, 0])])
+        hght = bg[x1, y1] * xdiff * ydiff + bg[x1, y0] * xdiff * (1 - ydiff) + bg[x0, y1] * \
+                (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
+        return n_sph, hght
 
 
 class Target(object):
@@ -485,22 +552,49 @@ class Sub(object):
         self.surf = surf
 
 
-@cuda.jit(device=True)
-def wavefunction(x, y, t, ws):
-    nwaves = int(ws % 8) + 1
-    wave = 1j * 0
-    for n in range(nwaves):
-        wdir = cmath.exp(1j * ws)
-        wave += ws / 10.0 * cmath.exp(
-            1j * (wdir.real / (ws * 10) * x + wdir.imag / (ws * 10) * y + 2 * np.pi * ws / 4.0 * t))
-    return wave
-    # return .25 * cmath.exp(1j * (.70710678 / 100 * x + .70710678 / 100 * y + 2 * np.pi * .1 * t)) + \
-    #   .47 * cmath.exp(1j * (0.9486833 / 40 * x + 0.31622777 / 40 * y + 2 * np.pi * 10 * t))
+def wavefunction(sz, npts=(64, 64), S=2, u10=10):
+    kx = np.arange(-(npts[0] // 2 - 1), npts[0] / 2 + 1) * 2 * np.pi / sz[0]
+    ky = np.arange(-(npts[1] // 2 - 1), npts[1] / 2 + 1) * 2 * np.pi / sz[1]
+    kkx, kky = np.meshgrid(kx, ky)
+    rho = np.random.randn(*kkx.shape)
+    sig = np.random.randn(*kkx.shape)
+    omega = np.floor(np.sqrt(9.8 * np.sqrt(kkx ** 2 + kky ** 2)) / (2 * np.pi / 10)) * (2 * np.pi / 10)
+    zo = 1 / np.sqrt(2) * (rho - 1j * sig) * np.sqrt(var_phi(kkx, kky, S, u10))
+    zoc = 1 / np.sqrt(2) * (rho - 1j * sig) * np.sqrt(var_phi(-kkx, -kky, S, u10))
+    return zo, zoc, omega
 
 
-def wave_cpu(x, y, t):
-    return .25 * np.exp(1j * (.70710678 / 100 * x + .70710678 / 100 * y + 2 * np.pi * .1 * t)) + \
-           .47 * np.exp(1j * (0.9486833 / 40 * x + 0.31622777 / 40 * y + 2 * np.pi * 10 * t))
+def Sk(k, u10=1):
+    g = 9.82
+    om_c = .84
+    Cd10 = .00144
+    ust = np.sqrt(Cd10) * u10
+    km = 370
+    cm = .23
+    lemma = 1.7 if om_c <= 1 else 1.7 + 6 * np.log10(om_c)
+    sigma = .08 * (1 + 4 * om_c ** -3)
+    alph_p = .006 * om_c ** .55
+    alph_m = .01 * (1 + np.log(ust / cm)) if ust <= cm else .01 * (1 + 3 * np.log(ust / cm))
+    ko = g / u10 ** 2
+    kp = ko * om_c ** 2
+    cp = np.sqrt(g / kp)
+    cc = np.sqrt((g / kp) * (1 + (k / km) ** 2))
+    Lpm = np.exp(-1.25 * (kp / k) ** 2)
+    gamma = np.exp(-1 / (2 * sigma ** 2) * (np.sqrt(k / kp) - 1) ** 2)
+    Jp = lemma ** gamma
+    Fp = Lpm * Jp * np.exp(-.3162 * om_c * (np.sqrt(k / kp) - 1))
+    Fm = Lpm * Jp * np.exp(-.25 * (k / km - 1) ** 2)
+    Bl = .5 * alph_p * (cp / cc) * Fp
+    Bh = .5 * alph_m * (cm / cc) * Fm
+
+    return (Bl + Bh) / k ** 3
+
+
+def var_phi(kx, ky, S=2, u10=10):
+    phi = np.cos(np.arctan2(ky, kx) / 2)**(2 * S)
+    gamma = Sk(np.sqrt(kx**2 + ky**2), u10) * phi * gam_func(S + 1) / gam_func(S + .5) * np.sqrt(kx**2 + ky**2)
+    gamma[np.logical_and(kx == 0, ky == 0)] = 0
+    return gamma
 
 
 @cuda.jit(device=True)
@@ -515,33 +609,49 @@ def cpudiff(x, y):
 
 
 @cuda.jit(
-    'void(float64[:, :], float64[:, :], float64[:], float64[:], float64[:], float64[:], ' +
-    'float64[:], float64[:, :], float64[:, :], float64[:])')
-def genRangeProfile(pathrx, pathtx, gx, gy, pan, el, t, pd_r, pd_i, params):
+    'void(float64[:, :], float64[:, :], float64[:, :], float64[:, :, :], float64[:], float64[:], ' +
+    'float64[:, :], float64[:, :], float64[:])')
+def genRangeProfile(pathrx, pathtx, gp, bg, pan, el, pd_r, pd_i, params):
     tt, samp_point = cuda.grid(ndim=2)
-    if tt < pd_r.shape[1] and samp_point < gx.size:
+    if tt < pd_r.shape[1] and samp_point < gp.shape[0]:
         # Load in all the parameters that don't change
         n_samples = pd_r.shape[0]
         wavenumber = 2 * np.pi / params[2]
 
-        tx = gx[samp_point] * (params[6] * 2) - params[6] / 2
-        ty = gy[samp_point] * (params[7] * 2) - params[7] / 2
+        tx = gp[samp_point, 0]
+        ty = gp[samp_point, 1]
 
-        wp = wavefunction(tx, ty, t[tt], params[8])
+        # Calc out wave height
+        x_i = tx / params[6] * bg.shape[1]
+        y_i = ty / params[7] * bg.shape[2]
+        x0 = int(x_i)
+        y0 = int(y_i)
+        x1 = int(x0 + 1 if x_i - x0 >= 0 else -1)
+        y1 = int(y0 + 1 if y_i - y0 >= 0 else -1)
+        xdiff = x_i - x0
+        ydiff = y_i - y0
+        tz = bg[tt, x1, y1].real * xdiff * ydiff + bg[tt, x1, y0].real * xdiff * (1 - ydiff) + bg[tt, x0, y1].real * \
+               (1 - xdiff) * ydiff + bg[tt, x0, y0].real * (1 - xdiff) * (1 - ydiff)
+        tz_dx = bg[tt, x1, y0].real - bg[tt, x0, y0].real
+        tz_dy = bg[tt, x0, y1].real - bg[tt, x0, y0].real
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
         s_tx = tx - pathtx[0, tt]
         s_ty = ty - pathtx[1, tt]
-        s_tz = wp.real - pathtx[2, tt]
-        rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz) + c0 / params[4]
+        s_tz = tz - pathtx[2, tt]
+        rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz)# + c0 / params[4]
         s_rx = tx - pathrx[0, tt]
         s_ry = ty - pathrx[1, tt]
-        s_rz = wp.real - pathrx[2, tt]
-        rngrx = math.sqrt(s_rx * s_rx + s_ry * s_ry + s_rz * s_rz) + c0 / params[4]
+        s_rz = tz - pathrx[2, tt]
+        rngrx = math.sqrt(s_rx * s_rx + s_ry * s_ry + s_rz * s_rz)# + c0 / params[4]
         rng = (rngtx + rngrx)
         rng_bin = (rng * 2 / c0 - 2 * params[3]) * params[4]
         but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
         if n_samples > but > 0:
+            # Cross product and dot product to determine point reflectivity
+            tz_dz1 = math.sqrt(1 + tz_dx * tz_dx)
+            tz_dz2 = math.sqrt(1 + tz_dy * tz_dy)
+            gv = abs(-tz_dx * tz_dz2 * s_rx / rngrx - tz_dy * tz_dz1 * s_ry / rngrx + tz_dz1 * tz_dz2 * s_rz / rngrx)
             el_tx = math.asin(-s_tz / rngtx)
             az_tx = math.atan2(s_tx, s_ty)
             eldiff = diff(el_tx, el[tt])
@@ -555,7 +665,7 @@ def genRangeProfile(pathrx, pathtx, gx, gy, pan, el, t, pd_r, pd_i, params):
             rx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
             rx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
             att = tx_elpat * tx_azpat * rx_elpat * rx_azpat
-            acc_val = wp.imag * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
+            acc_val = gv * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
             cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
             cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 

@@ -24,7 +24,7 @@ def findPowerOf2(x):
     return int(2 ** (np.ceil(np.log2(x))))
 
 
-games = 500
+games = 840
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64
@@ -156,3 +156,31 @@ times = np.array([l[2][0] for l in logs])
 for sc_part in range(scores.shape[1] + 1, -1, -1):
     plt.plot(times, np.sum(scores[:, :sc_part], axis=1))
     plt.fill_between(times, np.sum(scores[:, :sc_part], axis=1))
+
+figw, ax = plt.subplots(1)
+camw = Camera(figw)
+xx, yy = np.meshgrid(np.linspace(0, plot_env.env.eswath, 500), np.linspace(0, plot_env.env.swath, 500))
+bgpts = np.array([xx.flatten(), yy.flatten()])
+for l in logs:
+    gv, gz = plot_env.env.getBG(bgpts.T, l[2][0])
+    ax.imshow(gz.reshape(xx.shape), extent=[0, plot_env.env.swath, 0, plot_env.env.eswath])
+    for idx, s in enumerate(plot_env.env.targets):
+        pos = []
+        amp = []
+        pcols = []
+        for t in l[2]:
+            spow, loc1, loc2 = s(t)
+            pos.append([loc1, loc2])
+            amp.append(spow + 1)
+            pcols.append(cols[idx])
+        pos = np.array(pos)
+        if len(pos) > 0:
+            ax.scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
+            plt_rng = 2 * (np.linalg.norm(plot_env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
+                           np.linalg.norm(plot_env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
+                      (l[2][-1] - l[2][0])
+            ax.text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='black')
+    ax.legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
+    camw.snap()
+
+animw = camw.animate(interval=500)
