@@ -7,6 +7,7 @@ from scipy.special import gamma as gam_func
 from scipy.linalg import convolution_matrix
 from scipy.spatial.distance import mahalanobis
 from scipy.ndimage import gaussian_filter
+from itertools import combinations_with_replacement, permutations
 from tftb.processing import WignerVilleDistribution
 from scipy.ndimage import binary_dilation, binary_erosion, label
 import matplotlib.pyplot as plt
@@ -38,7 +39,7 @@ DTR = np.pi / 180
 MAX_ALFA_ACCEL = 0.35185185185185186
 MAX_ALFA_SPEED = 21.1111111111111111
 THREADS_PER_BLOCK = (16, 16)
-EP_LEN_S = 20
+EP_LEN_S = 10
 WAVEPOINTS = 100
 
 
@@ -76,6 +77,7 @@ class SinglePulseBackground(Environment):
         self.el_pt = 45 * DTR
         self.az_lims = (-np.pi / 2, np.pi / 2)
         self.el_lims = (40 * DTR, 50 * DTR)
+        self.curr_cpi = None
 
         # Add in extra phase centers
         self.antenna_locs = [(1, 0, 0), (-1, 0, 0)]
@@ -132,15 +134,19 @@ class SinglePulseBackground(Environment):
 
         # Generate the CPI using chirps; generates a nsam x cpi_len x n_ants block of FFT data
         cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
-        state = np.zeros((self.nsam, self.cpi_len, self.n_ants))
-        for n in range(self.n_ants):
-            rda = genRDAMap(cpi[:, :, 0], fft_chirp[:, n], self.nsam)
+        ant_pulse_combs = [n for n in combinations_with_replacement(np.arange(self.n_ants), 2)]
+        state = np.zeros((self.nsam, self.cpi_len, len(ant_pulse_combs)))
+        curr_cpi = np.zeros((self.nsam, self.cpi_len, len(ant_pulse_combs)), dtype=np.complex128)
+        for idx, ap in enumerate(ant_pulse_combs):
+            rda = genRDAMap(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
             st = abs(rda)
             if np.std(st) > 0:
                 st = (st - np.mean(st)) / np.std(st)
             else:
                 pass
-            state[:, :, n] = st
+            state[:, :, idx] = st
+            curr_cpi[:, :, idx] = rda
+        self.curr_cpi = curr_cpi
         reward = 0
         t_score = 0
 
@@ -182,7 +188,7 @@ class SinglePulseBackground(Environment):
                 rng = c0 / 2 * (rngs.mean() / self.fs + 2 * self.alt / c0 / np.sin(self.el_pt + self.el_bw / 2))
                 vel = vels.mean() * actions['radar'][0] / self.fc * c0
                 poss_targets.append([Target(rng, vel, self.tf[-1]), 0])
-        for ant in range(1, self.n_ants):
+        for ant in range(1, state.shape[2]):
             det_state = fftconvolve(state[:, :, ant], np.ones((5, 5)) / 25.0, mode='same')
             thresh = fftconvolve(det_state, self.cfar_kernel, mode='same')
             det_targets = det_state > thresh + 5
@@ -197,14 +203,17 @@ class SinglePulseBackground(Environment):
                     vel = vels.mean() * actions['radar'][0] / self.fc * c0
                     for pt in poss_targets:
                         if pt[0](rng, vel, self.tf[-1]) and pt[1] != ant:
-                            adist = np.linalg.norm(self.antenna_locs[:, pt[1]] - self.antenna_locs[:, ant])
+                            adist = np.linalg.norm(self.antenna_locs[:, pt[1]] - self.antenna_locs[:, ant_pulse_combs[ant][1]])
                             if adist < abs(pt[0].rng - rng):
                                 adist += abs(pt[0].rng - rng)
                             doa = -np.pi - \
                                   abs(np.arccos((adist**2 + pt[0].rng**2 - rng**2) / (2 * adist * pt[0].rng))) - \
                                   abs(np.arccos((adist**2 + rng**2 - pt[0].rng**2) / (2 * adist * rng)))
-                            pt[0].setAng(doa)
-                            pt[1] = ant
+                            if not np.isnan(doa):
+                                pt[0].setAng(doa)
+                                pt[1] = ant_pulse_combs[ant][1]
+                            else:
+                                pass
                             break
         # Disassociate targets
         for targ in poss_targets:
@@ -270,8 +279,6 @@ class SinglePulseBackground(Environment):
         gpts = np.random.rand(self.samples, 2)
         gpts[:, 0] *= self.env.eswath
         gpts[:, 1] *= self.env.swath
-        gz = np.zeros((self.samples, len(self.tf)))
-        gv = np.zeros((2, self.samples, len(self.tf)))
         for t in range(len(self.tf)):
             zo_t[t, ...] = self.env.getBGFreqMap(self.tf[t])
         sv = []
@@ -368,7 +375,7 @@ class SimEnv(object):
         self.targets = []
         self.f_ts = f_ts
         self.genFlightPath()
-        self.bg = wavefunction((self.eswath, self.swath))
+        self.bg = wavefunction((self.eswath, self.swath), npts=(32, 32))
         for n in range(2):
             self.targets.append(Sub(0, self.eswath,
                                     0, self.swath, f_ts))
@@ -382,9 +389,9 @@ class SimEnv(object):
             np.linspace(self.eswath / 4, self.eswath - self.eswath / 4, npts) + (np.random.rand(npts) - .5) * 3, 3)
         n = gaussian_filter(-self.gnrange + (np.random.rand(npts) - .5) * 3, 3)
         u = gaussian_filter(self.h_agl + (np.random.rand(npts) - .5) * 3, 3)
-        e = np.zeros(npts) + self.eswath / 2
-        n = np.zeros(npts) - self.gmrange
-        u = self.h_agl + np.zeros(npts)
+        #e = np.zeros(npts) + self.eswath / 2
+        #n = np.zeros(npts) - self.gmrange
+        #u = self.h_agl + np.zeros(npts)
         re = UnivariateSpline(tt, e, s=.7, k=3)
         rn = UnivariateSpline(tt, n, s=.7, k=3)
         ru = UnivariateSpline(tt, u, s=.7, k=3)
@@ -448,16 +455,17 @@ class SimEnv(object):
         gx1[:, 0] = 1
         gx1[:, 2] = gx[x1, y1] * xdiff * ydiff + gx[x1, y0] * xdiff * (1 - ydiff) + gx[x0, y1] * \
                     (1 - xdiff) * ydiff + gx[x0, y0] * (1 - xdiff) * (1 - ydiff)
+        gx1[:, 0] = 1 / np.sqrt(1 + gx1[:, 2]**2)
+        gx1[:, 2] = gx1[:, 2] / np.sqrt(1 + gx1[:, 2]**2)
         gx2 = np.zeros((pts.shape[0], 3))
-        gx2[:, 1] = 1
         gx2[:, 2] = gy[x1, y1] * xdiff * ydiff + gy[x1, y0] * xdiff * (1 - ydiff) + gy[x0, y1] * \
                 (1 - xdiff) * ydiff + gy[x0, y0] * (1 - xdiff) * (1 - ydiff)
+        gx2[:, 1] = 1 / np.sqrt(1 + gx2[:, 2]**2)
+        gx2[:, 2] = gx2[:, 2] / np.sqrt(1 + gx2[:, 2] ** 2)
         n_dir = np.cross(gx1, gx2)
-        n_sph = np.array([np.arccos(n_dir[:, 2] / np.linalg.norm(n_dir, axis=1)),
-                          np.arctan2(n_dir[:, 1], n_dir[:, 0])])
         hght = bg[x1, y1] * xdiff * ydiff + bg[x1, y0] * xdiff * (1 - ydiff) + bg[x0, y1] * \
                 (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
-        return n_sph, hght
+        return n_dir, hght
 
 
 class Target(object):
@@ -639,19 +647,19 @@ def genRangeProfile(pathrx, pathtx, gp, bg, pan, el, pd_r, pd_i, params):
         s_tx = tx - pathtx[0, tt]
         s_ty = ty - pathtx[1, tt]
         s_tz = tz - pathtx[2, tt]
-        rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz)# + c0 / params[4]
+        rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz) + c0 / params[4]
         s_rx = tx - pathrx[0, tt]
         s_ry = ty - pathrx[1, tt]
         s_rz = tz - pathrx[2, tt]
-        rngrx = math.sqrt(s_rx * s_rx + s_ry * s_ry + s_rz * s_rz)# + c0 / params[4]
+        rngrx = math.sqrt(s_rx * s_rx + s_ry * s_ry + s_rz * s_rz) + c0 / params[4]
         rng = (rngtx + rngrx)
-        rng_bin = (rng * 2 / c0 - 2 * params[3]) * params[4]
+        rng_bin = (rng / c0 - 2 * params[3]) * params[4]
         but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
         if n_samples > but > 0:
             # Cross product and dot product to determine point reflectivity
-            tz_dz1 = math.sqrt(1 + tz_dx * tz_dx)
-            tz_dz2 = math.sqrt(1 + tz_dy * tz_dy)
-            gv = abs(-tz_dx * tz_dz2 * s_rx / rngrx - tz_dy * tz_dz1 * s_ry / rngrx + tz_dz1 * tz_dz2 * s_rz / rngrx)
+            d1 = math.sqrt(1 + tz_dx * tz_dx)
+            d2 = math.sqrt(1 + tz_dy * tz_dy)
+            gv = abs(-tz_dx / (d1 * d2) * s_rx / rngrx - tz_dy / (d1 * d2) * s_ry / rngrx + 1 / (d1 * d2) * s_rz / rngrx) * 100
             el_tx = math.asin(-s_tz / rngtx)
             az_tx = math.atan2(s_tx, s_ty)
             eldiff = diff(el_tx, el[tt])
