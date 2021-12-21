@@ -195,17 +195,15 @@ class SinglePulseBackground(Environment):
                         vel = vels.mean() * actions['radar'][0] / self.fc * c0
                         poss_targets.append(rng)
                         targ_score.append(np.mean(det_state[rngs, vels]))
-        ptt = [poss_targets[np.argsort(targ_score)[0]]]
+        if len(poss_targets) > 0:
+            ptt = [poss_targets[np.argsort(targ_score)[0]]]
 
-        muse = MUSIC(virtual_array, self.fs, self.fft_len, c=c0, r=ptt)
-        mspect = np.swapaxes(np.swapaxes(self.curr_cpi, 0, 1), 0, 2)
-        muse.locate_sources(mspect, freq_range=[0, self.fs / 2])
-        pt_l2 = muse.theta[muse.P == muse.P.max()][0]
-
-        if len(pt_l2) > 0:
-            for targ in pt_l2:
-                t_score += 1 + .5 / abs(targ[0] - c0 / 2 * (2 * self.alt / c0 / np.sin(self.el_pt)))
-                prf_sc += 1 - 2 * cpudiff(actions['scan'][0], targ[1]) / np.pi + 1 - 2 * cpudiff(actions['elscan'][0], targ[2]) / np.pi
+            muse = MUSIC(virtual_array, self.fs, self.fft_len, c=c0, r=ptt)
+            mspect = np.swapaxes(np.swapaxes(self.curr_cpi, 0, 1), 0, 2)
+            muse.locate_sources(mspect, freq_range=[0, self.fs / 2])
+            pt_l2 = muse.theta[muse.P == muse.P.max()][0]
+            t_score += 1 + .5 / abs(ptt - c0 / 2 * (2 * self.alt / c0 / np.sin(self.el_pt)))
+            prf_sc += 1 - 2 * cpudiff(actions['scan'][0], pt_l2) / np.pi
         else:
             t_score += motion
         reward += t_score
