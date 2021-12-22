@@ -153,6 +153,7 @@ class SinglePulseBackground(Environment):
         self.curr_cpi = np.fft.fft(curr_cpi, self.fft_len, axis=0)[self.fft_len // 2 - 1:, :, :]
         reward = 0
         t_score = 0
+        pt_l2 = 0
 
         # Ambiguity score
         amb_sc = 1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_ants))
@@ -202,15 +203,18 @@ class SinglePulseBackground(Environment):
             mspect = np.swapaxes(np.swapaxes(self.curr_cpi, 0, 1), 0, 2)
             muse.locate_sources(mspect, freq_range=[0, self.fs / 2])
             pt_l2 = muse.theta[muse.P == muse.P.max()][0]
-            t_score += 1 + .5 / abs(ptt - c0 / 2 * (2 * self.alt / c0 / np.sin(self.el_pt)))
+            t_score += (1 + .5 / abs(ptt - c0 / 2 * (2 * self.alt / c0 / np.sin(self.el_pt))))[0]
             prf_sc += 1 - 2 * cpudiff(actions['scan'][0], pt_l2) / np.pi
         else:
             t_score += motion
-        reward += t_score
+        try:
+            reward += t_score
+        except:
+            reward += t_score
         reward += prf_sc
 
         self.log.append([state, [amb_sc, det_sc, t_score, prf_sc],
-                         self.tf, actions['scan'], actions['elscan'], actions['wave'], len(pt_l2)])
+                         self.tf, actions['scan'], actions['elscan'], actions['wave'], pt_l2])
 
         full_state = {'cpi': state[:, :, 0], 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
                       'currwave': actions['wave']}
@@ -840,17 +844,3 @@ if __name__ == '__main__':
         cam_wave.snap()
 
     anim_wave = cam_wave.animate()'''
-conv_block = np.zeros((101, 101, 101))
-conv_block[50, 51, 50] = 1
-conv_block[51, 50, 50] = 1
-conv_block[50, 50, 51] = 1
-conv_block[50, 49, 50] = 1
-conv_block[49, 50, 50] = 1
-conv_block[50, 50, 30] = 1
-
-
-mimo_arr = fftconvolve(conv_block, conv_block, mode='same')
-fig = plt.figure()
-ax = fig.add_subplot(projection='3d')
-ax.scatter(*np.where(conv_block > .5))
-ax.scatter(*np.where(mimo_arr > .5))

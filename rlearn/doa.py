@@ -159,7 +159,7 @@ class DOA(object):
             self.freq_bins = [int(np.round(f / self.fs * self.nfft))
                               for f in freq_bins]
         else:
-            print('Using freq_range')
+            # print('Using freq_range')
             freq_range = [int(np.round(f / self.fs * self.nfft))
                           for f in freq_range]
             self.freq_bins = np.arange(freq_range[0], freq_range[1])
