@@ -24,7 +24,7 @@ def findPowerOf2(x):
     return int(2 ** (np.ceil(np.log2(x))))
 
 
-games = 1
+games = 10
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64
@@ -185,6 +185,6 @@ for l in logs:
 
 animw = camw.animate(interval=500)
 
-plt.figure('db_cpi')
-plt.imshow(db(plot_env.curr_cpi[:, :, 0]))
-plt.axis('tight')
+plt.figure('VA positions')
+ax = plt.subplot(111, projection='3d')
+ax.scatter(plot_env.virtual_array[0, :], plot_env.virtual_array[1, :], plot_env.virtual_array[2, :])

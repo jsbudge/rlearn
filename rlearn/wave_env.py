@@ -5,6 +5,7 @@ from tqdm import tqdm
 from scipy.signal.windows import taylor
 from scipy.signal import fftconvolve
 from scipy.special import gamma as gam_func
+from scipy.special import comb as NchooseK
 from scipy.linalg import convolution_matrix
 from scipy.spatial.distance import mahalanobis
 from scipy.ndimage import gaussian_filter
@@ -39,7 +40,7 @@ DTR = np.pi / 180
 
 MAX_ALFA_ACCEL = 0.35185185185185186
 MAX_ALFA_SPEED = 21.1111111111111111
-THREADS_PER_BLOCK = (16, 16)
+THREADS_PER_BLOCK = (2, 16)
 EP_LEN_S = 30
 WAVEPOINTS = 100
 
@@ -61,6 +62,7 @@ class SinglePulseBackground(Environment):
     data_block = None
     az_pan = None
     log = None
+    virtual_array = None
 
     def __init__(self):
         super().__init__()
@@ -72,8 +74,8 @@ class SinglePulseBackground(Environment):
         self.plp = .5
         self.fc = 9.6e9
         self.samples = 200000
-        self.fs = fs / 4
-        self.bw = 200e6
+        self.fs = fs / 8
+        self.bw = 120e6
         self.az_pt = np.pi / 2
         self.el_pt = 45 * DTR
         self.az_lims = (-np.pi / 2, np.pi / 2)
@@ -81,15 +83,23 @@ class SinglePulseBackground(Environment):
         self.curr_cpi = None
 
         # Add in extra phase centers
-        self.antenna_locs = [(1, 0, 0), (-1, 0, 0), (0, 1, 0)]
+        self.antenna_locs = [(.5, 0, 0), (0, 0, 0)]
         self.antenna_locs = np.array(self.antenna_locs).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
-                                [0, np.cos(el), -np.sin(el)],
-                                [0, np.sin(el), np.cos(el)]]).dot(loc)
+                                                [0, np.cos(el), -np.sin(el)],
+                                                [0, np.sin(el), np.cos(el)]]).dot(loc)
         self.az_rot = lambda az, loc: np.array([[np.cos(az), -np.sin(az), 0],
                                                 [np.sin(az), np.cos(az), 0],
                                                 [0, 0, 1]]).dot(loc)
         self.n_ants = self.antenna_locs.shape[1]
+
+        # Setup for virtual array
+        self.v_ants = NchooseK(self.n_ants, 2, exact=True, repetition=True)
+        apc = [n for n in combinations_with_replacement(np.arange(self.n_ants), 2)]
+        self.virtual_array = np.array(
+            [self.antenna_locs[:, a[0]] + self.antenna_locs[:, a[1]]
+             for a in apc]).T
+        self.apc = apc
 
         # Generate CFAR kernel
         self.cfar_kernel = np.ones((40, 11))
@@ -135,13 +145,10 @@ class SinglePulseBackground(Environment):
 
         # Generate the CPI using chirps; generates a nsam x cpi_len x n_ants block of FFT data
         cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
-        ant_pulse_combs = [n for n in combinations_with_replacement(np.arange(self.n_ants), 2)]
-        virtual_array = np.array([self.env.pos(self.tf[0]) + self.el_rot(self.el_pt,
-                                              self.az_rot(self.az_pt,
-                                                          self.antenna_locs[:, a[0]] + self.antenna_locs[:, a[1]])) for a in ant_pulse_combs]).T
-        state = np.zeros((self.nsam, self.cpi_len, len(ant_pulse_combs)))
-        curr_cpi = np.zeros((self.nsam, self.cpi_len, len(ant_pulse_combs)), dtype=np.complex128)
-        for idx, ap in enumerate(ant_pulse_combs):
+        va = self.el_rot(self.el_pt, self.az_rot(self.az_pt, self.virtual_array))
+        state = np.zeros((self.nsam, self.cpi_len, self.v_ants))
+        curr_cpi = np.zeros((self.nsam, self.cpi_len, self.v_ants), dtype=np.complex128)
+        for idx, ap in enumerate(self.apc):
             rda = genRDAMap(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
             st = abs(rda)
             if np.std(st) > 0:
@@ -182,7 +189,7 @@ class SinglePulseBackground(Environment):
         # First, remove sea spikes using a simple averaging filter
         poss_targets = []
         targ_score = []
-        for idx, acomb in enumerate(ant_pulse_combs):
+        for idx, acomb in enumerate(self.apc):
             if acomb[0] == acomb[1]:
                 det_state = fftconvolve(state[:, :, idx], np.ones((5, 5)) / 25.0, mode='same')
                 thresh = fftconvolve(det_state, self.cfar_kernel, mode='same')
@@ -193,18 +200,18 @@ class SinglePulseBackground(Environment):
                         rngs, vels = np.where(labels == lab)
                         wght_rngs = np.average(rngs, weights=det_state[rngs, vels] + abs(np.min(det_state[rngs, vels])))
                         rng = c0 / 2 * (wght_rngs / self.fs + 2 * self.alt / c0 / np.sin(self.el_pt + self.el_bw / 2))
-                        vel = vels.mean() * actions['radar'][0] / self.fc * c0
+                        # vel = vels.mean() * actions['radar'][0] / self.fc * c0
                         poss_targets.append(rng)
                         targ_score.append(np.mean(det_state[rngs, vels]))
         if len(poss_targets) > 0:
             ptt = [poss_targets[np.argsort(targ_score)[0]]]
 
-            muse = MUSIC(virtual_array, self.fs, self.fft_len, c=c0, r=ptt)
-            mspect = np.swapaxes(np.swapaxes(self.curr_cpi, 0, 1), 0, 2)
-            muse.locate_sources(mspect, freq_range=[0, self.fs / 2])
-            pt_l2 = muse.theta[muse.P == muse.P.max()][0]
+            #muse = MUSIC(va, self.fs, self.fft_len, c=c0, r=ptt)
+            #mspect = np.swapaxes(np.swapaxes(self.curr_cpi, 0, 1), 0, 2)
+            #muse.locate_sources(mspect, freq_range=[0, self.fs / 2])
+            #pt_l2 = muse.theta[muse.P == muse.P.max()][0]
             t_score += (1 + .5 / abs(ptt - c0 / 2 * (2 * self.alt / c0 / np.sin(self.el_pt))))[0]
-            prf_sc += 1 - 2 * cpudiff(actions['scan'][0], pt_l2) / np.pi
+            #prf_sc += 1 - 2 * cpudiff(actions['scan'][0], pt_l2) / np.pi
         else:
             t_score += motion
         try:
@@ -311,7 +318,8 @@ def lsdir(arrpos, R, W=None):
         G = np.zeros((arrpos.shape[0], 3))
         for n in range(arrpos.shape[0]):
             norms[n] = np.linalg.norm(arrpos[n, :] - x0)
-            G[n, :] = [-(arrpos[n, 0] - x0[0]) / norms[n], -(arrpos[n, 1] - x0[1]) / norms[n], -(arrpos[n, 2] - x0[2]) / norms[n]]
+            G[n, :] = [-(arrpos[n, 0] - x0[0]) / norms[n], -(arrpos[n, 1] - x0[1]) / norms[n],
+                       -(arrpos[n, 2] - x0[2]) / norms[n]]
         dp = R - norms
         dx = np.linalg.pinv(G.T.dot(W.dot(G))).dot(G.T).dot(W.dot(dp))
         x0 += dx
@@ -397,9 +405,9 @@ class SimEnv(object):
             np.linspace(self.eswath / 4, self.eswath - self.eswath / 4, npts) + (np.random.rand(npts) - .5) * 3, 3)
         n = gaussian_filter(-self.gnrange + (np.random.rand(npts) - .5) * 3, 3)
         u = gaussian_filter(self.h_agl + (np.random.rand(npts) - .5) * 3, 3)
-        e = np.zeros(npts) + self.eswath / 2
-        n = np.zeros(npts) - self.gmrange
-        u = self.h_agl + np.zeros(npts)
+        #e = np.zeros(npts) + self.eswath / 2
+        #n = np.zeros(npts) - self.gmrange
+        #u = self.h_agl + np.zeros(npts)
         re = UnivariateSpline(tt, e, s=.7, k=3)
         rn = UnivariateSpline(tt, n, s=.7, k=3)
         ru = UnivariateSpline(tt, u, s=.7, k=3)
@@ -419,13 +427,14 @@ class SimEnv(object):
     def getBGFreqMap(self, t):
         zo = \
             1 / np.sqrt(2) * (
-                        self.bg[0] * np.exp(1j * self.bg[2] * t) + self.bg[1].conj() * np.exp(-1j * self.bg[2] * t))
+                    self.bg[0] * np.exp(1j * self.bg[2] * t) + self.bg[1].conj() * np.exp(-1j * self.bg[2] * t))
         zo[0, 0] = 0
         return np.fft.fftshift(zo)
 
     def getBG(self, pts, t):
         zo = \
-            1 / np.sqrt(2) * (self.bg[0] * np.exp(1j * self.bg[2] * t) + self.bg[1].conj() * np.exp(-1j * self.bg[2] * t))
+            1 / np.sqrt(2) * (
+                        self.bg[0] * np.exp(1j * self.bg[2] * t) + self.bg[1].conj() * np.exp(-1j * self.bg[2] * t))
         zo[0, 0] = 0
         bg = np.fft.ifft2(np.fft.fftshift(zo)).real
         bg = bg / np.max(bg) * 2
@@ -463,16 +472,16 @@ class SimEnv(object):
         gx1[:, 0] = 1
         gx1[:, 2] = gx[x1, y1] * xdiff * ydiff + gx[x1, y0] * xdiff * (1 - ydiff) + gx[x0, y1] * \
                     (1 - xdiff) * ydiff + gx[x0, y0] * (1 - xdiff) * (1 - ydiff)
-        gx1[:, 0] = 1 / np.sqrt(1 + gx1[:, 2]**2)
-        gx1[:, 2] = gx1[:, 2] / np.sqrt(1 + gx1[:, 2]**2)
+        gx1[:, 0] = 1 / np.sqrt(1 + gx1[:, 2] ** 2)
+        gx1[:, 2] = gx1[:, 2] / np.sqrt(1 + gx1[:, 2] ** 2)
         gx2 = np.zeros((pts.shape[0], 3))
         gx2[:, 2] = gy[x1, y1] * xdiff * ydiff + gy[x1, y0] * xdiff * (1 - ydiff) + gy[x0, y1] * \
-                (1 - xdiff) * ydiff + gy[x0, y0] * (1 - xdiff) * (1 - ydiff)
-        gx2[:, 1] = 1 / np.sqrt(1 + gx2[:, 2]**2)
+                    (1 - xdiff) * ydiff + gy[x0, y0] * (1 - xdiff) * (1 - ydiff)
+        gx2[:, 1] = 1 / np.sqrt(1 + gx2[:, 2] ** 2)
         gx2[:, 2] = gx2[:, 2] / np.sqrt(1 + gx2[:, 2] ** 2)
         n_dir = np.cross(gx1, gx2)
         hght = bg[x1, y1] * xdiff * ydiff + bg[x1, y0] * xdiff * (1 - ydiff) + bg[x0, y1] * \
-                (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
+               (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
         return n_dir, hght
 
 
@@ -607,8 +616,8 @@ def Sk(k, u10=1):
 
 
 def var_phi(kx, ky, S=2, u10=10):
-    phi = np.cos(np.arctan2(ky, kx) / 2)**(2 * S)
-    gamma = Sk(np.sqrt(kx**2 + ky**2), u10) * phi * gam_func(S + 1) / gam_func(S + .5) * np.sqrt(kx**2 + ky**2)
+    phi = np.cos(np.arctan2(ky, kx) / 2) ** (2 * S)
+    gamma = Sk(np.sqrt(kx ** 2 + ky ** 2), u10) * phi * gam_func(S + 1) / gam_func(S + .5) * np.sqrt(kx ** 2 + ky ** 2)
     gamma[np.logical_and(kx == 0, ky == 0)] = 0
     return gamma
 
@@ -647,7 +656,7 @@ def genRangeProfile(pathrx, pathtx, gp, bg, pan, el, pd_r, pd_i, params):
         xdiff = x_i - x0
         ydiff = y_i - y0
         tz = bg[tt, x1, y1].real * xdiff * ydiff + bg[tt, x1, y0].real * xdiff * (1 - ydiff) + bg[tt, x0, y1].real * \
-               (1 - xdiff) * ydiff + bg[tt, x0, y0].real * (1 - xdiff) * (1 - ydiff)
+             (1 - xdiff) * ydiff + bg[tt, x0, y0].real * (1 - xdiff) * (1 - ydiff)
         tz_dx = bg[tt, x1, y0].real - bg[tt, x0, y0].real
         tz_dy = bg[tt, x0, y1].real - bg[tt, x0, y0].real
 
@@ -667,7 +676,8 @@ def genRangeProfile(pathrx, pathtx, gp, bg, pan, el, pd_r, pd_i, params):
             # Cross product and dot product to determine point reflectivity
             d1 = math.sqrt(1 + tz_dx * tz_dx)
             d2 = math.sqrt(1 + tz_dy * tz_dy)
-            gv = abs(-tz_dx / (d1 * d2) * s_rx / rngrx - tz_dy / (d1 * d2) * s_ry / rngrx + 1 / (d1 * d2) * s_rz / rngrx)
+            gv = abs(
+                -tz_dx / (d1 * d2) * s_rx / rngrx - tz_dy / (d1 * d2) * s_ry / rngrx + 1 / (d1 * d2) * s_rz / rngrx)
             el_tx = math.asin(-s_tz / rngtx)
             az_tx = math.atan2(s_tx, s_ty)
             eldiff = diff(el_tx, el[tt])
