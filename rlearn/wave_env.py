@@ -83,7 +83,7 @@ class SinglePulseBackground(Environment):
         self.curr_cpi = None
 
         # Add in extra phase centers
-        self.antenna_locs = [(.5, 0, 0), (0, 0, 0)]
+        self.antenna_locs = [(.5, 0, 0), (0, 0, 0), (0, -.5, 0), (0, .5, 0)]
         self.antenna_locs = np.array(self.antenna_locs).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
@@ -145,7 +145,7 @@ class SinglePulseBackground(Environment):
 
         # Generate the CPI using chirps; generates a nsam x cpi_len x n_ants block of FFT data
         cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
-        va = self.el_rot(self.el_pt, self.az_rot(self.az_pt, self.virtual_array))
+        va = self.env.pos(self.tf[0])[:, None] + self.el_rot(self.el_pt, self.az_rot(self.az_pt, self.virtual_array))
         state = np.zeros((self.nsam, self.cpi_len, self.v_ants))
         curr_cpi = np.zeros((self.nsam, self.cpi_len, self.v_ants), dtype=np.complex128)
         for idx, ap in enumerate(self.apc):
@@ -206,12 +206,12 @@ class SinglePulseBackground(Environment):
         if len(poss_targets) > 0:
             ptt = [poss_targets[np.argsort(targ_score)[0]]]
 
-            #muse = MUSIC(va, self.fs, self.fft_len, c=c0, r=ptt)
-            #mspect = np.swapaxes(np.swapaxes(self.curr_cpi, 0, 1), 0, 2)
-            #muse.locate_sources(mspect, freq_range=[0, self.fs / 2])
-            #pt_l2 = muse.theta[muse.P == muse.P.max()][0]
+            muse = MUSIC(va, self.fs, self.fft_len, c=c0, r=ptt)
+            mspect = np.swapaxes(np.swapaxes(self.curr_cpi, 0, 1), 0, 2)
+            muse.locate_sources(mspect, freq_range=[0, self.fs / 2])
+            pt_l2 = muse.theta[muse.P == muse.P.max()][0]
             t_score += (1 + .5 / abs(ptt - c0 / 2 * (2 * self.alt / c0 / np.sin(self.el_pt))))[0]
-            #prf_sc += 1 - 2 * cpudiff(actions['scan'][0], pt_l2) / np.pi
+            prf_sc += 1 - 2 * cpudiff(actions['scan'][0], pt_l2) / np.pi
         else:
             t_score += motion
         try:
