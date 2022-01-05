@@ -9,7 +9,7 @@ from scipy.special import comb as NchooseK
 from scipy.linalg import convolution_matrix
 from scipy.spatial.distance import mahalanobis
 from scipy.ndimage import gaussian_filter
-from itertools import combinations_with_replacement, permutations, combinations
+from itertools import combinations_with_replacement, permutations, combinations, product
 from tftb.processing import WignerVilleDistribution
 from scipy.ndimage import binary_dilation, binary_erosion, label
 import matplotlib.pyplot as plt
@@ -40,7 +40,6 @@ DTR = np.pi / 180
 
 MAX_ALFA_ACCEL = 0.35185185185185186
 MAX_ALFA_SPEED = 21.1111111111111111
-THREADS_PER_BLOCK = (2, 16)
 EP_LEN_S = 30
 WAVEPOINTS = 100
 
@@ -82,23 +81,27 @@ class SinglePulseBackground(Environment):
         self.el_lims = (40 * DTR, 50 * DTR)
         self.curr_cpi = None
 
-        # Add in extra phase centers
-        self.antenna_locs = [(.5, 0, 0), (0, 0, 0), (0, -.5, 0), (0, .5, 0)]
-        self.antenna_locs = np.array(self.antenna_locs).T
+        # Antenna array definition
+        self.tx_locs = np.array([(.5, 0, 0), (-.5, 0, 0), (0, 0, .5)]).T
+        self.rx_locs = np.array([(0, 1, 0), (0, 0, 0), (0, -1, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
         self.az_rot = lambda az, loc: np.array([[np.cos(az), -np.sin(az), 0],
                                                 [np.sin(az), np.cos(az), 0],
                                                 [0, 0, 1]]).dot(loc)
-        self.n_ants = self.antenna_locs.shape[1]
+        self.n_tx = self.tx_locs.shape[1]
+        self.n_rx = self.rx_locs.shape[1]
 
         # Setup for virtual array
-        self.v_ants = NchooseK(self.n_ants, 2, exact=True, repetition=True)
-        apc = [n for n in combinations_with_replacement(np.arange(self.n_ants), 2)]
-        self.virtual_array = np.array(
-            [self.antenna_locs[:, a[0]] + self.antenna_locs[:, a[1]]
-             for a in apc]).T
+        self.v_ants = self.n_tx * self.n_rx
+        apc = []
+        va = np.zeros((3, self.v_ants))
+        for n in range(self.n_rx):
+            for m in range(self.n_tx):
+                va[:, n * self.n_tx + m] = self.rx_locs[:, n] + self.tx_locs[:, m]
+                apc.append([n,m])
+        self.virtual_array = va
         self.apc = apc
 
         # Generate CFAR kernel
@@ -122,10 +125,10 @@ class SinglePulseBackground(Environment):
         return dict(cpi=dict(type='float', shape=(self.nsam, self.cpi_len)),
                     currscan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
                     currelscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]),
-                    currwave=dict(type='float', shape=(WAVEPOINTS, self.n_ants), min_value=0, max_value=1))
+                    currwave=dict(type='float', shape=(WAVEPOINTS, self.n_tx), min_value=0, max_value=1))
 
     def actions(self):
-        return dict(wave=dict(type='float', shape=(WAVEPOINTS, self.n_ants), min_value=0, max_value=1),
+        return dict(wave=dict(type='float', shape=(WAVEPOINTS, self.n_tx), min_value=0, max_value=1),
                     radar=dict(type='float', shape=(1,), min_value=100, max_value=self.maxPRF),
                     scan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
                     elscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]))
@@ -138,8 +141,8 @@ class SinglePulseBackground(Environment):
         motion = (abs(self.az_pt - actions['scan'][0]) + abs(self.el_pt - actions['elscan'][0])) ** .1 - .5
         self.az_pt = actions['scan'][0]
         self.el_pt = actions['elscan'][0]
-        chirps = np.zeros((self.nr, self.n_ants), dtype=np.complex128)
-        for n in range(self.n_ants):
+        chirps = np.zeros((self.nr, self.n_tx), dtype=np.complex128)
+        for n in range(self.n_tx):
             chirps[:, n] = self.genChirp(actions['wave'][:, n], self.bw)
         fft_chirp = np.fft.fft(chirps, self.fft_len, axis=0)
 
@@ -160,10 +163,10 @@ class SinglePulseBackground(Environment):
         self.curr_cpi = np.fft.fft(curr_cpi, self.fft_len, axis=0)[self.fft_len // 2 - 1:, :, :]
         reward = 0
         t_score = 0
-        pt_l2 = 0
+        az_tx = 0
 
         # Ambiguity score
-        amb_sc = 1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_ants))
+        amb_sc = 1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx))
         reward += amb_sc
 
         # PRF shift score
@@ -187,31 +190,57 @@ class SinglePulseBackground(Environment):
         # Movement score
         # Find targets using basic CFAR
         # First, remove sea spikes using a simple averaging filter
-        poss_targets = []
-        targ_score = []
-        for idx, acomb in enumerate(self.apc):
-            if acomb[0] == acomb[1]:
-                det_state = fftconvolve(state[:, :, idx], np.ones((5, 5)) / 25.0, mode='same')
-                thresh = fftconvolve(det_state, self.cfar_kernel, mode='same')
-                det_targets = det_state > thresh + 5
-                labels, ntargets = label(det_targets)
-                if ntargets > 0:
-                    for lab in range(1, ntargets):
-                        rngs, vels = np.where(labels == lab)
-                        wght_rngs = np.average(rngs, weights=det_state[rngs, vels] + abs(np.min(det_state[rngs, vels])))
-                        rng = c0 / 2 * (wght_rngs / self.fs + 2 * self.alt / c0 / np.sin(self.el_pt + self.el_bw / 2))
-                        # vel = vels.mean() * actions['radar'][0] / self.fc * c0
-                        poss_targets.append(rng)
-                        targ_score.append(np.mean(det_state[rngs, vels]))
-        if len(poss_targets) > 0:
-            ptt = [poss_targets[np.argsort(targ_score)[0]]]
-
-            muse = MUSIC(va, self.fs, self.fft_len, c=c0, r=ptt)
-            mspect = np.swapaxes(np.swapaxes(self.curr_cpi, 0, 1), 0, 2)
-            muse.locate_sources(mspect, freq_range=[0, self.fs / 2])
-            pt_l2 = muse.theta[muse.P == muse.P.max()][0]
-            t_score += (1 + .5 / abs(ptt - c0 / 2 * (2 * self.alt / c0 / np.sin(self.el_pt))))[0]
-            prf_sc += 1 - 2 * cpudiff(actions['scan'][0], pt_l2) / np.pi
+        poss_targets = [[] for n in range(self.v_ants)]
+        for idx in range(self.v_ants):
+            targ_score = []
+            det_state = fftconvolve(state[:, :, idx], np.ones((5, 5)) / 25.0, mode='same')
+            thresh = fftconvolve(det_state, self.cfar_kernel, mode='same')
+            det_targets = det_state > thresh + 5
+            labels, ntargets = label(det_targets)
+            if ntargets > 0:
+                for lab in range(1, ntargets):
+                    rngs, vels = np.where(labels == lab)
+                    wght_rngs = np.average(rngs, weights=det_state[rngs, vels] + abs(np.min(det_state[rngs, vels])))
+                    rng = c0 / 2 * (wght_rngs / self.fs + 2 * self.alt / c0 / np.sin(self.el_pt + self.el_bw / 2))
+                    # vel = vels.mean() * actions['radar'][0] / self.fc * c0
+                    poss_targets[idx].append(rng)
+                    targ_score.append(np.mean(det_state[rngs, vels]))
+                poss_targets[idx] = [x for _, x in sorted(zip(targ_score, poss_targets[idx]))][-min(self.v_ants - 1, ntargets - 1):]
+        if np.all([len(p) > 0 for p in poss_targets]):
+            best_rmse = np.inf
+            pt_loc = None
+            # Use TDOA to find the location with the best RMSE among detections
+            for t_comb in product(*poss_targets):
+                sol_mat = np.zeros((3, self.v_ants - 1))
+                sol_mat[:3, :] = va[:, 1:] * 2 / t_comb[1:] - 2 * (va[:, 0] / t_comb[0])[:, None]
+                b = t_comb[1:] - t_comb[0] - np.linalg.norm(va[:, 1:], axis=0)**2 / t_comb[1:] + np.linalg.norm(va[:, 0])**2 / t_comb[0]
+                A = sol_mat.T
+                sol = np.linalg.pinv(A.T.dot(A)).dot(A.T).dot(-b) - va[:, 0]
+                rmse = abs(np.linalg.norm(sol[:, None] - va, axis=0) - t_comb).mean()
+                if rmse < best_rmse:
+                    pt_loc = sol
+                    best_rmse = rmse
+            # Only calculate scores if this has some chance of being accurate
+            # Find general peak-to-peak distance
+            pks = db(np.fft.ifft(fft_chirp * fft_chirp.conj(), self.fft_len, axis=0))
+            max_pktopk = 0
+            for n in range(self.n_tx):
+                ii = 0
+                mx_pk = 0
+                while pks[ii, n] > pks[0, n] - 6:
+                    mx_pk = ii
+                    ii += 1
+                max_pktopk += mx_pk * c0 / self.fs * self.n_rx
+            if best_rmse < max_pktopk**2:
+                pt_loc = pt_loc - self.env.pos(self.tf[0])
+                # el_tx = np.arcsin(-pt_loc[2] / np.linalg.norm(pt_loc))
+                az_tx = math.atan2(pt_loc[0], pt_loc[1])
+                # eldiff = cpudiff(el_tx, self.el_pt)
+                azdiff = cpudiff(az_tx, self.az_pt)
+                t_score += (1 + .5 / abs(np.linalg.norm(pt_loc) - c0 / 2 * (2 * self.alt / c0 / np.sin(self.el_pt))))
+                prf_sc += 1 - abs(azdiff / self.az_bw)
+            else:
+                t_score += motion
         else:
             t_score += motion
         try:
@@ -221,7 +250,7 @@ class SinglePulseBackground(Environment):
         reward += prf_sc
 
         self.log.append([state, [amb_sc, det_sc, t_score, prf_sc],
-                         self.tf, actions['scan'], actions['elscan'], actions['wave'], pt_l2])
+                         self.tf, actions['scan'], actions['elscan'], actions['wave'], az_tx])
 
         full_state = {'cpi': state[:, :, 0], 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
                       'currwave': actions['wave']}
@@ -236,16 +265,18 @@ class SinglePulseBackground(Environment):
                          np.floor(2 * self.env.nrange / c0 * TAC)) * self.fs / TAC)
         self.nr = int(self.env.max_pl * self.plp * self.fs)
         self.fft_len = findPowerOf2(self.nsam + self.nr)
-        init_wave = np.ones((WAVEPOINTS, self.n_ants)) * .5
+        init_wave = np.ones((WAVEPOINTS, self.n_tx)) * .5
         return {'cpi': np.zeros((self.nsam, self.cpi_len)),
                 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
                 'currwave': init_wave}
 
     def genCPI(self, chirp, tf, az_pt, el_pt):
+        mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK
+        threads_per_block = (16, 16)
         blocks_per_grid = (
-            int(np.ceil(self.cpi_len / THREADS_PER_BLOCK[0])), int(np.ceil(self.samples / THREADS_PER_BLOCK[1])))
-        sub_blocks = (int(np.ceil(self.cpi_len / THREADS_PER_BLOCK[0])),
-                      int(np.ceil(len(self.env.targets) / THREADS_PER_BLOCK[1])))
+            int(np.ceil(self.cpi_len / threads_per_block[0])), int(np.ceil(self.samples / threads_per_block[1])))
+        sub_blocks = (int(np.ceil(self.cpi_len / threads_per_block[0])),
+                      int(np.ceil(len(self.env.targets) / threads_per_block[1])))
         az_pan = az_pt * np.ones((self.cpi_len,))
         el_pan = el_pt * np.ones((self.cpi_len,))
         pan_gpu = cupy.array(np.ascontiguousarray(az_pan), dtype=np.float64)
@@ -267,19 +298,21 @@ class SinglePulseBackground(Environment):
         for sub in self.env.targets:
             sv.append([sub(t) for t in tf])
         sub_pos = cupy.array(np.ascontiguousarray(sv), dtype=np.float64)
-        alocs = self.el_rot(el_pt, self.az_rot(az_pt, self.antenna_locs))
-        rd_cpu = np.zeros((self.fft_len, self.cpi_len, self.n_ants), dtype=np.complex128)
-        for rx in range(self.n_ants):
-            posrx_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf) + alocs[:, rx][:, None]), dtype=np.float64)
+        alocs_rx = self.el_rot(el_pt, self.az_rot(az_pt, self.rx_locs))
+        alocs_tx = self.el_rot(el_pt, self.az_rot(az_pt, self.tx_locs))
+        rd_cpu = np.zeros((self.fft_len, self.cpi_len, self.n_rx), dtype=np.complex128)
+        for rx in range(self.n_rx):
+            posrx_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf) + alocs_rx[:, rx][:, None]), dtype=np.float64)
             data_r = cupy.zeros(self.data_block, dtype=np.float64)
             data_i = cupy.zeros(self.data_block, dtype=np.float64)
-            for tx in range(self.n_ants):
+            for tx in range(self.n_tx):
                 chirp_gpu = cupy.array(np.tile(chirp[:, tx], (self.cpi_len, 1)).T, dtype=np.complex128)
-                postx_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf) + alocs[:, tx][:, None]), dtype=np.float64)
-                genRangeProfile[blocks_per_grid, THREADS_PER_BLOCK](posrx_gpu, postx_gpu, gpts_gpu, bg_gpu, pan_gpu,
+                postx_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf) + alocs_tx[:, tx][:, None]),
+                                       dtype=np.float64)
+                genRangeProfile[blocks_per_grid, threads_per_block](posrx_gpu, postx_gpu, gpts_gpu, bg_gpu, pan_gpu,
                                                                     el_gpu, data_r, data_i, p_gpu)
                 cupy.cuda.Device().synchronize()
-                genSubProfile[sub_blocks, THREADS_PER_BLOCK](posrx_gpu, postx_gpu, sub_pos, pan_gpu, el_gpu,
+                genSubProfile[sub_blocks, threads_per_block](posrx_gpu, postx_gpu, sub_pos, pan_gpu, el_gpu,
                                                              data_r, data_i, p_gpu)
                 cupy.cuda.Device().synchronize()
                 data = data_r + 1j * data_i
@@ -590,6 +623,8 @@ def wavefunction(sz, npts=(64, 64), S=2, u10=10):
 
 
 def Sk(k, u10=1):
+    # Handles DC case
+    k[k == 0] = 1e-9
     g = 9.82
     om_c = .84
     Cd10 = .00144

@@ -7,9 +7,11 @@ try to identify signal parameters and such
 import numpy as np
 from tqdm import tqdm
 import keras
+from tensorflow.keras.optimizers import Adam
 from keras.layers import Input, Conv2D, Flatten, Dense, BatchNormalization, MaxPooling2D, AveragePooling2D, \
     Dropout, GaussianNoise
-from keras.callbacks import TerminateOnNaN, EarlyStopping, ReduceLROnPlateau
+from keras.callbacks import TerminateOnNaN, EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
+from keras.regularizers import l1_l2
 from wave_env import genPulse
 from tqdm import tqdm
 from scipy.signal.windows import taylor
@@ -40,15 +42,14 @@ def plotWeights(mdl, lnum=2, mdl_name=''):
 
 
 # Base net params
-dec_facs = [1, 2, 4]
-batch_sz = 64
-minp_sz = 1600
+dec_facs = [1]
+batch_sz = 32
+minp_sz = 1000
 band_limits = (10e6, fs / 2)
 base_pl = 6.468e-6
 
 segment_base_samp = minp_sz * dec_facs[-1]
 segment_t0 = segment_base_samp / fs   # Segment time in secs
-run_time = segment_t0 * 10
 seg_sz = int(np.ceil(segment_t0 * fs))
 
 
@@ -58,11 +59,13 @@ def genModel(m_sz):
     lay = MaxPooling2D((4, 4))(lay)
     lay = Conv2D(10, (16, 16))(lay)
     lay = MaxPooling2D((4, 4))(lay)
-    lay = Conv2D(10, (16, 16), activation=keras.layers.LeakyReLU(alpha=.3))(lay)
+    lay = Conv2D(10, (16, 16), activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
+                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
     lay = Flatten()(lay)
     lay = Dropout(.4)(lay)
-    lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.3))(lay)
-    lay = GaussianNoise(1)(lay)
+    lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
+                kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
+    #lay = GaussianNoise(1)(lay)
     outp = Dense(2, activation='softmax')(lay)
     return keras.Model(inputs=inp, outputs=outp)
 
@@ -71,7 +74,7 @@ def genModel(m_sz):
 mdls = []
 for d in dec_facs:
     mdl = genModel(minp_sz)
-    mdl.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    mdl.compile(optimizer=Adam(learning_rate=1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
     mdls.append(mdl)
 ramp = np.linspace(0, 1, 100)
 hist_loss = [[] for d in dec_facs]
@@ -81,7 +84,7 @@ hist_val_acc = [[] for d in dec_facs]
 
 sig_on = True
 
-for run in tqdm(range(400)):
+for run in tqdm(range(40)):
     t0 = 0
     sig_t = 0
     Xsplt = [[] for d in dec_facs]
@@ -89,8 +92,9 @@ for run in tqdm(range(400)):
     prf = np.random.rand() * 400 + 100
     # Make sure it's at least a microsecond long
     nr = int((np.random.rand() * (base_pl - 1e-6) + 1e-6) * fs)
+    bw = np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0]
     pcnt = 0
-    while np.any([len(X) < batch_sz for X in Xsplt]):
+    while np.any([len(X) < batch_sz * 2 for X in Xsplt]):
         # Generate the data for this segment
         seg_data = np.random.normal(0, 1, seg_sz) + 1j * np.random.normal(0, 1, seg_sz)
         seg_truth = np.zeros(seg_sz)
@@ -98,6 +102,7 @@ for run in tqdm(range(400)):
             prf = np.random.rand() * 400 + 100
             # Make sure it's at least a microsecond long
             nr = int((np.random.rand() * (base_pl - 1e-6) + 1e-6) * fs)
+            bw = np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0]
             pcnt = 0
         # First, get the signal we may or may not use here
         if sig_on:
@@ -106,7 +111,6 @@ for run in tqdm(range(400)):
             # Continue to pulse to the PRF during the segment length
             while sig_t < t0 + segment_t0:
                 ns = int((sig_t - t0) * fs)
-                bw = np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0]
                 seg_data[ns:min(seg_sz, ns + nr)] += \
                     genPulse(ramp, ramp, nr, nr / fs, 9.6e9, bw)[:min(seg_sz - ns, nr)]
                 seg_truth[ns:min(seg_sz, ns + nr)] = 1
@@ -120,13 +124,13 @@ for run in tqdm(range(400)):
                     break
                 bgn = seg_data[b * minp_sz:min(seg_sz, (b+dfac) * minp_sz):dfac]
                 if len(ysplt[idx]) == 0:
-                    if np.any(seg_truth[b * minp_sz:min(seg_sz, (b + dfac) * minp_sz):dfac]):
+                    if np.any(seg_truth[b * minp_sz:min(seg_sz, (b + dfac) * minp_sz):dfac]) and bw < fs / 2 / dfac:
                         ysplt[idx].append([True, False])
                     else:
                         ysplt[idx].append([False, True])
                     Xsplt[idx].append(WignerVilleDistribution(bgn).run()[0])
                 else:
-                    if np.any(seg_truth[b * minp_sz:min(seg_sz, (b+dfac) * minp_sz):dfac]):
+                    if np.any(seg_truth[b * minp_sz:min(seg_sz, (b+dfac) * minp_sz):dfac]) and bw < fs / 2 / dfac:
                         if ysplt[idx][-1][1]:
                             ysplt[idx].append([True, False])
                             Xsplt[idx].append(WignerVilleDistribution(bgn).run()[0])
@@ -136,33 +140,36 @@ for run in tqdm(range(400)):
                             Xsplt[idx].append(WignerVilleDistribution(bgn).run()[0])
         t0 += segment_t0
     for dec_idx in range(len(dec_facs)):
-        Xt = np.array(Xsplt[dec_idx])
-        yt = np.array(ysplt[dec_idx])
-        Xs = Xt
-        ys = yt
+        Xt = np.array(Xsplt[dec_idx])[:batch_sz, ...]
+        yt = np.array(ysplt[dec_idx])[:batch_sz, ...]
+        Xs = np.array(Xsplt[dec_idx])[batch_sz:, ...]
+        ys = np.array(ysplt[dec_idx])[batch_sz:, ...]
 
-        h = mdls[dec_idx].fit(Xt, yt, validation_data=(Xs, ys), epochs=2, callbacks=[TerminateOnNaN()])
+        h = mdls[dec_idx].fit(Xt, yt, validation_data=(Xs, ys), epochs=10,
+                              callbacks=[TerminateOnNaN()])
         hist_loss[dec_idx] = np.concatenate((hist_loss[dec_idx], h.history['loss']))
         hist_val_loss[dec_idx] = np.concatenate((hist_val_loss[dec_idx], h.history['val_loss']))
         hist_acc[dec_idx] = np.concatenate((hist_acc[dec_idx], h.history['accuracy']))
         hist_val_acc[dec_idx] = np.concatenate((hist_val_acc[dec_idx], h.history['val_accuracy']))
+
+
 for m_idx in range(len(dec_facs)):
-    Xsplt[m_idx] = np.array(Xsplt[m_idx])
-    ysplt[m_idx] = np.array(ysplt[m_idx])
+    Xsplt[m_idx] = np.array(Xsplt[m_idx])[batch_sz:, ...]
+    ysplt[m_idx] = np.array(ysplt[m_idx])[batch_sz:, ...]
 
 plt.figure('Losses')
 plt.plot(np.array(hist_loss).T)
 plt.plot(np.array(hist_val_loss).T)
-plt.legend([f'{d}' for d in dec_facs])
+plt.legend([f'{d}_loss' for d in dec_facs] + [f'{d}_val_loss' for d in dec_facs])
 
 plt.figure('Accuracy')
 plt.plot(np.array(hist_acc).T)
 plt.plot(np.array(hist_val_acc).T)
-plt.legend([f'{d}' for d in dec_facs])
+plt.legend([f'{d}_acc' for d in dec_facs] + [f'{d}_val_acc' for d in dec_facs])
 
 for m_idx, id_model in enumerate(mdls):
-    #for idx, l in enumerate(id_model.layers):
-    #    plotWeights(id_model, idx, mdl_name=f'dec_fac_{dec_facs[m_idx]}')
+    for idx, l in enumerate(id_model.layers):
+        plotWeights(id_model, idx, mdl_name=f'dec_fac_{dec_facs[m_idx]}')
 
     pos_pulses = sum(ysplt[m_idx][:, 0])
     pos_res = id_model.predict(Xsplt[m_idx])

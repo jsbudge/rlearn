@@ -24,7 +24,7 @@ def findPowerOf2(x):
     return int(2 ** (np.ceil(np.log2(x))))
 
 
-games = 10
+games = 1
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64
@@ -69,7 +69,7 @@ nr = int((plot_env.env.max_pl * plot_env.plp) * plot_env.fs)
 back_noise = np.random.rand(max(nr, 5000)) - .5 + 1j * (np.random.rand(max(nr, 5000)) - .5)
 
 plt.figure('RC Pulses')
-for ant in range(plot_env.n_ants):
+for ant in range(plot_env.n_tx):
     pulse = genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, ant],
                      plot_env.nr, plot_env.nr / plot_env.fs, plot_env.fc, plot_env.bw)
     fftpulse = np.fft.fft(pulse, findPowerOf2(nr) * 1)
@@ -85,11 +85,10 @@ except IndexError:
     print('Pulse too small?')
 
 cols = ['red', 'blue', 'green', 'orange', 'yellow', 'purple', 'black', 'cyan']
-wr = [1 for n in range(plot_env.n_ants)] + [plot_env.n_ants] + [plot_env.n_ants]
 fig = plt.figure()
-gs = gridspec.GridSpec(3, plot_env.n_ants)
+gs = gridspec.GridSpec(3, plot_env.n_rx)
 axes = []
-for ant in range(plot_env.n_ants):
+for ant in range(plot_env.n_rx):
     axes.append(plt.subplot(gs[0, ant]))
 axes.append(plt.subplot(gs[1, :]))
 axes.append(plt.subplot(gs[2, :]))
@@ -100,8 +99,8 @@ for l in logs:
     dopp_freqs = np.fft.fftshift(np.fft.fftfreq(l[0].shape[1], (l[2][1] - l[2][0]))) / plot_env.fc * c0
     bm_x, bm_y, bm_a, bm_b = plot_env.env.getAntennaBeamLocation(l[2][0], np.pi/2 + l[3][0], l[4][0])
     main_beam = ellipse(bm_x, -bm_y, bm_a, bm_b, l[3][0])
-    axes[plot_env.n_ants].plot(main_beam[0, :], main_beam[1, :], 'gray')
-    axes[plot_env.n_ants].scatter(fpos[0], fpos[1], marker='*', c='blue')
+    axes[plot_env.n_rx].plot(main_beam[0, :], main_beam[1, :], 'gray')
+    axes[plot_env.n_rx].scatter(fpos[0], fpos[1], marker='*', c='blue')
     for idx, s in enumerate(plot_env.env.targets):
         pos = []
         amp = []
@@ -113,17 +112,17 @@ for l in logs:
             pcols.append(cols[idx])
         pos = np.array(pos)
         if len(pos) > 0:
-            axes[plot_env.n_ants].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
+            axes[plot_env.n_rx].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
             plt_rng = 2 * (np.linalg.norm(plot_env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
                            np.linalg.norm(plot_env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
                       (l[2][-1] - l[2][0])
-            axes[plot_env.n_ants].text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='black')
-    axes[plot_env.n_ants].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
-    for ant in range(l[5].shape[1]):
+            axes[plot_env.n_rx].text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='black')
+    axes[plot_env.n_rx].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
+    for ant in range(plot_env.n_rx):
         axes[ant].imshow(np.fft.fftshift(l[0][:, :, ant], axes=1),
                          extent=[dopp_freqs[0], dopp_freqs[-1], plot_env.env.gnrange, plot_env.env.gfrange])
         axes[ant].axis('tight')
-        axes[plot_env.n_ants + 1].plot(db(
+        axes[plot_env.n_rx + 1].plot(db(
             np.fft.fft(
                 genPulse(np.linspace(0, 1, len(l[5][:, ant])), l[5][:, ant], plot_env.nr, plot_env.nr / plot_env.fs,
                          plot_env.fc, plot_env.bw),
@@ -131,17 +130,17 @@ for l in logs:
     camera.snap()
 
 animation = camera.animate(interval=500)
-animation.save('test.mp4')
+# animation.save('test.mp4')
 
 plt.figure('Ambiguity')
 cmin = None
 cmax = None
-for x in range(plot_env.n_ants):
+for x in range(plot_env.n_tx):
     pulse = genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, x],
                      plot_env.nr, plot_env.nr / plot_env.fs, plot_env.fc, plot_env.bw)
     window_pulse = np.fft.ifft(np.fft.fft(pulse, findPowerOf2(nr)) * taylor(findPowerOf2(nr)))
-    for y in range(plot_env.n_ants):
-        plt.subplot(plot_env.n_ants, plot_env.n_ants, x * plot_env.n_ants + y + 1)
+    for y in range(plot_env.n_tx):
+        plt.subplot(plot_env.n_tx, plot_env.n_tx, x * plot_env.n_tx + y + 1)
         amb = ambiguity(genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, y],
                                  plot_env.nr, plot_env.nr / plot_env.fs, plot_env.fc, plot_env.bw),
                         window_pulse, actions['radar'][0] * 2, 150, mag=True, normalize=False)
@@ -187,4 +186,8 @@ animw = camw.animate(interval=500)
 
 plt.figure('VA positions')
 ax = plt.subplot(111, projection='3d')
-ax.scatter(plot_env.virtual_array[0, :], plot_env.virtual_array[1, :], plot_env.virtual_array[2, :])
+for n in range(plot_env.n_rx):
+    ax.scatter(plot_env.virtual_array[0, n * plot_env.n_tx:(n+1) * plot_env.n_tx],
+               plot_env.virtual_array[1, n * plot_env.n_tx:(n+1) * plot_env.n_tx],
+               plot_env.virtual_array[2, n * plot_env.n_tx:(n+1) * plot_env.n_tx])
+    ax.scatter(plot_env.rx_locs[0, n], plot_env.rx_locs[1, n], plot_env.rx_locs[2, n], marker='*')
