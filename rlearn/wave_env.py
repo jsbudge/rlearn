@@ -12,6 +12,7 @@ from scipy.ndimage import gaussian_filter
 from itertools import combinations_with_replacement, permutations, combinations, product
 from tftb.processing import WignerVilleDistribution
 from scipy.ndimage import binary_dilation, binary_erosion, label
+from DFJeff import MUSICSinglePoint as music
 import matplotlib.pyplot as plt
 from scipy.interpolate import UnivariateSpline, interp1d
 from numba import cuda, njit
@@ -65,25 +66,25 @@ class SinglePulseBackground(Environment):
 
     def __init__(self):
         super().__init__()
-        self.cpi_len = 128
+        self.cpi_len = 64
         self.az_bw = 9 * DTR
         self.el_bw = 12 * DTR
         self.dep_ang = 45 * DTR
         self.alt = 1524
         self.plp = .5
         self.fc = 9.6e9
-        self.samples = 200000
+        self.samples = 500000
         self.fs = fs / 8
         self.bw = 120e6
         self.az_pt = np.pi / 2
         self.el_pt = 45 * DTR
-        self.az_lims = (-np.pi / 2, np.pi / 2)
-        self.el_lims = (40 * DTR, 50 * DTR)
+        self.az_lims = (-np.pi, np.pi)
+        self.el_lims = (40 * DTR, 60 * DTR)
         self.curr_cpi = None
 
         # Antenna array definition
-        self.tx_locs = np.array([(.5, 0, 0), (-.5, 0, 0), (0, 0, .5)]).T
-        self.rx_locs = np.array([(0, 1, 0), (0, 0, 0), (0, -1, 0)]).T
+        self.tx_locs = np.array([(.5, 0, 0), (-.5, 0, 0)]).T
+        self.rx_locs = np.array([(0, 1, 0), (0, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -153,7 +154,7 @@ class SinglePulseBackground(Environment):
         curr_cpi = np.zeros((self.nsam, self.cpi_len, self.v_ants), dtype=np.complex128)
         for idx, ap in enumerate(self.apc):
             rda = genRDAMap(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
-            st = abs(rda)
+            st = db(rda)
             if np.std(st) > 0:
                 st = (st - np.mean(st)) / np.std(st)
             else:
@@ -162,15 +163,13 @@ class SinglePulseBackground(Environment):
             curr_cpi[:, :, idx] = genRD(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
         self.curr_cpi = np.fft.fft(curr_cpi, self.fft_len, axis=0)[self.fft_len // 2 - 1:, :, :]
         reward = 0
-        t_score = 0
-        az_tx = 0
+        el_sc = 0
 
         # Ambiguity score
         amb_sc = 1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx))
-        reward += amb_sc
 
-        # PRF shift score
-        prf_sc = 0
+        # Azimuth score. If no target, motion score
+        az_sc = 0
 
         # Detectability score
         det_sc = 0
@@ -187,70 +186,63 @@ class SinglePulseBackground(Environment):
         reward += det_sc
         '''
 
-        # Movement score
-        # Find targets using basic CFAR
-        # First, remove sea spikes using a simple averaging filter
-        poss_targets = [[] for n in range(self.v_ants)]
-        for idx in range(self.v_ants):
-            targ_score = []
-            det_state = fftconvolve(state[:, :, idx], np.ones((5, 5)) / 25.0, mode='same')
-            thresh = fftconvolve(det_state, self.cfar_kernel, mode='same')
-            det_targets = det_state > thresh + 5
-            labels, ntargets = label(det_targets)
-            if ntargets > 0:
-                for lab in range(1, ntargets):
-                    rngs, vels = np.where(labels == lab)
-                    wght_rngs = np.average(rngs, weights=det_state[rngs, vels] + abs(np.min(det_state[rngs, vels])))
-                    rng = c0 / 2 * (wght_rngs / self.fs + 2 * self.alt / c0 / np.sin(self.el_pt + self.el_bw / 2))
-                    # vel = vels.mean() * actions['radar'][0] / self.fc * c0
-                    poss_targets[idx].append(rng)
-                    targ_score.append(np.mean(det_state[rngs, vels]))
-                poss_targets[idx] = [x for _, x in sorted(zip(targ_score, poss_targets[idx]))][-min(self.v_ants - 1, ntargets - 1):]
-        if np.all([len(p) > 0 for p in poss_targets]):
-            best_rmse = np.inf
-            pt_loc = None
-            # Use TDOA to find the location with the best RMSE among detections
-            for t_comb in product(*poss_targets):
-                sol_mat = np.zeros((3, self.v_ants - 1))
-                sol_mat[:3, :] = va[:, 1:] * 2 / t_comb[1:] - 2 * (va[:, 0] / t_comb[0])[:, None]
-                b = t_comb[1:] - t_comb[0] - np.linalg.norm(va[:, 1:], axis=0)**2 / t_comb[1:] + np.linalg.norm(va[:, 0])**2 / t_comb[0]
-                A = sol_mat.T
-                sol = np.linalg.pinv(A.T.dot(A)).dot(A.T).dot(-b) - va[:, 0]
-                rmse = abs(np.linalg.norm(sol[:, None] - va, axis=0) - t_comb).mean()
-                if rmse < best_rmse:
-                    pt_loc = sol
-                    best_rmse = rmse
-            # Only calculate scores if this has some chance of being accurate
-            # Find general peak-to-peak distance
-            pks = db(np.fft.ifft(fft_chirp * fft_chirp.conj(), self.fft_len, axis=0))
-            max_pktopk = 0
-            for n in range(self.n_tx):
-                ii = 0
-                mx_pk = 0
-                while pks[ii, n] > pks[0, n] - 6:
-                    mx_pk = ii
-                    ii += 1
-                max_pktopk += mx_pk * c0 / self.fs * self.n_rx
-            if best_rmse < max_pktopk**2:
-                pt_loc = pt_loc - self.env.pos(self.tf[0])
-                # el_tx = np.arcsin(-pt_loc[2] / np.linalg.norm(pt_loc))
-                az_tx = math.atan2(pt_loc[0], pt_loc[1])
-                # eldiff = cpudiff(el_tx, self.el_pt)
-                azdiff = cpudiff(az_tx, self.az_pt)
-                t_score += (1 + .5 / abs(np.linalg.norm(pt_loc) - c0 / 2 * (2 * self.alt / c0 / np.sin(self.el_pt))))
-                prf_sc += 1 - abs(azdiff / self.az_bw)
-            else:
-                t_score += motion
-        else:
-            t_score += motion
-        try:
-            reward += t_score
-        except:
-            reward += t_score
-        reward += prf_sc
+        # Target detection
+        t_poss = [[] for n in range(self.v_ants)]
+        f_poss = []
+        for va_rx in range(self.v_ants):
+            # Local averaging filter to remove bright single points and clutter
+            det_st = fftconvolve(state[:, :, va_rx], np.ones((5, 5)) / 25.0, mode='same')
 
-        self.log.append([state, [amb_sc, det_sc, t_score, prf_sc],
-                         self.tf, actions['scan'], actions['elscan'], actions['wave'], az_tx])
+            # Threshold to find targets
+            det_st[det_st < np.mean(det_st) + np.std(det_st) * 3] = 0
+
+            # Convenient finder of blobs
+            labels, ntargets = label(det_st)
+            if ntargets > 1:
+                t_sc = []
+                for lab in range(1, ntargets):
+                    t_sc.append(det_st[np.where(labels == lab)].mean())
+                    t_poss[va_rx].append([x.mean() for x in np.where(labels == lab)])
+                # Reduce number of targets if we get a lot of sea stuff
+                if ntargets > 3:
+                    t_poss[va_rx] = [x for _, x in sorted(zip(t_sc, t_poss[va_rx]))][-3:]
+        # If a target exists, it will show on at least two elements
+        if np.sum([len(t) > 0 for t in t_poss]) > 1:
+            for t_set in product(*t_poss):
+                t_rng = [t[0] for t in t_set]
+                t_vel = [t[1] for t in t_set]
+                # If this set of possible targets is close enough together in velocity and range,
+                # add it to the formal targets list
+                if np.linalg.norm(np.array(t_rng) - np.mean(t_rng)) < 2:
+                    if np.linalg.norm(np.array(t_vel) - np.mean(t_vel)) < 2:
+                        f_poss.append([np.mean(t_rng), np.mean(t_vel)])
+
+        # Colton MUSIC input here
+        if len(f_poss) > 0:
+            det_sc += 1
+            single_pulse = np.fft.ifft(cpi[:, 0, :], axis=0)[:self.nsam, :].T
+            ea = music(single_pulse, 1, va.T, self.fc, .5 * DTR,
+                       np.array([self.az_pt - self.az_bw, self.az_pt + self.az_bw]),
+                       np.array([self.el_pt - self.el_bw, self.el_pt + self.el_bw]),
+                       False, False)
+            if ea.shape[1] > 0:
+                eldiff = cpudiff(ea[1][0], self.el_pt)
+                azdiff = cpudiff(ea[0][0], self.az_pt)
+
+                # Only add reward if music finds possible angles
+                el_sc += 1 - abs(eldiff / self.el_bw)
+                az_sc += 1 - abs(azdiff / self.az_bw)
+        else:
+            # No targets found, incentivize the antenna to move
+            ea = []
+            el_sc += motion
+            az_sc += motion
+
+        # Add all the disparate reward functions
+        reward += amb_sc + det_sc + el_sc + az_sc
+
+        self.log.append([state, [amb_sc, det_sc, el_sc, az_sc],
+                         self.tf, actions['scan'], actions['elscan'], actions['wave'], ea])
 
         full_state = {'cpi': state[:, :, 0], 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
                       'currwave': actions['wave']}
@@ -266,6 +258,8 @@ class SinglePulseBackground(Environment):
         self.nr = int(self.env.max_pl * self.plp * self.fs)
         self.fft_len = findPowerOf2(self.nsam + self.nr)
         init_wave = np.ones((WAVEPOINTS, self.n_tx)) * .5
+        init_wave[0:3, :] = .01
+        init_wave[-3:, :] = .99
         return {'cpi': np.zeros((self.nsam, self.cpi_len)),
                 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
                 'currwave': init_wave}
@@ -424,10 +418,10 @@ class SimEnv(object):
         self.targets = []
         self.f_ts = f_ts
         self.genFlightPath()
-        self.bg = wavefunction((self.eswath, self.swath), npts=(32, 32))
+        self.bg = wavefunction((self.swath * 2, self.eswath * 2), npts=(64, 64))
         for n in range(1):
-            self.targets.append(Sub(0, self.eswath,
-                                    0, self.swath, f_ts))
+            self.targets.append(Sub(0, self.swath,
+                                    self.eswath / 4, self.eswath - self.eswath / 4, f_ts))
 
     def genFlightPath(self):
         # We start assuming that the bottom left corner of scene is (0, 0, 0) ENU
@@ -438,9 +432,9 @@ class SimEnv(object):
             np.linspace(self.eswath / 4, self.eswath - self.eswath / 4, npts) + (np.random.rand(npts) - .5) * 3, 3)
         n = gaussian_filter(-self.gnrange + (np.random.rand(npts) - .5) * 3, 3)
         u = gaussian_filter(self.h_agl + (np.random.rand(npts) - .5) * 3, 3)
-        #e = np.zeros(npts) + self.eswath / 2
-        #n = np.zeros(npts) - self.gmrange
-        #u = self.h_agl + np.zeros(npts)
+        # e = np.zeros(npts) + self.eswath / 2
+        # n = np.zeros(npts) - self.gmrange
+        # u = self.h_agl + np.zeros(npts)
         re = UnivariateSpline(tt, e, s=.7, k=3)
         rn = UnivariateSpline(tt, n, s=.7, k=3)
         ru = UnivariateSpline(tt, u, s=.7, k=3)
@@ -516,42 +510,6 @@ class SimEnv(object):
         hght = bg[x1, y1] * xdiff * ydiff + bg[x1, y0] * xdiff * (1 - ydiff) + bg[x0, y1] * \
                (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
         return n_dir, hght
-
-
-class Target(object):
-    def __init__(self, rng, vel, t):
-        self.rng = rng
-        self.vel = vel
-        self.track = [[rng, vel, t]]
-        self.last_assoc = t
-        self.ang = None
-
-    def __call__(self, rng, vel, t, ang=None):
-        # First, check to see what the expected new position is
-        if abs(self.rng + (t - self.last_assoc) * self.vel - rng) < 5:
-            if abs(self.vel - vel) < 10:
-                # Passes the checks, associate it
-                if ang is None:
-                    return True
-                elif cpudiff(ang, self.ang) > 4 * DTR:
-                    return False
-        # Failed!
-        return False
-
-    def setAng(self, ang):
-        self.ang = (self.ang + ang) / 2 if self.ang is not None else ang
-
-    def assoc(self, rng, vel, t):
-        self.rng = rng
-        self.vel = vel
-        self.track.append([rng, vel, t])
-        self.last_assoc = t
-
-    def dissac(self, t):
-        # Send a disassociate signal if it has been too long between detections
-        if t - self.last_assoc > .1:
-            return True
-        return False
 
 
 class Sub(object):
