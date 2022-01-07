@@ -64,7 +64,7 @@ class SinglePulseBackground(Environment):
     log = None
     virtual_array = None
 
-    def __init__(self):
+    def __init__(self, max_timesteps):
         super().__init__()
         self.cpi_len = 64
         self.az_bw = 9 * DTR
@@ -81,6 +81,8 @@ class SinglePulseBackground(Environment):
         self.az_lims = (-np.pi, np.pi)
         self.el_lims = (40 * DTR, 60 * DTR)
         self.curr_cpi = None
+        self.max_steps = max_timesteps
+        self.step = 0
 
         # Antenna array definition
         self.tx_locs = np.array([(.5, 0, 0), (-.5, 0, 0)]).T
@@ -122,6 +124,9 @@ class SinglePulseBackground(Environment):
         self.ave = 0
         self.std = 0
 
+    def max_episode_timesteps(self):
+        return self.max_steps
+
     def states(self):
         return dict(cpi=dict(type='float', shape=(self.nsam, self.cpi_len)),
                     currscan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
@@ -138,6 +143,9 @@ class SinglePulseBackground(Environment):
         self.tf = self.tf[-1] + np.arange(1, self.cpi_len + 1) * 1 / actions['radar'][0]
         # We've reached the end of the data, pull out
         done = False if self.tf[-1] < EP_LEN_S else 2
+        self.step += 1
+        if self.step >= self.max_episode_timesteps():
+            done = 2
         self.tf[self.tf >= EP_LEN_S] = EP_LEN_S - .01
         motion = (abs(self.az_pt - actions['scan'][0]) + abs(self.el_pt - actions['elscan'][0])) ** .1 - .5
         self.az_pt = actions['scan'][0]
@@ -278,9 +286,10 @@ class SinglePulseBackground(Environment):
         full_state = {'cpi': state[:, :, 0], 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
                       'currwave': actions['wave']}
 
-        return full_state, done, reward
+        return full_state, done, np.array([amb_sc, det_sc + el_sc + az_sc])
 
     def reset(self, num_parallel=None):
+        self.step = 0
         self.tf = np.linspace(0, self.cpi_len / 500.0, self.cpi_len)
         self.env = SimEnv(self.alt, self.az_bw, self.el_bw, self.dep_ang, f_ts=EP_LEN_S)
         self.log = []
