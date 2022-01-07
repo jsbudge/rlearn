@@ -73,7 +73,7 @@ class SinglePulseBackground(Environment):
         self.alt = 1524
         self.plp = .5
         self.fc = 9.6e9
-        self.samples = 500000
+        self.samples = 200000
         self.fs = fs / 8
         self.bw = 120e6
         self.az_pt = np.pi / 2
@@ -166,7 +166,7 @@ class SinglePulseBackground(Environment):
         el_sc = 0
 
         # Ambiguity score
-        amb_sc = 1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx))
+        amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx))) / 2
 
         # Azimuth score. If no target, motion score
         az_sc = 0
@@ -208,23 +208,53 @@ class SinglePulseBackground(Environment):
                     t_poss[va_rx] = [x for _, x in sorted(zip(t_sc, t_poss[va_rx]))][-3:]
         # If a target exists, it will show on at least two elements
         if np.sum([len(t) > 0 for t in t_poss]) > 1:
-            for t_set in product(*t_poss):
-                t_rng = [t[0] for t in t_set]
+            for t_set in product(*[t for t in t_poss if len(t) > 0]):
+                t_rng = [t[0] / self.fs * c0 + (self.env.pos(self.tf[0])[2] / np.sin(self.el_pt + self.el_bw / 2))
+                         for t in t_set]
                 t_vel = [t[1] for t in t_set]
                 # If this set of possible targets is close enough together in velocity and range,
                 # add it to the formal targets list
-                if np.linalg.norm(np.array(t_rng) - np.mean(t_rng)) < 2:
-                    if np.linalg.norm(np.array(t_vel) - np.mean(t_vel)) < 2:
-                        f_poss.append([np.mean(t_rng), np.mean(t_vel)])
+                vv = np.linalg.norm([np.linalg.norm(np.array(t_vel) - np.mean(t_vel)),
+                                     np.linalg.norm(np.array(t_rng) - np.mean(t_rng))])
+                if vv < 5:
+                    # Use TDOA to get a solution
+                    vas_in_use = va[:, [True if len(t) > 0 else False for t in t_poss]]
+                    sol_mat = np.zeros((2, len(t_set) - 1))
+                    sol_mat[:2, :] = vas_in_use[:2, 1:] * 2 / t_rng[1:] - 2 * (vas_in_use[:2, 0] / t_rng[0])[:, None]
+                    b = t_rng[1:] - t_rng[0] - np.linalg.norm(vas_in_use[:, 1:], axis=0) ** 2 / t_rng[1:] + np.linalg.norm(
+                        vas_in_use[:, 0]) ** 2 / t_rng[0] - vas_in_use[2, 1:] * 2 / t_rng[1:] + 2 * (vas_in_use[2, 0] / t_rng[0])
+                    A = sol_mat.T
+                    sol = np.array([*(np.linalg.pinv(A.T.dot(A)).dot(A.T).dot(-b)), 1])
+                    rmse = abs(np.linalg.norm(sol[:, None] - vas_in_use, axis=0) - t_rng).mean()
+                    f_poss = sol - self.env.pos(self.tf[0])
+
+        if len(f_poss) > 0:
+            det_sc += 1
+            ea = [np.arctan2(f_poss[1], f_poss[0]),
+                  np.arcsin(-f_poss[2] / np.linalg.norm(f_poss))]
+            ea[0] = -ea[0] if ea[0] < 0 else ea[0]
+            eldiff = cpudiff(ea[1], self.el_pt)
+            azdiff = cpudiff(ea[0], self.az_pt)
+
+            # Only add reward if music finds possible angles
+            el_sc += 1 - abs(eldiff / self.el_bw)
+            az_sc += 1 - abs(azdiff / self.az_bw)
+        else:
+            # No targets found, incentivize the antenna to move
+            ea = []
+            el_sc += motion
+            az_sc += motion
 
         # Colton MUSIC input here
+        '''
         if len(f_poss) > 0:
             det_sc += 1
             single_pulse = np.fft.ifft(cpi[:, 0, :], axis=0)[:self.nsam, :].T
-            ea = music(single_pulse, 1, va.T, self.fc, .5 * DTR,
-                       np.array([self.az_pt - self.az_bw, self.az_pt + self.az_bw]),
-                       np.array([self.el_pt - self.el_bw, self.el_pt + self.el_bw]),
-                       False, False)
+            ea = music(single_pulse, 1, va.T, self.fc)
+            # ea = music(single_pulse, 1, va.T, self.fc, .5 * DTR,
+            #            np.array([self.az_pt - self.az_bw * 2, self.az_pt + self.az_bw * 2]),
+            #            np.array([self.el_pt - self.el_bw * 2, self.el_pt + self.el_bw * 2]),
+            #            False, False)
             if ea.shape[1] > 0:
                 eldiff = cpudiff(ea[1][0], self.el_pt)
                 azdiff = cpudiff(ea[0][0], self.az_pt)
@@ -237,6 +267,7 @@ class SinglePulseBackground(Environment):
             ea = []
             el_sc += motion
             az_sc += motion
+        '''
 
         # Add all the disparate reward functions
         reward += amb_sc + det_sc + el_sc + az_sc
@@ -265,8 +296,10 @@ class SinglePulseBackground(Environment):
                 'currwave': init_wave}
 
     def genCPI(self, chirp, tf, az_pt, el_pt):
-        mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK
-        threads_per_block = (16, 16)
+        mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 2
+        cpi_threads = int(np.ceil(self.cpi_len / self.samples))
+        samp_threads = mx_threads // cpi_threads - 1
+        threads_per_block = (16, 16) #(cpi_threads, samp_threads)
         blocks_per_grid = (
             int(np.ceil(self.cpi_len / threads_per_block[0])), int(np.ceil(self.samples / threads_per_block[1])))
         sub_blocks = (int(np.ceil(self.cpi_len / threads_per_block[0])),
@@ -418,10 +451,10 @@ class SimEnv(object):
         self.targets = []
         self.f_ts = f_ts
         self.genFlightPath()
-        self.bg = wavefunction((self.swath * 2, self.eswath * 2), npts=(64, 64))
+        self.bg = wavefunction((self.swath * 2, self.eswath * 2), npts=(32, 32))
         for n in range(1):
-            self.targets.append(Sub(0, self.swath,
-                                    self.eswath / 4, self.eswath - self.eswath / 4, f_ts))
+            self.targets.append(Sub(self.eswath / 4, self.eswath - self.eswath / 4,
+                                    0, self.swath, f_ts))
 
     def genFlightPath(self):
         # We start assuming that the bottom left corner of scene is (0, 0, 0) ENU

@@ -77,7 +77,7 @@ def plotActivations(classifier, inp):
 
 # Base net params
 dec_facs = [1]
-batch_sz = 32
+batch_sz = 64
 minp_sz = 20000
 band_limits = (10e6, fs / 2)
 base_pl = 6.468e-6
@@ -93,8 +93,8 @@ def genModel(nsam):
     lay = Magnitude()(lay)
     lay = MagnitudeToDecibel()(lay)
     lay = BatchNormalization()(lay)
-    lay = MaxPooling2D((4, 4))(lay)
-    lay = Conv2D(10, (32, 32), activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
+    lay = MaxPooling2D((2, 2))(lay)
+    lay = Conv2D(30, (32, 32), activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                  kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
     lay = Flatten()(lay)
     lay = Dropout(.4)(lay)
@@ -116,7 +116,7 @@ hist_val_acc = []
 
 sig_on = True
 
-for run in tqdm(range(2)):
+for run in tqdm(range(20)):
     t0 = 0
     sig_t = 0
     Xt = []
@@ -190,6 +190,8 @@ plt.legend([f'{d}_acc' for d in dec_facs] + [f'{d}_val_acc' for d in dec_facs])
 
 for idx, l in enumerate(mdl.layers):
     plotWeights(mdl, idx, mdl_name=f'model')
+
+plotActivations(mdl, Xs[ys[:, 0] == 1, :][0, :])
 
 pos_pulses = sum(ys[:, 0])
 pos_res = mdl.predict(Xs)

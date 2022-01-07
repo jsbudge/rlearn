@@ -97,10 +97,16 @@ camera = Camera(fig)
 for l in logs:
     fpos = plot_env.env.pos(l[2])[:, 0]
     dopp_freqs = np.fft.fftshift(np.fft.fftfreq(l[0].shape[1], (l[2][1] - l[2][0]))) / plot_env.fc * c0
-    bm_x, bm_y, bm_a, bm_b = plot_env.env.getAntennaBeamLocation(l[2][0], np.pi/2 + l[3][0], l[4][0])
-    main_beam = ellipse(bm_x, -bm_y, bm_a, bm_b, l[3][0])
+
+    # Draw the beam and platform
+    bm_x, bm_y, bm_a, bm_b = plot_env.env.getAntennaBeamLocation(l[2][0], l[3][0] + np.pi / 2, l[4][0])
+    main_beam = ellipse(bm_x, bm_y, bm_a, bm_b, l[3][0])
     axes[plot_env.n_rx].plot(main_beam[0, :], main_beam[1, :], 'gray')
     axes[plot_env.n_rx].scatter(fpos[0], fpos[1], marker='*', c='blue')
+    beam_dir = np.exp(-1j * l[3][0]) * fpos[2] / np.tan(l[4][0])
+    axes[plot_env.n_rx].arrow(fpos[0], fpos[1], beam_dir.imag, beam_dir.real)
+
+    # Draw the targets
     for idx, s in enumerate(plot_env.env.targets):
         pos = []
         amp = []
@@ -113,11 +119,15 @@ for l in logs:
         pos = np.array(pos)
         if len(pos) > 0:
             axes[plot_env.n_rx].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
+
+            # Range to target
             plt_rng = 2 * (np.linalg.norm(plot_env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
                            np.linalg.norm(plot_env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
                       (l[2][-1] - l[2][0])
             axes[plot_env.n_rx].text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='black')
     axes[plot_env.n_rx].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
+
+    # Draw the RD maps for each antenna
     for ant in range(plot_env.n_rx):
         axes[ant].imshow(np.fft.fftshift(l[0][:, :, ant], axes=1),
                          extent=[dopp_freqs[0], dopp_freqs[-1], plot_env.env.gnrange, plot_env.env.gfrange])
