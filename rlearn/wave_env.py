@@ -3,6 +3,7 @@ import numpy as np
 from music import MUSIC
 from tqdm import tqdm
 from scipy.signal.windows import taylor
+from scipy.optimize import minimize
 from scipy.signal import fftconvolve
 from scipy.special import gamma as gam_func
 from scipy.special import comb as NchooseK
@@ -45,6 +46,26 @@ EP_LEN_S = 30
 WAVEPOINTS = 100
 
 
+def gkern(l=5, sig=1.):
+    """\
+    creates gaussian kernel with side length `l` and a sigma of `sig`
+    """
+    ax = np.linspace(-(l - 1) / 2., (l - 1) / 2., l)
+    gauss = np.exp(-0.5 * np.square(ax) / np.square(sig))
+    kernel = np.outer(gauss, gauss)
+    return kernel / np.sum(kernel)
+
+
+def multilateration(rngs, va_pos, x0=None):
+    def error(x, c, r):
+        return sum([(np.linalg.norm([x[0] - c[i][0], x[1] - c[i][1], 1 - c[i][2]]) - r[i])**2 for i in range(len(c))])
+
+    # get initial guess of point location
+    x0 = [0.0, 0.0] if x0 is None else x0
+    # optimize distance from signal origin to border of spheres
+    return minimize(error, x0, args=(va_pos, rngs), method='Nelder-Mead').x
+
+
 # Container class for radar data and parameters
 def genPulse(phase_x, phase_y, nr, t0, fc, bandw):
     phase = fc - bandw // 2 + bandw * np.interp(np.linspace(0, 1, nr), phase_x, phase_y)
@@ -72,21 +93,19 @@ class SinglePulseBackground(Environment):
         self.dep_ang = 45 * DTR
         self.alt = 1524
         self.plp = .5
-        self.fc = 9.6e9
         self.samples = 200000
         self.fs = fs / 8
-        self.bw = 120e6
         self.az_pt = np.pi / 2
         self.el_pt = 45 * DTR
-        self.az_lims = (-np.pi, np.pi)
+        self.az_lims = (np.pi/3, np.pi * 2/3)
         self.el_lims = (40 * DTR, 60 * DTR)
         self.curr_cpi = None
         self.max_steps = max_timesteps
         self.step = 0
 
         # Antenna array definition
-        self.tx_locs = np.array([(.5, 0, 0), (-.5, 0, 0)]).T
-        self.rx_locs = np.array([(0, 1, 0), (0, 0, 0)]).T
+        self.tx_locs = np.array([(.5, .25, 0), (-.5, 0, 0), (-.15, .15, 0)]).T
+        self.rx_locs = np.array([(.25, .5, 0), (0, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -96,6 +115,10 @@ class SinglePulseBackground(Environment):
         self.n_tx = self.tx_locs.shape[1]
         self.n_rx = self.rx_locs.shape[1]
 
+        # Setup center freqs and bandwidths
+        self.fc = [9.6e9 for n in range(self.n_tx)]
+        self.bw = [100e6 for n in range(self.n_tx)]
+
         # Setup for virtual array
         self.v_ants = self.n_tx * self.n_rx
         apc = []
@@ -103,14 +126,12 @@ class SinglePulseBackground(Environment):
         for n in range(self.n_rx):
             for m in range(self.n_tx):
                 va[:, n * self.n_tx + m] = self.rx_locs[:, n] + self.tx_locs[:, m]
-                apc.append([n,m])
+                apc.append([n, m])
         self.virtual_array = va
         self.apc = apc
 
         # Generate CFAR kernel
-        self.cfar_kernel = np.ones((40, 11))
-        self.cfar_kernel[17:24, 3:8] = 0
-        self.cfar_kernel = self.cfar_kernel / np.sum(self.cfar_kernel)
+        self.cfar_kernel = gkern(21, sig=5)[:, 9:12]
         self.det_targets = []
         self.reset()
 
@@ -131,13 +152,17 @@ class SinglePulseBackground(Environment):
         return dict(cpi=dict(type='float', shape=(self.nsam, self.cpi_len)),
                     currscan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
                     currelscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]),
-                    currwave=dict(type='float', shape=(WAVEPOINTS, self.n_tx), min_value=0, max_value=1))
+                    currwave=dict(type='float', shape=(WAVEPOINTS, self.n_tx), min_value=0, max_value=1),
+                    currfc=dict(type='float', shape=(self.n_tx,), min_value=8e9, max_value=12e9),
+                    currbw=dict(type='float', shape=(self.n_tx,), min_value=10e6, max_value=self.fs / 2 - 5e6))
 
     def actions(self):
         return dict(wave=dict(type='float', shape=(WAVEPOINTS, self.n_tx), min_value=0, max_value=1),
                     radar=dict(type='float', shape=(1,), min_value=100, max_value=self.maxPRF),
                     scan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
-                    elscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]))
+                    elscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]),
+                    fc=dict(type='float', shape=(self.n_tx,), min_value=8e9, max_value=12e9),
+                    bw=dict(type='float', shape=(self.n_tx,), min_value=10e6, max_value=self.fs / 2 - 5e6))
 
     def execute(self, actions):
         self.tf = self.tf[-1] + np.arange(1, self.cpi_len + 1) * 1 / actions['radar'][0]
@@ -147,17 +172,20 @@ class SinglePulseBackground(Environment):
         if self.step >= self.max_episode_timesteps():
             done = 2
         self.tf[self.tf >= EP_LEN_S] = EP_LEN_S - .01
-        motion = (abs(self.az_pt - actions['scan'][0]) + abs(self.el_pt - actions['elscan'][0])) ** .1 - .5
+        self.fc = actions['fc']
+        self.bw = actions['bw']
+        mid_tf = self.tf[len(self.tf) // 2]
+        motion = (abs(self.az_pt - actions['scan'][0]) + abs(self.el_pt - actions['elscan'][0])) ** .1
         self.az_pt = actions['scan'][0]
         self.el_pt = actions['elscan'][0]
         chirps = np.zeros((self.nr, self.n_tx), dtype=np.complex128)
         for n in range(self.n_tx):
-            chirps[:, n] = self.genChirp(actions['wave'][:, n], self.bw)
+            chirps[:, n] = self.genChirp(actions['wave'][:, n], self.bw[n])
         fft_chirp = np.fft.fft(chirps, self.fft_len, axis=0)
 
         # Generate the CPI using chirps; generates a nsam x cpi_len x n_ants block of FFT data
         cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
-        va = self.env.pos(self.tf[0])[:, None] + self.el_rot(self.el_pt, self.az_rot(self.az_pt, self.virtual_array))
+        va = self.env.pos(mid_tf)[:, None] + self.el_rot(self.el_pt, self.az_rot(self.az_pt, self.virtual_array))
         state = np.zeros((self.nsam, self.cpi_len, self.v_ants))
         curr_cpi = np.zeros((self.nsam, self.cpi_len, self.v_ants), dtype=np.complex128)
         for idx, ap in enumerate(self.apc):
@@ -174,7 +202,14 @@ class SinglePulseBackground(Environment):
         el_sc = 0
 
         # Ambiguity score
-        amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx))) / 2
+        amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx)))
+
+        # Target resolution score. Also used for detection.
+        res_sc = 0
+        chirp_amb = db(np.fft.ifft(fft_chirp * fft_chirp.conj(), axis=0))
+        filt_szs = [np.arange(self.fft_len)[chirp_amb[:, n] < chirp_amb[:, n].max() - 3].min() *
+                    2 for n in range(self.n_tx)]
+        res_sc += max([self.fs / c0 / (f * self.fs * self.fft_len / self.nsam / c0) for f in filt_szs])
 
         # Azimuth score. If no target, motion score
         az_sc = 0
@@ -199,7 +234,9 @@ class SinglePulseBackground(Environment):
         f_poss = []
         for va_rx in range(self.v_ants):
             # Local averaging filter to remove bright single points and clutter
-            det_st = fftconvolve(state[:, :, va_rx], np.ones((5, 5)) / 25.0, mode='same')
+            kern = np.ones((self.apc[va_rx][1], 5)) * -1
+            kern[:, 2] = 1
+            det_st = fftconvolve(state[:, :, va_rx], kern, mode='same')
 
             # Threshold to find targets
             det_st[det_st < np.mean(det_st) + np.std(det_st) * 3] = 0
@@ -217,24 +254,25 @@ class SinglePulseBackground(Environment):
         # If a target exists, it will show on at least two elements
         if np.sum([len(t) > 0 for t in t_poss]) > 1:
             for t_set in product(*[t for t in t_poss if len(t) > 0]):
-                t_rng = [t[0] / self.fs * c0 + (self.env.pos(self.tf[0])[2] / np.sin(self.el_pt + self.el_bw / 2))
+                p_pos = self.env.pos(mid_tf)
+                t_rng = [t[0] / self.fs * c0 + (p_pos[2] / np.sin(self.el_pt + self.el_bw / 2))
                          for t in t_set]
                 t_vel = [t[1] for t in t_set]
                 # If this set of possible targets is close enough together in velocity and range,
                 # add it to the formal targets list
                 vv = np.linalg.norm([np.linalg.norm(np.array(t_vel) - np.mean(t_vel)),
                                      np.linalg.norm(np.array(t_rng) - np.mean(t_rng))])
-                if vv < 5:
+                if vv < 10:
                     # Use TDOA to get a solution
-                    vas_in_use = va[:, [True if len(t) > 0 else False for t in t_poss]]
-                    sol_mat = np.zeros((2, len(t_set) - 1))
-                    sol_mat[:2, :] = vas_in_use[:2, 1:] * 2 / t_rng[1:] - 2 * (vas_in_use[:2, 0] / t_rng[0])[:, None]
-                    b = t_rng[1:] - t_rng[0] - np.linalg.norm(vas_in_use[:, 1:], axis=0) ** 2 / t_rng[1:] + np.linalg.norm(
-                        vas_in_use[:, 0]) ** 2 / t_rng[0] - vas_in_use[2, 1:] * 2 / t_rng[1:] + 2 * (vas_in_use[2, 0] / t_rng[0])
-                    A = sol_mat.T
-                    sol = np.array([*(np.linalg.pinv(A.T.dot(A)).dot(A.T).dot(-b)), 1])
-                    rmse = abs(np.linalg.norm(sol[:, None] - vas_in_use, axis=0) - t_rng).mean()
-                    f_poss = sol - self.env.pos(self.tf[0])
+                    vas_in_use = [va[:, t] for t in range(len(t_poss)) if len(t_poss[t]) > 0]
+                    dx = 1e7
+                    x0 = [0.0, 0.0]
+                    x_ = [0.0, 0.0]
+                    while dx > 1:
+                        x_ = multilateration(t_rng, vas_in_use, x0)
+                        dx = sum([(x_[0] - x0[0])**2, (x_[1] - x0[1])**2])
+                        x0 = x_
+                    f_poss = [x_[0] - p_pos[0], x_[1] - p_pos[1], 1 - p_pos[2]]
 
         if len(f_poss) > 0:
             det_sc += 1
@@ -245,8 +283,8 @@ class SinglePulseBackground(Environment):
             azdiff = cpudiff(ea[0], self.az_pt)
 
             # Only add reward if music finds possible angles
-            el_sc += 1 - abs(eldiff / self.el_bw)
-            az_sc += 1 - abs(azdiff / self.az_bw)
+            el_sc += abs(self.el_bw / eldiff) if eldiff != 0 else 10
+            az_sc += abs(self.az_bw / azdiff) if azdiff != 0 else 10
         else:
             # No targets found, incentivize the antenna to move
             ea = []
@@ -278,15 +316,15 @@ class SinglePulseBackground(Environment):
         '''
 
         # Add all the disparate reward functions
-        reward += amb_sc + det_sc + el_sc + az_sc
+        reward += amb_sc + res_sc + det_sc + el_sc + az_sc
 
-        self.log.append([state, [amb_sc, det_sc, el_sc, az_sc],
+        self.log.append([state, [amb_sc, res_sc, det_sc, el_sc, az_sc],
                          self.tf, actions['scan'], actions['elscan'], actions['wave'], ea])
 
         full_state = {'cpi': state[:, :, 0], 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
-                      'currwave': actions['wave']}
+                      'currwave': actions['wave'], 'currfc': self.fc, 'currbw': self.bw}
 
-        return full_state, done, np.array([amb_sc, det_sc + el_sc + az_sc])
+        return full_state, done, np.array([amb_sc + res_sc, det_sc + el_sc + az_sc])
 
     def reset(self, num_parallel=None):
         self.step = 0
@@ -301,8 +339,9 @@ class SinglePulseBackground(Environment):
         init_wave[0:3, :] = .01
         init_wave[-3:, :] = .99
         return {'cpi': np.zeros((self.nsam, self.cpi_len)),
-                'currscan': [self.az_pt], 'currelscan': [self.el_pt],
-                'currwave': init_wave}
+                'currscan': [np.pi / 2], 'currelscan': [45 * DTR],
+                'currwave': init_wave, 'currfc': [9.6e9 for n in range(self.n_tx)],
+                'currbw': [100e6 for n in range(self.n_tx)]}
 
     def genCPI(self, chirp, tf, az_pt, el_pt):
         mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 2
@@ -317,10 +356,6 @@ class SinglePulseBackground(Environment):
         el_pan = el_pt * np.ones((self.cpi_len,))
         pan_gpu = cupy.array(np.ascontiguousarray(az_pan), dtype=np.float64)
         el_gpu = cupy.array(np.ascontiguousarray(el_pan), dtype=np.float64)
-        p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc,
-                                     self.alt / np.sin(self.el_pt + self.el_bw / 2) / c0,
-                                     self.fs, self.dep_ang, self.env.eswath, self.env.swath,
-                                     np.random.randint(1, 15)]), dtype=np.float64)
         zo_t = np.zeros((len(self.tf), *self.env.bg[0].shape), dtype=np.complex128)
         gpts = np.random.rand(self.samples, 2)
         gpts[:, 0] *= self.env.eswath
@@ -342,6 +377,9 @@ class SinglePulseBackground(Environment):
             data_r = cupy.zeros(self.data_block, dtype=np.float64)
             data_i = cupy.zeros(self.data_block, dtype=np.float64)
             for tx in range(self.n_tx):
+                p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc[tx],
+                                             self.alt / np.sin(self.el_pt + self.el_bw / 2) / c0,
+                                             self.fs, self.dep_ang, self.env.eswath, self.env.swath]), dtype=np.float64)
                 chirp_gpu = cupy.array(np.tile(chirp[:, tx], (self.cpi_len, 1)).T, dtype=np.complex128)
                 postx_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf) + alocs_tx[:, tx][:, None]),
                                        dtype=np.float64)
@@ -578,12 +616,12 @@ class Sub(object):
         loc = np.array([np.random.rand() * (max_x - min_x) + min_x, np.random.rand() * (max_y - min_y) + min_y])
         vels = np.random.rand(2) - .5
         pos = np.zeros((2, f_ts * 100))
-        is_surfaced = np.zeros((f_ts * 100))
-        surfaced = False
+        is_surfaced = np.ones((f_ts * 100))
+        surfaced = True
         t0 = .01
         for idx in np.arange(f_ts * 100):
             if idx % 25 == 0:
-                if np.random.rand() < .5:
+                if np.random.rand() < 0:
                     surfaced = not surfaced
             acc_dir = (np.random.rand(2) - .5)
             accels = acc_dir / np.linalg.norm(acc_dir) * MAX_ALFA_ACCEL * np.random.rand()
