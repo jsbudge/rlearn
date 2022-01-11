@@ -78,7 +78,8 @@ def plotActivations(classifier, inp):
 # Base net params
 dec_facs = [1]
 batch_sz = 64
-minp_sz = 20000
+minp_sz = 40000
+stft_sz = 512
 band_limits = (10e6, fs / 2)
 base_pl = 6.468e-6
 
@@ -89,18 +90,19 @@ seg_sz = int(np.ceil(segment_t0 * fs))
 
 def genModel(nsam):
     inp = Input(shape=(nsam, 1))
-    lay = STFT(n_fft=256, win_length=200, hop_length=128, window_name=None)(inp)
+    lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100), hop_length=stft_sz // 2, window_name=None)(inp)
     lay = Magnitude()(lay)
-    lay = MagnitudeToDecibel()(lay)
     lay = BatchNormalization()(lay)
     lay = MaxPooling2D((2, 2))(lay)
     lay = Conv2D(30, (32, 32), activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
+                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
+    lay = Conv2D(30, (16, 16), activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                  kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
     lay = Flatten()(lay)
     lay = Dropout(.4)(lay)
     lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
-    #lay = GaussianNoise(1)(lay)
+    lay = GaussianNoise(1)(lay)
     outp = Dense(2, activation='softmax')(lay)
     return keras.Model(inputs=inp, outputs=outp)
 
@@ -116,7 +118,7 @@ hist_val_acc = []
 
 sig_on = True
 
-for run in tqdm(range(20)):
+for run in tqdm(range(2)):
     t0 = 0
     sig_t = 0
     Xt = []
@@ -172,7 +174,7 @@ for run in tqdm(range(20)):
     Xt = np.array(Xt)[:batch_sz, ...]
     yt = np.array(yt)[:batch_sz, ...]
 
-    h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=10, callbacks=[TerminateOnNaN()])
+    h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=20, callbacks=[TerminateOnNaN()])
     hist_loss = np.concatenate((hist_loss, h.history['loss']))
     hist_val_loss = np.concatenate((hist_val_loss, h.history['val_loss']))
     hist_acc = np.concatenate((hist_acc, h.history['accuracy']))

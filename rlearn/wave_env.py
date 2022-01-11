@@ -58,7 +58,7 @@ def gkern(l=5, sig=1.):
 
 def multilateration(rngs, va_pos, x0=None):
     def error(x, c, r):
-        return sum([(np.linalg.norm([x[0] - c[i][0], x[1] - c[i][1], 1 - c[i][2]]) - r[i])**2 for i in range(len(c))])
+        return sum([(np.linalg.norm([x[0] - c[i][0], x[1] - c[i][1], 1 - c[i][2]]) - r[i]) ** 2 for i in range(len(c))])
 
     # get initial guess of point location
     x0 = [0.0, 0.0] if x0 is None else x0
@@ -93,18 +93,18 @@ class SinglePulseBackground(Environment):
         self.dep_ang = 45 * DTR
         self.alt = 1524
         self.plp = .5
-        self.samples = 200000
+        self.samples = 500000
         self.fs = fs / 8
         self.az_pt = np.pi / 2
         self.el_pt = 45 * DTR
-        self.az_lims = (np.pi/3, np.pi * 2/3)
+        self.az_lims = (np.pi / 3, np.pi * 2 / 3)
         self.el_lims = (40 * DTR, 60 * DTR)
         self.curr_cpi = None
         self.max_steps = max_timesteps
         self.step = 0
 
         # Antenna array definition
-        self.tx_locs = np.array([(.5, .25, 0), (-.5, 0, 0), (-.15, .15, 0)]).T
+        self.tx_locs = np.array([(.5, 0, 0), (-.5, 0, 0)]).T
         self.rx_locs = np.array([(.25, .5, 0), (0, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
@@ -207,8 +207,8 @@ class SinglePulseBackground(Environment):
         # Target resolution score. Also used for detection.
         res_sc = 0
         chirp_amb = db(np.fft.ifft(fft_chirp * fft_chirp.conj(), axis=0))
-        filt_szs = [np.arange(self.fft_len)[chirp_amb[:, n] < chirp_amb[:, n].max() - 3].min() *
-                    2 for n in range(self.n_tx)]
+        filt_szs = [max([np.arange(self.fft_len)[chirp_amb[:, n] < chirp_amb[:, n].max() - 3].min() *
+                    2, 1]) for n in range(self.n_tx)]
         res_sc += max([self.fs / c0 / (f * self.fs * self.fft_len / self.nsam / c0) for f in filt_szs])
 
         # Azimuth score. If no target, motion score
@@ -234,7 +234,7 @@ class SinglePulseBackground(Environment):
         f_poss = []
         for va_rx in range(self.v_ants):
             # Local averaging filter to remove bright single points and clutter
-            kern = np.ones((self.apc[va_rx][1], 5)) * -1
+            kern = np.ones((filt_szs[self.apc[va_rx][1]], 5)) * -1
             kern[:, 2] = 1
             det_st = fftconvolve(state[:, :, va_rx], kern, mode='same')
 
@@ -270,7 +270,7 @@ class SinglePulseBackground(Environment):
                     x_ = [0.0, 0.0]
                     while dx > 1:
                         x_ = multilateration(t_rng, vas_in_use, x0)
-                        dx = sum([(x_[0] - x0[0])**2, (x_[1] - x0[1])**2])
+                        dx = sum([(x_[0] - x0[0]) ** 2, (x_[1] - x0[1]) ** 2])
                         x0 = x_
                     f_poss = [x_[0] - p_pos[0], x_[1] - p_pos[1], 1 - p_pos[2]]
 
@@ -347,9 +347,9 @@ class SinglePulseBackground(Environment):
         mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 2
         cpi_threads = int(np.ceil(self.cpi_len / self.samples))
         samp_threads = mx_threads // cpi_threads - 1
-        threads_per_block = (16, 16) #(cpi_threads, samp_threads)
+        threads_per_block = (2, 16)  # (cpi_threads, samp_threads)
         blocks_per_grid = (
-            int(np.ceil(self.cpi_len / threads_per_block[0])), int(np.ceil(self.samples / threads_per_block[1])))
+            int(np.ceil(self.cpi_len / cpi_threads)), int(np.ceil(self.samples / samp_threads)))
         sub_blocks = (int(np.ceil(self.cpi_len / threads_per_block[0])),
                       int(np.ceil(len(self.env.targets) / threads_per_block[1])))
         az_pan = az_pt * np.ones((self.cpi_len,))
@@ -379,7 +379,8 @@ class SinglePulseBackground(Environment):
             for tx in range(self.n_tx):
                 p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc[tx],
                                              self.alt / np.sin(self.el_pt + self.el_bw / 2) / c0,
-                                             self.fs, self.dep_ang, self.env.eswath, self.env.swath]), dtype=np.float64)
+                                             self.fs, self.dep_ang, self.env.bg_ext[0], self.env.bg_ext[1]]),
+                                   dtype=np.float64)
                 chirp_gpu = cupy.array(np.tile(chirp[:, tx], (self.cpi_len, 1)).T, dtype=np.complex128)
                 postx_gpu = cupy.array(np.ascontiguousarray(self.env.pos(tf) + alocs_tx[:, tx][:, None]),
                                        dtype=np.float64)
@@ -412,26 +413,6 @@ class SinglePulseBackground(Environment):
 
     def genChirp(self, py, bandwidth):
         return genPulse(np.linspace(0, 1, len(py)), py, self.nr, self.nr / self.fs, 0, bandwidth)
-
-
-def lsdir(arrpos, R, W=None):
-    if W is None:
-        W = np.eye(arrpos.shape[0])
-    x0 = np.array([0., 0., 0.])
-    dx = np.ones(3)
-    iters = 0
-    while np.linalg.norm(dx) > .001 and iters < 100:
-        norms = np.zeros(arrpos.shape[0])
-        G = np.zeros((arrpos.shape[0], 3))
-        for n in range(arrpos.shape[0]):
-            norms[n] = np.linalg.norm(arrpos[n, :] - x0)
-            G[n, :] = [-(arrpos[n, 0] - x0[0]) / norms[n], -(arrpos[n, 1] - x0[1]) / norms[n],
-                       -(arrpos[n, 2] - x0[2]) / norms[n]]
-        dp = R - norms
-        dx = np.linalg.pinv(G.T.dot(W.dot(G))).dot(G.T).dot(W.dot(dp))
-        x0 += dx
-        iters += 1
-    return x0
 
 
 def genRDAMap(cpi, chirp, nsam):
@@ -498,7 +479,8 @@ class SimEnv(object):
         self.targets = []
         self.f_ts = f_ts
         self.genFlightPath()
-        self.bg = wavefunction((self.swath * 2, self.eswath * 2), npts=(32, 32))
+        self.bg_ext = (self.eswath / 2, self.swath / 2)
+        self.bg = wavefunction(self.bg_ext, npts=(32, 32))
         for n in range(1):
             self.targets.append(Sub(self.eswath / 4, self.eswath - self.eswath / 4,
                                     0, self.swath, f_ts))
@@ -541,14 +523,14 @@ class SimEnv(object):
     def getBG(self, pts, t):
         zo = \
             1 / np.sqrt(2) * (
-                        self.bg[0] * np.exp(1j * self.bg[2] * t) + self.bg[1].conj() * np.exp(-1j * self.bg[2] * t))
+                    self.bg[0] * np.exp(1j * self.bg[2] * t) + self.bg[1].conj() * np.exp(-1j * self.bg[2] * t))
         zo[0, 0] = 0
         bg = np.fft.ifft2(np.fft.fftshift(zo)).real
         bg = bg / np.max(bg) * 2
         gx, gy = np.gradient(bg)
 
-        x_i = pts[:, 0] / self.eswath * bg.shape[0]
-        y_i = pts[:, 1] / self.swath * bg.shape[1]
+        x_i = pts[:, 0] % self.bg_ext[0] / self.bg_ext[0] * bg.shape[0]
+        y_i = pts[:, 1] % self.bg_ext[1] / self.bg_ext[1] * bg.shape[1]
         x0 = np.round(x_i).astype(int)
         y0 = np.round(y_i).astype(int)
         x1 = x0 + np.sign(x_i - x0).astype(int)
@@ -578,17 +560,17 @@ class SimEnv(object):
         gx1 = np.zeros((pts.shape[0], 3))
         gx1[:, 0] = 1
         gx1[:, 2] = gx[x1, y1] * xdiff * ydiff + gx[x1, y0] * xdiff * (1 - ydiff) + gx[x0, y1] * \
-                    (1 - xdiff) * ydiff + gx[x0, y0] * (1 - xdiff) * (1 - ydiff)
+            (1 - xdiff) * ydiff + gx[x0, y0] * (1 - xdiff) * (1 - ydiff)
         gx1[:, 0] = 1 / np.sqrt(1 + gx1[:, 2] ** 2)
         gx1[:, 2] = gx1[:, 2] / np.sqrt(1 + gx1[:, 2] ** 2)
         gx2 = np.zeros((pts.shape[0], 3))
         gx2[:, 2] = gy[x1, y1] * xdiff * ydiff + gy[x1, y0] * xdiff * (1 - ydiff) + gy[x0, y1] * \
-                    (1 - xdiff) * ydiff + gy[x0, y0] * (1 - xdiff) * (1 - ydiff)
+            (1 - xdiff) * ydiff + gy[x0, y0] * (1 - xdiff) * (1 - ydiff)
         gx2[:, 1] = 1 / np.sqrt(1 + gx2[:, 2] ** 2)
         gx2[:, 2] = gx2[:, 2] / np.sqrt(1 + gx2[:, 2] ** 2)
         n_dir = np.cross(gx1, gx2)
         hght = bg[x1, y1] * xdiff * ydiff + bg[x1, y0] * xdiff * (1 - ydiff) + bg[x0, y1] * \
-               (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
+            (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
         return n_dir, hght
 
 
@@ -720,8 +702,8 @@ def genRangeProfile(pathrx, pathtx, gp, bg, pan, el, pd_r, pd_i, params):
         ty = gp[samp_point, 1]
 
         # Calc out wave height
-        x_i = tx / params[6] * bg.shape[1]
-        y_i = ty / params[7] * bg.shape[2]
+        x_i = tx % params[6] / params[6] * bg.shape[1]
+        y_i = ty % params[7] / params[7] * bg.shape[2]
         x0 = int(x_i)
         y0 = int(y_i)
         x1 = int(x0 + 1 if x_i - x0 >= 0 else -1)
@@ -729,7 +711,7 @@ def genRangeProfile(pathrx, pathtx, gp, bg, pan, el, pd_r, pd_i, params):
         xdiff = x_i - x0
         ydiff = y_i - y0
         tz = bg[tt, x1, y1].real * xdiff * ydiff + bg[tt, x1, y0].real * xdiff * (1 - ydiff) + bg[tt, x0, y1].real * \
-             (1 - xdiff) * ydiff + bg[tt, x0, y0].real * (1 - xdiff) * (1 - ydiff)
+            (1 - xdiff) * ydiff + bg[tt, x0, y0].real * (1 - xdiff) * (1 - ydiff)
         tz_dx = bg[tt, x1, y0].real - bg[tt, x0, y0].real
         tz_dy = bg[tt, x0, y1].real - bg[tt, x0, y0].real
 
@@ -851,79 +833,3 @@ def ambiguity(s1, s2, prf, dopp_bins, mag=True, normalize=True):
         return abs(A) ** 2, fdopp, np.linspace(-len(s1) / 2 / fs, len(s1) / 2 / fs, len(s1))
     else:
         return A, fdopp, np.linspace(-dopp_bins / 2 * fs / c0, dopp_bins / 2 * fs / c0, dopp_bins)
-
-
-if __name__ == '__main__':
-    agent = SinglePulseBackground()
-    test = SimEnv(agent.alt, agent.az_bw, agent.el_bw, agent.dep_ang)
-
-    pulse = agent.genChirp(np.linspace(0, 1, WAVEPOINTS), agent.bw)
-
-    for cpi in tqdm(range(200)):
-        cpi_data, done, reward = agent.execute({'wave': np.linspace(0, 1, WAVEPOINTS),
-                                                'radar': [100], 'scan': [np.pi / 2]})
-        # print(agent.az_pt / DTR)
-
-    logs = agent.log
-    skips = 2
-    cols = ['blue', 'red', 'orange', 'yellow', 'green']
-    fig, axes = plt.subplots(2)
-    axes[1].set_xlim([-agent.env.eswath / 2, agent.env.eswath * 1.5])
-    axes[1].set_ylim([-agent.env.gnrange, agent.env.gfrange])
-    camera = Camera(fig)
-    for log_idx, l in tqdm(enumerate(logs[::skips])):
-        fpos = agent.env.pos(l[2][0])
-        main_beam = ellipse(*(list(agent.env.getAntennaBeamLocation(l[2][0], l[3][0], l[4][0])) + [l[3][0]]))
-        axes[1].plot(main_beam[0, :], main_beam[1, :], 'gray')
-        axes[1].scatter(fpos[0], fpos[1], marker='*', c='blue')
-        for idx, s in enumerate(agent.env.targets):
-            pos = s.pos(l[2][0])
-            amp = s.surf(l[2][0]) + 1
-            zx = wave_cpu(pos[0], pos[1], l[2][0])
-            plt_rng = np.linalg.norm(fpos - np.array([pos[0], pos[1], zx.real]))
-            axes[1].scatter(pos[0], pos[1], s=amp, c=cols[idx])
-            axes[1].text(pos[0], pos[1], f'{plt_rng:.2f}', c='black')
-        axes[1].legend([f'{l[2][0]:.6f}-{l[2][-1]:.6f}'])
-        axes[0].imshow(np.fft.fftshift(l[0], axes=1), origin='lower',
-                       extent=[0, agent.cpi_len, agent.env.nrange, agent.env.frange])
-        axes[0].axis('tight')
-        camera.snap()
-
-    animation = camera.animate()
-
-    tt = np.linspace(0, 10, 1000)
-    locs = test.pos(tt)
-
-    fig = plt.figure('Plane')
-    ax = plt.axes(projection='3d')
-    ax.plot(locs[0, :], locs[1, :], locs[2, :])
-
-    wdd = WignerVilleDistribution(pulse)
-    wdd.run()
-    wdd.plot(show_tf=True, kind='contour')
-    dbw, dt0 = agent.detect(pulse)
-    print('Params\t\tBW(MHz)\t\tt0(us)')
-    print(f'Detect\t\t{dbw * agent.fs / 1e6:.2f}\t\t{dt0 / agent.fs * 1e6:.2f}')
-    print(f'Truth \t\t{agent.bw / 1e6:.2f}\t\t{agent.nr / agent.fs * 1e6:.2f}')
-    print(f'Diffs \t\t{abs(agent.bw - dbw * agent.fs) / 1e6:.2f}\t\t{abs(agent.nr - dt0) * 1e6 / agent.fs:.2f}')
-
-    amb = ambiguity(pulse, pulse, 100, 30)
-
-    plt.figure('Ambiguity')
-    plt.imshow(amb[0])
-
-    # scores = np.array([l[1] for l in logs])
-
-    # plt.figure('Score breakdown')
-
-    '''fig_wave = plt.figure('Waves')
-    gx, gy = np.meshgrid(np.linspace(-agent.env.eswath / 2, agent.env.eswath * 1.5, 1000),
-                         np.linspace(-agent.env.swath / 2, agent.env.swath * 1.5, 1000))
-    ax = plt.axes()
-    cam_wave = Camera(fig_wave)
-    for log_idx, l in tqdm(enumerate(logs[::skips])):
-        wav_vals = wave_cpu(gx, gy, l[2][0])
-        ax.imshow(wav_vals.real)
-        cam_wave.snap()
-
-    anim_wave = cam_wave.animate()'''
