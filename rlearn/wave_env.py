@@ -27,7 +27,7 @@ from celluloid import Camera
 
 def db(x):
     ret = abs(x)
-    ret[ret == 0] = 1e-9
+    ret[ret < 1e-15] = 1e-15
     return 20 * np.log10(ret)
 
 
@@ -105,7 +105,7 @@ class SinglePulseBackground(Environment):
 
         # Antenna array definition
         self.tx_locs = np.array([(.5, 0, 0), (-.5, 0, 0)]).T
-        self.rx_locs = np.array([(.25, .5, 0), (0, 0, 0)]).T
+        self.rx_locs = np.array([(0, .5, 0), (0, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -149,7 +149,7 @@ class SinglePulseBackground(Environment):
         return self.max_steps
 
     def states(self):
-        return dict(cpi=dict(type='float', shape=(self.nsam, self.cpi_len)),
+        return dict(cpi=dict(type='float', shape=(self.nsam, self.cpi_len), min_value=-300, max_value=100),
                     currscan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
                     currelscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]),
                     currwave=dict(type='float', shape=(WAVEPOINTS, self.n_tx), min_value=0, max_value=1),
@@ -191,10 +191,7 @@ class SinglePulseBackground(Environment):
         for idx, ap in enumerate(self.apc):
             rda = genRDAMap(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
             st = db(rda)
-            if np.std(st) > 0:
-                st = (st - np.mean(st)) / np.std(st)
-            else:
-                pass
+            st[st > 100] = 100
             state[:, :, idx] = st
             curr_cpi[:, :, idx] = genRD(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
         self.curr_cpi = np.fft.fft(curr_cpi, self.fft_len, axis=0)[self.fft_len // 2 - 1:, :, :]
@@ -230,6 +227,7 @@ class SinglePulseBackground(Environment):
         '''
 
         # Target detection
+        '''
         t_poss = [[] for n in range(self.v_ants)]
         f_poss = []
         for va_rx in range(self.v_ants):
@@ -290,30 +288,33 @@ class SinglePulseBackground(Environment):
             ea = []
             el_sc += motion
             az_sc += motion
+        '''
 
         # Colton MUSIC input here
-        '''
-        if len(f_poss) > 0:
-            det_sc += 1
-            single_pulse = np.fft.ifft(cpi[:, 0, :], axis=0)[:self.nsam, :].T
-            ea = music(single_pulse, 1, va.T, self.fc)
-            # ea = music(single_pulse, 1, va.T, self.fc, .5 * DTR,
-            #            np.array([self.az_pt - self.az_bw * 2, self.az_pt + self.az_bw * 2]),
-            #            np.array([self.el_pt - self.el_bw * 2, self.el_pt + self.el_bw * 2]),
-            #            False, False)
-            if ea.shape[1] > 0:
-                eldiff = cpudiff(ea[1][0], self.el_pt)
-                azdiff = cpudiff(ea[0][0], self.az_pt)
+        single_pulse = np.fft.ifft(cpi[:, 0, :], axis=0)[:self.nsam, :].T
+        ea = np.zeros((2,))
+        n_hits = 0
+        for n in range(self.n_tx):
+            va_1 = va[:, [True if a[1] == n else False for a in self.apc]].astype(np.float64)
+            mus_res = music(single_pulse, 1, va_1.T, self.fc[n], .01 * DTR,
+                            a_scaleElevation=False).flatten()
+            ea += 0 if len(mus_res) == 0 else mus_res
+            n_hits += 0 if len(mus_res) == 0 else 1
 
-                # Only add reward if music finds possible angles
-                el_sc += 1 - abs(eldiff / self.el_bw)
-                az_sc += 1 - abs(azdiff / self.az_bw)
+        if n_hits > 0:
+            det_sc += 1
+            ea /= n_hits
+            eldiff = cpudiff(ea[1], self.el_pt)
+            azdiff = cpudiff(ea[0], self.az_pt)
+
+            # Only add reward if music finds possible angles
+            el_sc += 1 - abs(eldiff / self.el_bw)
+            az_sc += 1 - abs(azdiff / self.az_bw)
         else:
             # No targets found, incentivize the antenna to move
             ea = []
             el_sc += motion
             az_sc += motion
-        '''
 
         # Add all the disparate reward functions
         reward += amb_sc + res_sc + det_sc + el_sc + az_sc
@@ -344,10 +345,10 @@ class SinglePulseBackground(Environment):
                 'currbw': [100e6 for n in range(self.n_tx)]}
 
     def genCPI(self, chirp, tf, az_pt, el_pt):
-        mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 2
+        mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 4
         cpi_threads = int(np.ceil(self.cpi_len / self.samples))
         samp_threads = mx_threads // cpi_threads - 1
-        threads_per_block = (2, 16)  # (cpi_threads, samp_threads)
+        threads_per_block = (16, 16)  # (cpi_threads, samp_threads)
         blocks_per_grid = (
             int(np.ceil(self.cpi_len / cpi_threads)), int(np.ceil(self.samples / samp_threads)))
         sub_blocks = (int(np.ceil(self.cpi_len / threads_per_block[0])),
@@ -367,7 +368,7 @@ class SinglePulseBackground(Environment):
         bg_gpu = cupy.fft.ifft2(bg_gpu, axes=(1, 2))
         gpts_gpu = cupy.array(gpts, dtype=np.float64)
         for sub in self.env.targets:
-            sv.append([sub(t) for t in tf])
+            sv.append([sub(t, fullset=True) for t in tf])
         sub_pos = cupy.array(np.ascontiguousarray(sv), dtype=np.float64)
         alocs_rx = self.el_rot(el_pt, self.az_rot(az_pt, self.rx_locs))
         alocs_tx = self.el_rot(el_pt, self.az_rot(az_pt, self.tx_locs))
@@ -587,8 +588,13 @@ class Sub(object):
         # Plot out next f_ts of movement for reproducability
         self.plotRoute(f_ts, min_x, max_x, min_y, max_y)
 
-    def __call__(self, t):
-        return self.surf(t), *self.pos(t)
+    def __call__(self, t, fullset=False):
+        if fullset:
+            dd = self.vel(t) - self.vel(t+.01)
+            dang = [dd[0] / np.linalg.norm(dd), dd[1] / np.linalg.norm(dd)]
+            return self.surf(t), *self.pos(t), *dang
+        else:
+            return self.surf(t), *self.pos(t)
 
     def reset(self):
         # Plot out next f_ts of movement for reproducability
@@ -619,13 +625,13 @@ class Sub(object):
                 vels[1] = -vels[1]
             loc += vels * t0
             pos[:, idx] = loc + 0.0
-            is_surfaced[idx] = surfaced * 50
+            is_surfaced[idx] = surfaced * 9.5
         pn = UnivariateSpline(np.linspace(0, f_ts, f_ts * 100), pos[0, :])
         pe = UnivariateSpline(np.linspace(0, f_ts, f_ts * 100), pos[1, :])
         surf = interp1d(np.linspace(0, f_ts, f_ts * 100), is_surfaced, fill_value=0)
         self.pos = lambda t: np.array([pe(t), pn(t)])
-        vn = np.gradient(pos[0, :]) / 100
-        ve = np.gradient(pos[1, :]) / 100
+        vn = UnivariateSpline(np.linspace(0, f_ts, f_ts * 100), np.gradient(pos[0, :]) / 100)
+        ve = UnivariateSpline(np.linspace(0, f_ts, f_ts * 100), np.gradient(pos[1, :]) / 100)
         self.vel = lambda t: np.array([ve(t), vn(t)])
         self.surf = surf
 
@@ -762,39 +768,48 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
 
         sub_x = subs[subnum, tt, 1]
         sub_y = subs[subnum, tt, 2]
-        spow = subs[subnum, tt, 0]
-        sub_z = 20 if spow > 0 else 0
+        sub_cos = subs[subnum, tt, 3]
+        sub_sin = subs[subnum, tt, 4]
+        spow = subs[subnum, tt, 0] * 20 / 7.6
+        sub_z = subs[subnum, tt, 0]
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
-        for n in range(-3, 3):
-            s_tx = sub_x - pathtx[0, tt]
-            s_ty = sub_y - pathtx[1, tt]
-            s_tz = sub_z - pathtx[2, tt]
-            rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz) + c0 / params[4] * n
-            s_rx = sub_x - pathrx[0, tt]
-            s_ry = sub_y - pathrx[1, tt]
-            s_rz = sub_z - pathrx[2, tt]
-            rngrx = math.sqrt(s_rx * s_rx + s_ry * s_ry + s_rz * s_rz) + c0 / params[4] * n
-            rng = (rngtx + rngrx)
-            rng_bin = (rng / c0 - 2 * params[3]) * params[4]
-            but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
-            if n_samples > but > 0:
-                el_tx = math.asin(-s_tz / rngtx)
-                az_tx = math.atan2(s_tx, s_ty)
-                eldiff = diff(el_tx, el[tt])
-                azdiff = diff(az_tx, pan[tt])
-                tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
-                tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
-                el_rx = math.asin(-s_rz / rngrx)
-                az_rx = math.atan2(s_rx, s_ry)
-                eldiff = diff(el_rx, el[tt])
-                azdiff = diff(az_rx, pan[tt])
-                rx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
-                rx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
-                att = tx_elpat * tx_azpat * rx_elpat * rx_azpat
-                acc_val = spow * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
-                cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
-                cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
+        xpts = 11
+        ypts = 7
+        for n in range(xpts):
+            for m in range(ypts):
+                shift_x = sub_x + (n - xpts // 2) / (xpts // 2) * 40.52 * sub_sin
+                shift_y = sub_y + 4.75 / 40.52 * math.sqrt(
+                    40.52 * 40.52 - ((n - xpts // 2) / (xpts // 2) * 40.52) *
+                    ((n - xpts // 2) / (xpts // 2) * 40.52)) * sub_cos * (m - ypts // 2) / (ypts // 2)
+                s_tx = shift_x - pathtx[0, tt]
+                s_ty = shift_y - pathtx[1, tt]
+                s_tz = sub_z - pathtx[2, tt]
+                rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz) + c0 / params[4]
+                s_rx = shift_x - pathrx[0, tt]
+                s_ry = shift_y - pathrx[1, tt]
+                s_rz = sub_z - pathrx[2, tt]
+                rngrx = math.sqrt(s_rx * s_rx + s_ry * s_ry + s_rz * s_rz) + c0 / params[4]
+                rng = (rngtx + rngrx)
+                rng_bin = (rng / c0 - 2 * params[3]) * params[4]
+                but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
+                if n_samples > but > 0:
+                    el_tx = math.asin(-s_tz / rngtx)
+                    az_tx = math.atan2(s_tx, s_ty)
+                    eldiff = diff(el_tx, el[tt])
+                    azdiff = diff(az_tx, pan[tt])
+                    tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
+                    tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
+                    el_rx = math.asin(-s_rz / rngrx)
+                    az_rx = math.atan2(s_rx, s_ry)
+                    eldiff = diff(el_rx, el[tt])
+                    azdiff = diff(az_rx, pan[tt])
+                    rx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
+                    rx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
+                    att = tx_elpat * tx_azpat * rx_elpat * rx_azpat
+                    acc_val = spow * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
+                    cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
+                    cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
 
 def ellipse(x, y, a, b, ang):

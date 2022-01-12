@@ -4,6 +4,7 @@ import numpy as np
 from scipy.signal.windows import taylor
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from matplotlib.cm import ScalarMappable
 import matplotlib.gridspec as gridspec
 from celluloid import Camera
 from tftb.processing import WignerVilleDistribution
@@ -24,7 +25,7 @@ def findPowerOf2(x):
     return int(2 ** (np.ceil(np.log2(x))))
 
 
-games = 500
+games = 5
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64
@@ -32,8 +33,12 @@ batch_sz = 64
 # Pre-defined or custom environment
 env = SinglePulseBackground(max_timesteps)
 
-# Instantiate a Tensorforce agent
-wave_agent = Agent.create(agent='a2c', states=dict(cpi=dict(type='float', shape=(env.nsam, env.cpi_len)),
+# Define preprocessing layer (just a normalization)
+state_prelayer = [dict(type='exponential_normalization', decay=.01)]
+
+# Instantiate wave agent
+wave_agent = Agent.create(agent='a2c', states=dict(cpi=dict(type='float', shape=(env.nsam, env.cpi_len),
+                                                            min_value=-300.1, max_value=100),
                                                    currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
                                                                  max_value=1),
                                                    currfc=dict(type='float', shape=(env.n_tx,), min_value=8e9,
@@ -44,10 +49,14 @@ wave_agent = Agent.create(agent='a2c', states=dict(cpi=dict(type='float', shape=
                                        fc=dict(type='float', shape=(env.n_tx,), min_value=8e9, max_value=12e9),
                                        bw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
                                                max_value=env.fs / 2 - 5e6)
-                                       ), max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.9,
+                                       ), state_preprocessing=state_prelayer,
+                          max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.9,
                           learning_rate=5e-4,
-                          memory=max_timesteps, exploration=.1, entropy_regularization=.1)
-motion_agent = Agent.create(agent='a2c', states=dict(cpi=dict(type='float', shape=(env.nsam, env.cpi_len)),
+                          memory=max_timesteps, exploration=.1, entropy_regularization=.1, variable_noise=.4)
+
+# Instantiate motion agent
+motion_agent = Agent.create(agent='a2c', states=dict(cpi=dict(type='float', shape=(env.nsam, env.cpi_len),
+                                                              min_value=-300.1, max_value=100),
                                                      currscan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
                                                                    max_value=env.az_lims[1]),
                                                      currelscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
@@ -57,9 +66,10 @@ motion_agent = Agent.create(agent='a2c', states=dict(cpi=dict(type='float', shap
                                                    max_value=env.az_lims[1]),
                                          elscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
                                                      max_value=env.el_lims[1])),
+                            state_preprocessing=state_prelayer,
                             max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.9, learning_rate=5e-5,
                             memory=max_timesteps, exploration=.5,
-                            entropy_regularization=.1)
+                            entropy_regularization=.1, variable_noise=.4)
 
 # Training regimen
 reward_track = np.zeros(games)
@@ -136,8 +146,11 @@ for ant in range(env.n_tx):
                      env.nr, env.nr / env.fs, env.fc[ant], env.bw[ant])
     fftpulse = np.fft.fft(pulse, findPowerOf2(nr) * 1)
     rc_pulse = db(np.fft.ifft(fftpulse * (fftpulse * taylor(findPowerOf2(nr))).conj().T, findPowerOf2(nr) * 8))
-    plt.plot(np.fft.fftshift(rc_pulse))
+    plt.plot(np.arange(-len(rc_pulse) // 2, len(rc_pulse) // 2)[1:], np.fft.fftshift(rc_pulse)[1:])
     back_noise[:nr] += pulse
+plt.ylabel('dB')
+plt.xlabel('Lag')
+plt.legend(['Tx_{}'.format(n + 1) for n in range(env.n_tx)])
 
 try:
     wd = WignerVilleDistribution(back_noise)
@@ -269,3 +282,35 @@ for n in range(env.n_rx):
                env.virtual_array[1, n * env.n_tx:(n + 1) * env.n_tx],
                env.virtual_array[2, n * env.n_tx:(n + 1) * env.n_tx])
     ax.scatter(env.rx_locs[0, n], env.rx_locs[1, n], env.rx_locs[2, n], marker='*')
+
+'''
+fig = plt.figure('Ocean3D')
+xx, yy = np.meshgrid(np.linspace(0, env.env.eswath, 1500), np.linspace(0, env.env.swath, 1500))
+bgpts = np.array([xx.flatten(), yy.flatten()])
+gv, gz = env.env.getBG(bgpts.T, l[2][0])
+disp_oc = fftconvolve(gz.reshape(xx.shape), np.ones((30, 30)) / (30**2), mode='same')
+ax3d = fig.add_subplot(1, 2, 1, projection='3d')
+ax = fig.add_subplot(1, 2, 2)
+ax3d.plot_surface(xx, yy, disp_oc, rstride=10, cstride=10, cmap='ocean')
+ax3d.set_zlim([-1, 10])
+im2d = ax.imshow(disp_oc, extent=[0, env.env.swath, 0, env.env.eswath], cmap='ocean')
+ax.set_ylabel('Northing (m)')
+ax.set_xlabel('Easting (m)')
+plt.colorbar(ScalarMappable(cmap='ocean'), ax=ax, fraction=.046, pad=.04)
+pos = []
+amp = []
+pcols = []
+for t in l[2]:
+    spow, loc1, loc2 = s(t)
+    pos.append([loc1, loc2])
+    amp.append(spow + 1)
+    pcols.append(cols[idx])
+pos = np.array(pos)
+if len(pos) > 0:
+    ax.scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
+    plt_rng = 2 * (np.linalg.norm(env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
+                   np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
+              (l[2][-1] - l[2][0])
+    ax.text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='white')
+plt.tight_layout()
+'''

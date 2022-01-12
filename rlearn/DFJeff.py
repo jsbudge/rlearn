@@ -3,6 +3,7 @@ import numpy as np
 
 from mpl_toolkits import mplot3d
 from numba import cuda
+import cupy as cupy
 import numba
 from cmath import exp
 
@@ -198,12 +199,15 @@ def _runMUSICGPU(a_azimuthGrid, a_elevationGrid, a_spectrumMUSIC,
         space) of the signal.
     """
     # Precalculations for GPU processing
-    nullMatrix = a_nullSpace @ np.conjugate(a_nullSpace.T)
-    azimuthSin = np.sin(a_azimuthGrid)
-    azimuthCos = np.cos(a_azimuthGrid)
-    elevationSin = np.sin(a_elevationGrid)
-    elevationCos = np.cos(a_elevationGrid)
+    d_nullMatrix = cupy.array(a_nullSpace @ np.conjugate(a_nullSpace.T), dtype=np.complex128)
+    d_azimuthSin = cupy.array(np.sin(a_azimuthGrid), dtype=np.float64)
+    d_azimuthCos = cupy.array(np.cos(a_azimuthGrid), dtype=np.float64)
+    d_elevationSin = cupy.array(np.sin(a_elevationGrid), dtype=np.float64)
+    d_elevationCos = cupy.array(np.cos(a_elevationGrid), dtype=np.float64)
     spectrumSize = np.size(a_azimuthGrid) * np.size(a_elevationGrid)
+
+    d_relativePositionBody = cupy.array(a_relativePositionBody, dtype=np.float64)
+    d_spectrumMUSIC = cupy.array(a_spectrumMUSIC, dtype=np.float64)
 
     # Use Numba to interface with GPU
     # Calculate the number of threads per block
@@ -221,25 +225,36 @@ def _runMUSICGPU(a_azimuthGrid, a_elevationGrid, a_spectrumMUSIC,
 
     # Call the CUDA Kernal
     _musicSearchGPU[blocksPerGrid, threadsPerBlock](
-        nullMatrix, a_waveLength, a_antennaNumber,
-        a_relativePositionBody, azimuthSin, azimuthCos,
-        elevationSin, elevationCos, a_spectrumMUSIC)
+        d_nullMatrix, a_waveLength, a_antennaNumber,
+        d_relativePositionBody, d_azimuthSin, d_azimuthCos,
+        d_elevationSin, d_elevationCos, d_spectrumMUSIC)
     cuda.synchronize()
 
     # Peak Estimation on the GPU
-    isPeak = np.zeros(np.shape(a_spectrumMUSIC), dtype=int)
+    d_isPeak = cupy.array(np.zeros(np.shape(a_spectrumMUSIC), dtype=int), dtype=int)
     _estimatePeaksGPU[blocksPerGrid, threadsPerBlock](
-        isPeak, a_spectrumMUSIC, a_targetNumber)
+        d_isPeak, d_spectrumMUSIC, a_targetNumber)
     cuda.synchronize()
 
+    spectrumMUSIC = d_spectrumMUSIC.get()
+    isPeak = d_isPeak.get()
+
+    del d_isPeak
+    del d_spectrumMUSIC
+    del d_azimuthSin
+    del d_nullMatrix
+    del d_elevationSin
+    del d_azimuthCos
+    del d_elevationCos
+    del d_relativePositionBody
+
     # Extract peak indices
-    peakIndices = _extractPeaks(isPeak, a_spectrumMUSIC,
+    peakIndices = _extractPeaks(isPeak, spectrumMUSIC,
                                 a_targetNumber)
     estimatedAngles = np.array(
-        [a_azimuthGrid[peakIndices[:, 0]], \
-         a_elevationGrid[peakIndices[:, 1]]]).T
+        [a_azimuthGrid[peakIndices[:, 0]], a_elevationGrid[peakIndices[:, 1]]]).T
 
-    return a_spectrumMUSIC, peakIndices, estimatedAngles
+    return spectrumMUSIC, peakIndices, estimatedAngles
 
 
 @cuda.jit
