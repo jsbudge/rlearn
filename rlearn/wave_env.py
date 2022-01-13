@@ -42,7 +42,7 @@ DTR = np.pi / 180
 
 MAX_ALFA_ACCEL = 0.35185185185185186
 MAX_ALFA_SPEED = 21.1111111111111111
-EP_LEN_S = 30
+EP_LEN_S = 10
 WAVEPOINTS = 100
 
 
@@ -87,14 +87,14 @@ class SinglePulseBackground(Environment):
 
     def __init__(self, max_timesteps):
         super().__init__()
-        self.cpi_len = 64
-        self.az_bw = 9 * DTR
+        self.cpi_len = 128
+        self.az_bw = 15 * DTR
         self.el_bw = 12 * DTR
         self.dep_ang = 45 * DTR
         self.alt = 1524
         self.plp = .5
-        self.samples = 500000
-        self.fs = fs / 8
+        self.samples = 200000
+        self.fs = fs / 4
         self.az_pt = np.pi / 2
         self.el_pt = 45 * DTR
         self.az_lims = (np.pi / 3, np.pi * 2 / 3)
@@ -104,7 +104,7 @@ class SinglePulseBackground(Environment):
         self.step = 0
 
         # Antenna array definition
-        self.tx_locs = np.array([(.5, 0, 0), (-.5, 0, 0)]).T
+        self.tx_locs = np.array([(-.5, 0, 0), (.5, 0, 0)]).T
         self.rx_locs = np.array([(0, .5, 0), (0, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
@@ -117,7 +117,7 @@ class SinglePulseBackground(Environment):
 
         # Setup center freqs and bandwidths
         self.fc = [9.6e9 for n in range(self.n_tx)]
-        self.bw = [100e6 for n in range(self.n_tx)]
+        self.bw = [self.fs / 2 - 10e6 for n in range(self.n_tx)]
 
         # Setup for virtual array
         self.v_ants = self.n_tx * self.n_rx
@@ -191,10 +191,9 @@ class SinglePulseBackground(Environment):
         for idx, ap in enumerate(self.apc):
             rda = genRDAMap(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
             st = db(rda)
-            st[st > 100] = 100
             state[:, :, idx] = st
             curr_cpi[:, :, idx] = genRD(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
-        self.curr_cpi = np.fft.fft(curr_cpi, self.fft_len, axis=0)[self.fft_len // 2 - 1:, :, :]
+        # self.curr_cpi = np.fft.fft(curr_cpi, self.fft_len, axis=0)[self.fft_len // 2 - 1:, :, :]
         reward = 0
         el_sc = 0
 
@@ -291,19 +290,22 @@ class SinglePulseBackground(Environment):
         '''
 
         # Colton MUSIC input here
-        single_pulse = np.fft.ifft(cpi[:, 0, :], axis=0)[:self.nsam, :].T
+        single_pulse = np.fft.ifft(cpi[:, :2, :], axis=0)[:self.nsam, :].T
         ea = np.zeros((2,))
         n_hits = 0
-        for n in range(self.n_tx):
-            va_1 = va[:, [True if a[1] == n else False for a in self.apc]].astype(np.float64)
-            mus_res = music(single_pulse, 1, va_1.T, self.fc[n], .01 * DTR,
-                            a_scaleElevation=False).flatten()
-            ea += 0 if len(mus_res) == 0 else mus_res
-            n_hits += 0 if len(mus_res) == 0 else 1
+        for pulse in range(2):
+            for n in range(self.n_tx):
+                mus_res = music(single_pulse[:, pulse, :], 1, va.T, self.fc[n], .2 * DTR,
+                                a_elevationRange=np.array([-self.el_bw, self.el_bw]),
+                                a_azimuthRange=np.array([-self.az_bw, self.az_bw]),
+                                a_scaleElevation=False).flatten()
+                ea += 0 if len(mus_res) == 0 else mus_res
+                n_hits += 0 if len(mus_res) == 0 else 1
 
         if n_hits > 0:
             det_sc += 1
             ea /= n_hits
+            ea += np.array([self.az_pt, self.el_pt])
             eldiff = cpudiff(ea[1], self.el_pt)
             azdiff = cpudiff(ea[0], self.az_pt)
 
@@ -348,7 +350,7 @@ class SinglePulseBackground(Environment):
         mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 4
         cpi_threads = int(np.ceil(self.cpi_len / self.samples))
         samp_threads = mx_threads // cpi_threads - 1
-        threads_per_block = (16, 16)  # (cpi_threads, samp_threads)
+        threads_per_block = (2, 16)  # (cpi_threads, samp_threads)
         blocks_per_grid = (
             int(np.ceil(self.cpi_len / cpi_threads)), int(np.ceil(self.samples / samp_threads)))
         sub_blocks = (int(np.ceil(self.cpi_len / threads_per_block[0])),
@@ -774,8 +776,8 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
         sub_z = subs[subnum, tt, 0]
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
-        xpts = 11
-        ypts = 7
+        xpts = 7
+        ypts = 5
         for n in range(xpts):
             for m in range(ypts):
                 shift_x = sub_x + (n - xpts // 2) / (xpts // 2) * 40.52 * sub_sin

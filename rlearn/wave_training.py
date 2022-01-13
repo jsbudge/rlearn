@@ -25,20 +25,21 @@ def findPowerOf2(x):
     return int(2 ** (np.ceil(np.log2(x))))
 
 
-games = 5
+games = 1
 eval_games = 1
 max_timesteps = 128
-batch_sz = 64
+batch_sz = 32
 
 # Pre-defined or custom environment
 env = SinglePulseBackground(max_timesteps)
 
 # Define preprocessing layer (just a normalization)
-state_prelayer = [dict(type='exponential_normalization', decay=.01)]
+state_prelayer = [dict(type='linear_normalization', min_value=-1, max_value=1),
+                  dict(type='exponential_normalization', decay=.1)]
 
 # Instantiate wave agent
 wave_agent = Agent.create(agent='a2c', states=dict(cpi=dict(type='float', shape=(env.nsam, env.cpi_len),
-                                                            min_value=-300.1, max_value=100),
+                                                            min_value=-300, max_value=100),
                                                    currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
                                                                  max_value=1),
                                                    currfc=dict(type='float', shape=(env.n_tx,), min_value=8e9,
@@ -56,18 +57,18 @@ wave_agent = Agent.create(agent='a2c', states=dict(cpi=dict(type='float', shape=
 
 # Instantiate motion agent
 motion_agent = Agent.create(agent='a2c', states=dict(cpi=dict(type='float', shape=(env.nsam, env.cpi_len),
-                                                              min_value=-300.1, max_value=100),
+                                                              min_value=-300, max_value=100),
                                                      currscan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
                                                                    max_value=env.az_lims[1]),
                                                      currelscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
                                                                      max_value=env.el_lims[1])),
-                            actions=dict(radar=dict(type='float', shape=(1,), min_value=100, max_value=env.maxPRF),
+                            actions=dict(radar=dict(type='float', shape=(1,), min_value=env.maxPRF, max_value=env.maxPRF * 2),
                                          scan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
                                                    max_value=env.az_lims[1]),
                                          elscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
                                                      max_value=env.el_lims[1])),
                             state_preprocessing=state_prelayer,
-                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.9, learning_rate=5e-5,
+                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.9, learning_rate=5e-3,
                             memory=max_timesteps, exploration=.5,
                             entropy_regularization=.1, variable_noise=.4)
 
