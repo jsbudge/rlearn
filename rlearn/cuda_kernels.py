@@ -133,6 +133,15 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
                     cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
 
+@cuda.jit(device=True)
+def dot(a, b, c):
+    for n in range(c.shape[0]):
+        for m in range(c.shape[1]):
+            for k in range(a.shape[1]):
+                c[n, m] = c[n, m] + a[n, k] * b[k, m]
+    return c
+
+
 @cuda.jit()
 def runSTAP(Rc_inv, azs, els, fcs, va, tf, data_vec, fd, ang_mat):
     x, y = cuda.grid(2)
@@ -140,9 +149,14 @@ def runSTAP(Rc_inv, azs, els, fcs, va, tf, data_vec, fd, ang_mat):
         az = azs[x]
         el = els[y]
         u = array([np.cos(az) * np.sin(el), np.sin(az) * np.sin(el), np.cos(el)])
-        a = np.exp(-1j * 2 * np.pi * fcs * va.T.dot(u) / c0)
+        rel_dist = array()
+        dot(va, u, a)
+        a = np.exp(-1j * 2 * np.pi * fcs * dot(va, u) / c0)
         a0 = np.concatenate([a[n] * np.exp(-1j * 2 * np.pi * fd * tf)
                              for n in range(curr_cpi.shape[2])])
-        w = Rc_inv.dot(a0.conj())
-        h = w / (a0.dot(w.conj()))
+        dot(Rc_inv, a0.conj(), w)
+        dot(a0, w.conj(), h_den)
+        h = w / h_den
+        dot(h, data_vec, ret)
+        ang_mat[x, y] = 20 * np.log10(abs(ret))
 

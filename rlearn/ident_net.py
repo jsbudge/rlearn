@@ -43,7 +43,7 @@ def plotWeights(mdl, lnum=2, mdl_name=''):
         return
     if 'conv2d' in lnm:
         # It's a convolution layer
-        plt.figure(lnm.split('/')[1] + ' weights: ' + mdl_name)
+        plt.figure(lnm.split('/')[1] + 'layer {} weights: '.format(lnum) + mdl_name)
         grid_sz = int(np.ceil(np.sqrt(lw.shape[3])))
         for n in range(lw.shape[3]):
             plt.subplot(grid_sz, grid_sz, n + 1)
@@ -79,8 +79,9 @@ def plotActivations(classifier, inp):
 
 # Base net params
 dec_facs = [1]
-batch_sz = 64
-neg_per_pos = 3
+epoch_sz = 256
+batch_sz = 32
+neg_per_pos = 1
 minp_sz = 40000
 stft_sz = 512
 band_limits = (10e6, fs / 2)
@@ -95,22 +96,38 @@ def genModel(nsam):
     inp = Input(shape=(nsam, 1))
     lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100), hop_length=stft_sz // 4, window_name='hann_window')(inp)
     lay = Magnitude()(lay)
-    lay = MaxPooling2D((2, 2))(lay)
-    lay = MaxPooling2D((2, 2))(lay)
+    lay = MaxPooling2D((4, 4))(lay)
     lay = BatchNormalization()(lay)
-    lay = Conv2D(25, (8, 8))(lay)
+    lay = Conv2D(25, (16, 16))(lay)
+    lay = Conv2D(25, (16, 16))(lay)
     lay = Flatten()(lay)
-    lay = Dropout(.4)(lay)
     lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
     #lay = GaussianNoise(1)(lay)
-    outp = Dense(2, activation='softmax')(lay)
+    outp = Dense(1, activation='sigmoid')(lay)
+    return keras.Model(inputs=inp, outputs=outp)
+
+
+def genParamModel(nsam):
+    inp = Input(shape=(nsam, 1))
+    lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100), hop_length=stft_sz // 4, window_name='hann_window')(
+        inp)
+    lay = Magnitude()(lay)
+    lay = BatchNormalization()(lay)
+    lay = Conv2D(25, (16, 16))(lay)
+    lay = Conv2D(25, (16, 16))(lay)
+    lay = Conv2D(25, (16, 16), activation=keras.layers.LeakyReLU(alpha=.1))(lay)
+    lay = Flatten()(lay)
+    lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
+                kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
+    # lay = GaussianNoise(1)(lay)
+    outp = Dense(2)(lay)
     return keras.Model(inputs=inp, outputs=outp)
 
 
 # Generate models for different sampling rates
 mdl = genModel(minp_sz)
-mdl_comp_opts = dict(optimizer=Adam(learning_rate=1e-5), loss='categorical_crossentropy', metrics=['accuracy'])
+mdl_comp_opts = dict(optimizer=Adam(learning_rate=1e-7), loss='binary_crossentropy', metrics=['accuracy'])
 mdl.compile(**mdl_comp_opts)
 ramp = np.linspace(0, 1, 100)
 hist_loss = []
@@ -120,26 +137,23 @@ hist_val_acc = []
 
 sig_on = True
 
-for run in tqdm(range(2)):
+genparams = lambda: (np.random.rand() * 400 + 100, int((np.random.rand() * (base_pl - 1e-6) + 1e-6) * fs),
+                     np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0])
+
+for run in tqdm(range(200)):
     t0 = 0
     sig_t = 0
     count = 0
     Xt = []
     yt = []
-    prf = np.random.rand() * 400 + 100
-    # Make sure it's at least a microsecond long
-    nr = int((np.random.rand() * (base_pl - 1e-6) + 1e-6) * fs)
-    bw = np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0]
+    prf, nr, bw = genparams()
     pcnt = 0
-    while len(Xt) < batch_sz * 2:
+    while len(Xt) < epoch_sz * 2:
         # Generate the data for this segment
         seg_data = np.random.normal(0, 1, seg_sz) + 1j * np.random.normal(0, 1, seg_sz)
         seg_truth = np.zeros(seg_sz)
         if pcnt > 10:
-            prf = np.random.rand() * 400 + 100
-            # Make sure it's at least a microsecond long
-            nr = int((np.random.rand() * (base_pl - 1e-6) + 1e-6) * fs)
-            bw = np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0]
+            prf, nr, bw = genparams()
             pcnt = 0
         # First, get the signal we may or may not use here
         if sig_on:
@@ -149,7 +163,7 @@ for run in tqdm(range(2)):
             while sig_t < t0 + segment_t0:
                 ns = int((sig_t - t0) * fs)
                 seg_data[ns:min(seg_sz, ns + nr)] += \
-                    genPulse(ramp, ramp, nr, nr / fs, 9.6e9, bw)[:min(seg_sz - ns, nr)]
+                    genPulse(ramp, np.random.rand(len(ramp)), nr, nr / fs, 9.6e9, bw)[:min(seg_sz - ns, nr)]
                 seg_truth[ns:min(seg_sz, ns + nr)] = 1
                 sig_t += 1 / prf
                 pcnt += 1
@@ -175,14 +189,15 @@ for run in tqdm(range(2)):
                     Xt.append(bgn)
                     count += 1
         t0 += segment_t0
-    Xs = np.array(Xt)[batch_sz:, ...]
-    ys = to_categorical(np.array(yt)[batch_sz:, ...])
-    Xt = np.array(Xt)[:batch_sz, ...]
-    yt = to_categorical(np.array(yt)[:batch_sz, ...])
-    #Xs, ys = shuffle(Xs, ys)
-    #Xt, yt = shuffle(Xt, yt)
+    Xs = np.array(Xt)[:batch_sz, ...]
+    ys = np.array(yt)[:batch_sz, ...]
+    Xt = np.array(Xt)[batch_sz:, ...]
+    yt = to_categorical(np.array(yt)[batch_sz:, ...])
+    Xs, ys = shuffle(Xs, ys)
+    Xt, yt = shuffle(Xt, yt)
 
-    h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=5, shuffle=False, callbacks=[ReduceLROnPlateau(), TerminateOnNaN()])
+    h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=2, batch_size=batch_sz,
+                callbacks=[ReduceLROnPlateau(), TerminateOnNaN()])
     hist_loss = np.concatenate((hist_loss, h.history['loss']))
     hist_val_loss = np.concatenate((hist_val_loss, h.history['val_loss']))
     hist_acc = np.concatenate((hist_acc, h.history['accuracy']))
@@ -201,15 +216,17 @@ plt.legend([f'{d}_acc' for d in dec_facs] + [f'{d}_val_acc' for d in dec_facs])
 for idx, l in enumerate(mdl.layers):
     plotWeights(mdl, idx, mdl_name=f'model')
 
-plotActivations(mdl, Xs[ys[:, 0] == 1, :][0, :])
+plotActivations(mdl, Xs[ys[:, 0] == 0, :][0, :])
 
 # Model analysis
 test_mdl = genModel(minp_sz)
 test_mdl.compile(**mdl_comp_opts)
-sing_true = Xs[ys[:, 0] == 1, :][0, :].reshape((1, seg_sz))
-sing_y = ys[ys[:, 0] == 1, :][0, :].reshape((1, 2))
+sing_true = Xs[ys[:, 0] == 0, :][0, :].reshape((1, seg_sz))
+sing_false = Xs[ys[:, 0] == 1, :][0, :].reshape((1, seg_sz))
+sing_y = ys[ys[:, 0] == 0, :][0, :].reshape((1, 1))
+sing_fy = ys[ys[:, 0] == 1, :][0, :].reshape((1, 1))
 
-ms = test_mdl.fit(sing_true, sing_y, epochs=20, verbose=0, callbacks=[TerminateOnNaN()])
+ms = test_mdl.fit(sing_false, sing_fy, epochs=20, verbose=0, callbacks=[TerminateOnNaN()])
 
 plt.figure('Single Truth')
 plt.subplot(2, 1, 1)
@@ -219,30 +236,34 @@ plt.subplot(2, 1, 2)
 plt.title('Acc')
 plt.plot(ms.history['accuracy'])
 
-pos_pulses = sum(yt[:, 0])
-pos_res = mdl.predict(Xt)
+pos_pulses = sum(np.logical_not(ys))
+pos_res = mdl.predict(Xs)
 plt.figure(f'Pulse Found')
 grid_sz = int(np.ceil(np.sqrt(pos_pulses)))
 pos = 0
-for n in range(Xt.shape[0]):
-    if yt[n, 0]:
+for n in range(Xs.shape[0]):
+    if not ys[n]:
         pos += 1
         plt.subplot(grid_sz, grid_sz, pos)
-        plt.title(f'{pos_res[n, 0] * 100:.2f}')
-        plt.imshow(db(stft(Xt[n, :], return_onesided=False)[2]))
+        plt.title(f'{(1 - pos_res[n, 0]) * 100:.2f}')
+        plt.imshow(db(stft(Xs[n, :], return_onesided=False)[2]))
         plt.axis('tight')
 
-neg_pulses = sum(yt[:, 1])
-pos_res = mdl.predict(Xt)
+neg_pulses = sum(ys)
+pos_res = mdl.predict(Xs)
 plt.figure(f'No Pulse Found')
 grid_sz = int(np.ceil(np.sqrt(neg_pulses)))
 pos = 0
-for n in range(Xt.shape[0]):
-    if yt[n, 1]:
+for n in range(Xs.shape[0]):
+    if ys[n]:
         pos += 1
         plt.subplot(grid_sz, grid_sz, pos)
-        plt.title(f'{pos_res[n, 0] * 100:.2f}')
-        plt.imshow(db(stft(Xt[n, :], return_onesided=False)[2]))
+        plt.title(f'{(1 - pos_res[n, 0]) * 100:.2f}')
+        plt.imshow(db(stft(Xs[n, :], return_onesided=False)[2]))
         plt.axis('tight')
 
- # id_model.save('./id_model')
+'''
+------------ STAGE 2: PARAMETER DETECTION ---------------
+'''
+
+# Isolate several sets of positive detections
