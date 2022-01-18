@@ -95,8 +95,8 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
         sub_z = subs[subnum, tt, 0]
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
-        xpts = 7
-        ypts = 5
+        xpts = 1
+        ypts = 1
         for n in range(xpts):
             for m in range(ypts):
                 shift_x = sub_x + (n - xpts // 2) / (xpts // 2) * 40.52 * sub_sin

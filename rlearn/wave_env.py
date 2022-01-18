@@ -95,7 +95,7 @@ class SinglePulseBackground(Environment):
         self.alt = 1524
         self.plp = .5
         self.samples = 200000
-        self.fs = fs / 4
+        self.fs = fs / 8
         self.az_pt = np.pi / 2
         self.el_pt = 45 * DTR
         self.az_lims = (np.pi / 3, np.pi * 2 / 3)
@@ -187,12 +187,12 @@ class SinglePulseBackground(Environment):
         # Generate the CPI using chirps; generates a nsam x cpi_len x n_ants block of FFT data
         cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
         va = self.env.pos(mid_tf)[:, None] + self.el_rot(self.el_pt, self.az_rot(self.az_pt, self.virtual_array))
-        state = np.zeros((self.nsam, self.cpi_len, self.v_ants))
+        #state = np.zeros((self.nsam, self.cpi_len, self.v_ants))
         curr_cpi = np.zeros((self.nsam, self.cpi_len, self.v_ants), dtype=np.complex128)
         for idx, ap in enumerate(self.apc):
-            rda = genRDAMap(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
-            st = db(rda)
-            state[:, :, idx] = st
+            #rda = genRDAMap(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
+            #st = db(rda)
+            #state[:, :, idx] = st
             curr_cpi[:, :, idx] = genRD(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
         # self.curr_cpi = np.fft.fft(curr_cpi, self.fft_len, axis=0)[self.fft_len // 2 - 1:, :, :]
         reward = 0
@@ -227,6 +227,7 @@ class SinglePulseBackground(Environment):
         '''
 
         # Colton MUSIC input here
+        '''
         single_pulse = np.fft.ifft(cpi[:, :2, :], axis=0)[:self.nsam, :].T
         ea = np.zeros((2,))
         n_hits = 0
@@ -254,15 +255,38 @@ class SinglePulseBackground(Environment):
             ea = []
             el_sc += motion
             az_sc += motion
+        '''
+
+        # MIMO beamforming using some CPI stuff
+        beamform = np.zeros((self.nsam, self.cpi_len), dtype=np.complex128)
+        for tt in range(self.cpi_len):
+            t_pos = np.array([*self.env.targets[0].pos(self.tf[tt]), 1])
+            p_pos = self.env.pos(self.tf[tt])
+            fpos = t_pos - p_pos
+            el_tx = np.arcsin(-fpos[2] / np.linalg.norm(fpos))
+            az_tx = np.arctan2(fpos[1], fpos[0])
+            u = np.array([np.cos(az_tx) * np.sin(el_tx), np.sin(az_tx) * np.sin(el_tx), np.cos(el_tx)])
+            a = np.exp(-1j * 2 * np.pi * np.array([self.fc[n[1]] for n in self.apc]) * self.virtual_array.T.dot(u) / c0)
+            Rs = np.outer(a, a)
+            Rx = np.cov(curr_cpi[:, tt, :].T) + np.eye(self.v_ants)
+            U, eigs = np.linalg.eig(np.linalg.pinv(Rx).dot(Rs))
+            beamform[:, tt] = curr_cpi[:, tt, :].dot(U)
+            eldiff = cpudiff(el_tx, self.el_pt)
+            azdiff = cpudiff(az_tx, self.az_pt)
+            el_sc += (1 - abs(eldiff / self.el_bw)) / self.cpi_len
+            az_sc += (1 - abs(azdiff / self.az_bw)) / self.cpi_len
 
         # Add all the disparate reward functions
         reward += amb_sc + res_sc + det_sc + el_sc + az_sc
 
-        self.log.append([state, [amb_sc, res_sc, det_sc, el_sc, az_sc],
-                         self.tf, actions['scan'], actions['elscan'], actions['wave'], ea])
+        self.log.append([db(np.fft.fft(beamform, axis=1)), [amb_sc, res_sc, det_sc, el_sc, az_sc],
+                         self.tf, actions['scan'], actions['elscan'], actions['wave'], [az_tx, el_tx]])
 
-        full_state = {'cpi': state[:, :, 0], 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
-                      'currwave': actions['wave'], 'currfc': self.fc, 'currbw': self.bw}
+        full_state = {'cpi': db(np.fft.fft(beamform, axis=1)), 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
+                      'currwave': actions['wave'], 'currfc': self.fc, 'currbw': self.bw,
+                      'platform_motion': np.array([self.env.pos(mid_tf),
+                                                   (self.env.pos(self.tf[1]) - self.env.pos(self.tf[0])) /
+                                                   (self.tf[1] - self.tf[0])])}
 
         return full_state, done, np.array([amb_sc + res_sc, det_sc + el_sc + az_sc])
 
@@ -281,7 +305,9 @@ class SinglePulseBackground(Environment):
         return {'cpi': np.zeros((self.nsam, self.cpi_len)),
                 'currscan': [np.pi / 2], 'currelscan': [45 * DTR],
                 'currwave': init_wave, 'currfc': [9.6e9 for n in range(self.n_tx)],
-                'currbw': [100e6 for n in range(self.n_tx)]}
+                'currbw': [100e6 for n in range(self.n_tx)], 'platform_motion': np.array([self.env.pos(self.tf[0]),
+                                                   (self.env.pos(self.tf[1]) - self.env.pos(self.tf[0])) /
+                                                   (self.tf[1] - self.tf[0])])}
 
     def genCPI(self, chirp, tf, az_pt, el_pt):
         mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 4
@@ -356,6 +382,7 @@ class SinglePulseBackground(Environment):
 
 
 def genRDAMap(cpi, chirp, nsam):
+    # Gets a the Range-Doppler Map
     twin = taylor(cpi.shape[0])
     win_gpu = cupy.array(np.tile(twin, (cpi.shape[1], 1)).T, dtype=np.complex128)
     chirp_gpu = cupy.array(np.tile(chirp, (cpi.shape[1], 1)).T, dtype=np.complex128)
@@ -373,6 +400,7 @@ def genRDAMap(cpi, chirp, nsam):
 
 
 def genRD(cpi, chirp, nsam):
+    # Gets a range compressed Range Map
     twin = taylor(cpi.shape[0])
     win_gpu = cupy.array(np.tile(twin, (cpi.shape[1], 1)).T, dtype=np.complex128)
     chirp_gpu = cupy.array(np.tile(chirp, (cpi.shape[1], 1)).T, dtype=np.complex128)

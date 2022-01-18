@@ -14,6 +14,7 @@ from kapre import STFT, MagnitudeToDecibel, Magnitude, Phase
 from keras.callbacks import TerminateOnNaN, EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
 from keras.regularizers import l1_l2
 from tensorflow.keras.utils import to_categorical
+from keras.utils.vis_utils import plot_model
 from sklearn.utils import shuffle
 from wave_env import genPulse
 from tqdm import tqdm
@@ -140,7 +141,7 @@ sig_on = True
 genparams = lambda: (np.random.rand() * 400 + 100, int((np.random.rand() * (base_pl - 1e-6) + 1e-6) * fs),
                      np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0])
 
-for run in tqdm(range(200)):
+for run in tqdm(range(10)):
     t0 = 0
     sig_t = 0
     count = 0
@@ -192,11 +193,11 @@ for run in tqdm(range(200)):
     Xs = np.array(Xt)[:batch_sz, ...]
     ys = np.array(yt)[:batch_sz, ...]
     Xt = np.array(Xt)[batch_sz:, ...]
-    yt = to_categorical(np.array(yt)[batch_sz:, ...])
+    yt = np.array(yt)[batch_sz:, ...]
     Xs, ys = shuffle(Xs, ys)
     Xt, yt = shuffle(Xt, yt)
 
-    h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=2, batch_size=batch_sz,
+    h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=5, batch_size=batch_sz,
                 callbacks=[ReduceLROnPlateau(), TerminateOnNaN()])
     hist_loss = np.concatenate((hist_loss, h.history['loss']))
     hist_val_loss = np.concatenate((hist_val_loss, h.history['val_loss']))
@@ -261,6 +262,8 @@ for n in range(Xs.shape[0]):
         plt.title(f'{(1 - pos_res[n, 0]) * 100:.2f}')
         plt.imshow(db(stft(Xs[n, :], return_onesided=False)[2]))
         plt.axis('tight')
+
+plot_model(mdl, to_file='mdl.png', show_shapes=True)
 
 '''
 ------------ STAGE 2: PARAMETER DETECTION ---------------
