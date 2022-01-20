@@ -147,7 +147,7 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
 
 
 @cuda.jit()
-def getDetectionCheck(pathtx, subs, pan, el, pd_r, pd_i, params):
+def getDetectionCheck(pathtx, subs, pan, el, pd_r, pd_i, det_spread, params):
     tt, subnum = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and subnum < subs.shape[0]:
         # Load in all the parameters that don't change
@@ -177,3 +177,4 @@ def getDetectionCheck(pathtx, subs, pan, el, pd_r, pd_i, params):
         pt_f = int(ptt % params[6])
         cuda.atomic.add(pd_r, (pt_f, pt_s), acc_val.real)
         cuda.atomic.add(pd_i, (pt_f, pt_s), acc_val.imag)
+        det_spread[pt_s] = 1
