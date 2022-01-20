@@ -21,7 +21,7 @@ from tensorflow import keras
 import cmath
 import math
 import cupy as cupy
-from cuda_kernels import genSubProfile, genRangeProfile
+from cuda_kernels import genSubProfile, genRangeProfile, getDetectionCheck
 
 from celluloid import Camera
 
@@ -42,8 +42,8 @@ fs = 2e9
 DTR = np.pi / 180
 
 MAX_ALFA_ACCEL = 0.35185185185185186
-MAX_ALFA_SPEED = 21.1111111111111111
-EP_LEN_S = 10
+MAX_ALFA_SPEED = 2.577
+EP_LEN_S = 30
 WAVEPOINTS = 100
 
 
@@ -89,8 +89,8 @@ class SinglePulseBackground(Environment):
     def __init__(self, max_timesteps):
         super().__init__()
         self.cpi_len = 128
-        self.az_bw = 15 * DTR
-        self.el_bw = 12 * DTR
+        self.az_bw = 24 * DTR
+        self.el_bw = 18 * DTR
         self.dep_ang = 45 * DTR
         self.alt = 1524
         self.plp = .5
@@ -131,9 +131,8 @@ class SinglePulseBackground(Environment):
         self.virtual_array = va
         self.apc = apc
 
-        # Generate CFAR kernel
-        self.cfar_kernel = gkern(21, sig=5)[:, 9:12]
-        self.det_targets = []
+        # Generate beamforming matrix
+        self.Rx = np.eye(self.v_ants, dtype=np.complex128) * 1e-9
         self.reset()
 
         self.data_block = (self.nsam, self.cpi_len)
@@ -141,8 +140,13 @@ class SinglePulseBackground(Environment):
         self.maxPRF = min(c0 / (self.env.nrange + self.nsam * self.MPP), 500.0)
         try:
             self.det_model = keras.models.load_model('./id_model')
+            self.det_sz = 40000
         except OSError:
             self.det_model = None
+        try:
+            self.par_model = keras.models.load_model('./par_model')
+        except OSError:
+            self.par_model = None
         self.ave = 0
         self.std = 0
 
@@ -181,21 +185,20 @@ class SinglePulseBackground(Environment):
         self.el_pt = actions['elscan'][0]
         chirps = np.zeros((self.nr, self.n_tx), dtype=np.complex128)
         for n in range(self.n_tx):
-            chirps[:, n] = self.genChirp(actions['wave'][:, n], self.bw[n])
+            chirps[:, n] = self.genChirp(actions['wave'][:, n], self.bw[n]) * actions['power'][n]
         fft_chirp = np.fft.fft(chirps, self.fft_len, axis=0)
 
         # Generate the CPI using chirps; generates a nsam x cpi_len x n_ants block of FFT data
         cpi = self.genCPI(fft_chirp, self.tf, self.az_pt, self.el_pt)
-        va = self.env.pos(mid_tf)[:, None] + self.el_rot(self.el_pt, self.az_rot(self.az_pt, self.virtual_array))
-        #state = np.zeros((self.nsam, self.cpi_len, self.v_ants))
+        va = self.el_rot(self.el_pt, self.az_rot(self.az_pt, self.virtual_array))
+        # state = np.zeros((self.nsam, self.cpi_len, self.v_ants))
         curr_cpi = np.zeros((self.nsam, self.cpi_len, self.v_ants), dtype=np.complex128)
         for idx, ap in enumerate(self.apc):
-            #rda = genRDAMap(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
-            #st = db(rda)
-            #state[:, :, idx] = st
+            # rda = genRDAMap(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
+            # st = db(rda)
+            # state[:, :, idx] = st
             curr_cpi[:, :, idx] = genRD(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
         # self.curr_cpi = np.fft.fft(curr_cpi, self.fft_len, axis=0)[self.fft_len // 2 - 1:, :, :]
-        reward = 0
         el_sc = 0
 
         # Ambiguity score
@@ -205,7 +208,7 @@ class SinglePulseBackground(Environment):
         res_sc = 0
         chirp_amb = db(np.fft.ifft(fft_chirp * fft_chirp.conj(), axis=0))
         filt_szs = [max([np.arange(self.fft_len)[chirp_amb[:, n] < chirp_amb[:, n].max() - 3].min() *
-                    2, 1]) for n in range(self.n_tx)]
+                         2, 1]) for n in range(self.n_tx)]
         res_sc += max([self.fs / c0 / (f * self.fs * self.fft_len / self.nsam / c0) for f in filt_szs])
 
         # Azimuth score. If no target, motion score
@@ -213,21 +216,15 @@ class SinglePulseBackground(Environment):
 
         # Detectability score
         det_sc = 0
-        '''
+
+        # Find truth sub direction for pulse power
+        detb_sc = 0
+        # n_dets = int(np.ceil(self.cpi_len / actions['radar'][0] * self.fs / 40000))
         if self.det_model is not None:
-            net_sz = self.det_model.layers[0].input_shape[0][1]
-            det_chirp = (np.random.rand(max(self.nr, net_sz)) - .5 + 1j *
-                         (np.random.rand(max(self.nr, net_sz)) - .5)) / 100
-            det_chirp[:self.nr] += chirps[:, 0]
-            wdd = WignerVilleDistribution(det_chirp).run()[0]
-            det_sc = self.det_model.predict(wdd.reshape((1, *wdd.shape)))[0][1]
-        else:
-            det_sc = 0
-        reward += det_sc
-        '''
+            id_data, blen = self.genDetBlock(chirps, 20)
+            detb_sc = 1 - np.max(self.det_model.predict(id_data.T))
 
         # Colton MUSIC input here
-        '''
         single_pulse = np.fft.ifft(cpi[:, :2, :], axis=0)[:self.nsam, :].T
         ea = np.zeros((2,))
         n_hits = 0
@@ -255,40 +252,32 @@ class SinglePulseBackground(Environment):
             ea = []
             el_sc += motion
             az_sc += motion
-        '''
 
         # MIMO beamforming using some CPI stuff
+        if len(ea) == 0:
+            ea = np.array([self.az_pt, self.el_pt])
         beamform = np.zeros((self.nsam, self.cpi_len), dtype=np.complex128)
+        a = np.exp(-1j * 2 * np.pi * np.array([self.fc[n[1]] for n in self.apc]) *
+                   va.T.dot(np.array([np.cos(ea[0]) * np.sin(ea[1]),
+                                      np.sin(ea[0]) * np.sin(ea[1]), np.cos(ea[1])])) / c0)
+        Rs = np.outer(a, a)
         for tt in range(self.cpi_len):
-            t_pos = np.array([*self.env.targets[0].pos(self.tf[tt]), 1])
-            p_pos = self.env.pos(self.tf[tt])
-            fpos = t_pos - p_pos
-            el_tx = np.arcsin(-fpos[2] / np.linalg.norm(fpos))
-            az_tx = np.arctan2(fpos[1], fpos[0])
-            u = np.array([np.cos(az_tx) * np.sin(el_tx), np.sin(az_tx) * np.sin(el_tx), np.cos(el_tx)])
-            a = np.exp(-1j * 2 * np.pi * np.array([self.fc[n[1]] for n in self.apc]) * self.virtual_array.T.dot(u) / c0)
-            Rs = np.outer(a, a)
-            Rx = np.cov(curr_cpi[:, tt, :].T) + np.eye(self.v_ants)
-            U, eigs = np.linalg.eig(np.linalg.pinv(Rx).dot(Rs))
+            self.Rx += (np.cov(curr_cpi[:, tt, :].T) + np.diag(np.linalg.norm(curr_cpi[:, tt, :], axis=0)))
+            self.Rx /= 2
+            U, eigs = np.linalg.eig(np.linalg.pinv(self.Rx).dot(Rs))
             beamform[:, tt] = curr_cpi[:, tt, :].dot(U)
-            eldiff = cpudiff(el_tx, self.el_pt)
-            azdiff = cpudiff(az_tx, self.az_pt)
-            el_sc += (1 - abs(eldiff / self.el_bw)) / self.cpi_len
-            az_sc += (1 - abs(azdiff / self.az_bw)) / self.cpi_len
+        beamform = db(np.fft.fft(beamform, axis=1))
 
-        # Add all the disparate reward functions
-        reward += amb_sc + res_sc + det_sc + el_sc + az_sc
+        self.log.append([beamform, [amb_sc, res_sc, detb_sc, det_sc, el_sc, az_sc],
+                         self.tf, actions['scan'], actions['elscan'], actions['wave'], ea, U])
 
-        self.log.append([db(np.fft.fft(beamform, axis=1)), [amb_sc, res_sc, det_sc, el_sc, az_sc],
-                         self.tf, actions['scan'], actions['elscan'], actions['wave'], [az_tx, el_tx]])
-
-        full_state = {'cpi': db(np.fft.fft(beamform, axis=1)), 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
+        full_state = {'cpi': beamform, 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
                       'currwave': actions['wave'], 'currfc': self.fc, 'currbw': self.bw,
                       'platform_motion': np.array([self.env.pos(mid_tf),
                                                    (self.env.pos(self.tf[1]) - self.env.pos(self.tf[0])) /
                                                    (self.tf[1] - self.tf[0])])}
 
-        return full_state, done, np.array([amb_sc + res_sc, det_sc + el_sc + az_sc])
+        return full_state, done, np.array([amb_sc + res_sc + detb_sc, det_sc + el_sc + az_sc])
 
     def reset(self, num_parallel=None):
         self.step = 0
@@ -306,8 +295,10 @@ class SinglePulseBackground(Environment):
                 'currscan': [np.pi / 2], 'currelscan': [45 * DTR],
                 'currwave': init_wave, 'currfc': [9.6e9 for n in range(self.n_tx)],
                 'currbw': [100e6 for n in range(self.n_tx)], 'platform_motion': np.array([self.env.pos(self.tf[0]),
-                                                   (self.env.pos(self.tf[1]) - self.env.pos(self.tf[0])) /
-                                                   (self.tf[1] - self.tf[0])])}
+                                                                                          (self.env.pos(self.tf[
+                                                                                                            1]) - self.env.pos(
+                                                                                              self.tf[0])) /
+                                                                                          (self.tf[1] - self.tf[0])])}
 
     def genCPI(self, chirp, tf, az_pt, el_pt):
         mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 4
@@ -376,6 +367,61 @@ class SinglePulseBackground(Environment):
         cupy.get_default_memory_pool().free_all_blocks()
 
         return rd_cpu
+
+    def genDetBlock(self, chirp, n_dets, block_init=0):
+        block_len = np.arange(self.cpi_len)[
+            np.logical_and(self.tf[block_init] <= self.tf,
+                           self.tf < self.tf[block_init] + n_dets * self.det_sz / self.fs)].max() + 1
+        threads_per_block = (2, 16)  # (cpi_threads, samp_threads)
+        sub_blocks = (int(np.ceil(block_len / threads_per_block[0])),
+                      int(np.ceil(len(self.env.targets) / threads_per_block[1])))
+        az_pan = self.az_pt * np.ones((block_len,))
+        el_pan = self.el_pt * np.ones((block_len,))
+        pan_gpu = cupy.array(np.ascontiguousarray(az_pan), dtype=np.float64)
+        el_gpu = cupy.array(np.ascontiguousarray(el_pan), dtype=np.float64)
+        sv = []
+        for sub in self.env.targets:
+            sv.append([sub(t, fullset=True) for t in self.tf[block_init:block_len + block_init]])
+        sub_pos = cupy.array(np.ascontiguousarray(sv), dtype=np.float64)
+        alocs_tx = self.el_rot(self.el_pt, self.az_rot(self.az_pt, self.tx_locs))
+
+        # Calculate how much detection data we'll need
+        pt_s = n_dets
+        data_r = cupy.zeros((self.det_sz, pt_s), dtype=np.float64)
+        data_i = cupy.zeros((self.det_sz, pt_s), dtype=np.float64)
+        rd_cpu = np.random.randn(self.det_sz, pt_s) + 1j * np.random.randn(self.det_sz, pt_s)
+        fft_len = findPowerOf2(self.det_sz)
+        for tx in range(self.n_tx):
+            p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc[tx],
+                                         self.alt / np.sin(self.el_pt + self.el_bw / 2) / c0,
+                                         self.fs, block_init * self.fs / c0, self.det_sz]),
+                               dtype=np.float64)
+            chirp_gpu = cupy.array(np.tile(chirp[:, tx], (n_dets, 1)).T, dtype=np.complex128)
+            postx_gpu = cupy.array(
+                np.ascontiguousarray(
+                    self.env.pos(self.tf[block_init:block_len + block_init]) + alocs_tx[:, tx][:, None]),
+                dtype=np.float64)
+            getDetectionCheck[sub_blocks, threads_per_block](postx_gpu, sub_pos, pan_gpu, el_gpu,
+                                                             data_r, data_i, p_gpu)
+            cupy.cuda.Device().synchronize()
+            data = data_r + 1j * data_i
+            ret_data = cupy.fft.ifft(cupy.fft.fft(data, fft_len, axis=0) * cupy.fft.fft(chirp_gpu, fft_len, axis=0),
+                                     axis=0)[:self.det_sz, :]
+            cupy.cuda.Device().synchronize()
+            rd_cpu += ret_data.get()
+
+        del ret_data
+        del pan_gpu
+        del el_gpu
+        del p_gpu
+        del data_r
+        del data_i
+        del postx_gpu
+        del chirp_gpu
+        del sub_pos
+        cupy.get_default_memory_pool().free_all_blocks()
+
+        return rd_cpu, block_len + block_init
 
     def genChirp(self, py, bandwidth):
         return genPulse(np.linspace(0, 1, len(py)), py, self.nr, self.nr / self.fs, 0, bandwidth)
@@ -528,17 +574,17 @@ class SimEnv(object):
         gx1 = np.zeros((pts.shape[0], 3))
         gx1[:, 0] = 1
         gx1[:, 2] = gx[x1, y1] * xdiff * ydiff + gx[x1, y0] * xdiff * (1 - ydiff) + gx[x0, y1] * \
-            (1 - xdiff) * ydiff + gx[x0, y0] * (1 - xdiff) * (1 - ydiff)
+                    (1 - xdiff) * ydiff + gx[x0, y0] * (1 - xdiff) * (1 - ydiff)
         gx1[:, 0] = 1 / np.sqrt(1 + gx1[:, 2] ** 2)
         gx1[:, 2] = gx1[:, 2] / np.sqrt(1 + gx1[:, 2] ** 2)
         gx2 = np.zeros((pts.shape[0], 3))
         gx2[:, 2] = gy[x1, y1] * xdiff * ydiff + gy[x1, y0] * xdiff * (1 - ydiff) + gy[x0, y1] * \
-            (1 - xdiff) * ydiff + gy[x0, y0] * (1 - xdiff) * (1 - ydiff)
+                    (1 - xdiff) * ydiff + gy[x0, y0] * (1 - xdiff) * (1 - ydiff)
         gx2[:, 1] = 1 / np.sqrt(1 + gx2[:, 2] ** 2)
         gx2[:, 2] = gx2[:, 2] / np.sqrt(1 + gx2[:, 2] ** 2)
         n_dir = np.cross(gx1, gx2)
         hght = bg[x1, y1] * xdiff * ydiff + bg[x1, y0] * xdiff * (1 - ydiff) + bg[x0, y1] * \
-            (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
+               (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
         return n_dir, hght
 
 
@@ -557,7 +603,7 @@ class Sub(object):
 
     def __call__(self, t, fullset=False):
         if fullset:
-            dd = self.vel(t) - self.vel(t+.01)
+            dd = self.vel(t) - self.vel(t + .01)
             dang = [dd[0] / np.linalg.norm(dd), dd[1] / np.linalg.norm(dd)]
             return self.surf(t), *self.pos(t), *dang
         else:

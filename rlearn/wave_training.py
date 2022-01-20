@@ -35,41 +35,54 @@ env = SinglePulseBackground(max_timesteps)
 
 # Define preprocessing layer (just a normalization)
 state_prelayer = [dict(type='linear_normalization', min_value=-1, max_value=1),
-                  dict(type='exponential_normalization', decay=.1)]
+                  dict(type='exponential_normalization', decay=.8)]
 
-# Instantiate wave agent
-wave_agent = Agent.create(agent='a2c', states=dict(cpi=dict(type='float', shape=(env.nsam, env.cpi_len),
+# Define states for different agents
+wave_state = dict(cpi=dict(type='float', shape=(env.nsam, env.cpi_len),
                                                             min_value=-300, max_value=100),
                                                    currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
                                                                  max_value=1),
                                                    currfc=dict(type='float', shape=(env.n_tx,), min_value=8e9,
                                                                max_value=12e9),
                                                    currbw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
-                                                               max_value=env.fs / 2 - 5e6)),
-                          actions=dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, max_value=1),
+                                                               max_value=env.fs / 2 - 5e6),
+                                                     platform_motion=dict(type='float', shape=(2, 3),
+                                                                          min_value=-2000, max_value=2000))
+motion_state = dict(currscan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
+                                                                   max_value=env.az_lims[1]),
+                                                     currelscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
+                                                                     max_value=env.el_lims[1]),
+                                                     platform_motion=dict(type='float', shape=(2, 3),
+                                                                          min_value=-2000, max_value=2000))
+
+# Define actions for different agents
+wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, max_value=1),
                                        fc=dict(type='float', shape=(env.n_tx,), min_value=8e9, max_value=12e9),
                                        bw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
-                                               max_value=env.fs / 2 - 5e6)
-                                       ), state_preprocessing=state_prelayer,
+                                               max_value=env.fs / 2 - 5e6),
+                                        power=dict(type='float', shape=(env.n_tx,), min_value=1,
+                                               max_value=100)
+                                       )
+
+motion_action = dict(radar=dict(type='float', shape=(1,), min_value=100, max_value=env.maxPRF * 2),
+                                         scan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
+                                                   max_value=env.az_lims[1]),
+                                         elscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
+                                                     max_value=env.el_lims[1]))
+
+# Instantiate wave agent
+wave_agent = Agent.create(agent='a2c', states=wave_state,
+                          actions=wave_action, state_preprocessing=state_prelayer,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.9,
                           learning_rate=5e-4,
                           memory=max_timesteps, exploration=.1, entropy_regularization=.1, variable_noise=.4)
 
 # Instantiate motion agent
-motion_agent = Agent.create(agent='ac', states=dict(currscan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
-                                                                   max_value=env.az_lims[1]),
-                                                     currelscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
-                                                                     max_value=env.el_lims[1]),
-                                                     platform_motion=dict(type='float', shape=(2, 3),
-                                                                          min_value=-2000, max_value=2000)),
-                            actions=dict(radar=dict(type='float', shape=(1,), min_value=env.maxPRF, max_value=env.maxPRF * 2),
-                                         scan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
-                                                   max_value=env.az_lims[1]),
-                                         elscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
-                                                     max_value=env.el_lims[1])),
+motion_agent = Agent.create(agent='ac', states=motion_state,
+                            actions=motion_action,
                             state_preprocessing=state_prelayer,
                             max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.95, learning_rate=1e-3,
-                            memory=max_timesteps, exploration=.1)
+                            memory=max_timesteps, exploration=.9)
 
 # Training regimen
 reward_track = np.zeros(games)
@@ -81,12 +94,8 @@ for episode in tqdm(range(games)):
     sum_rewards = 0.0
     num_updates = 0
     while not terminal:
-        wave_actions = wave_agent.act(states=dict(cpi=states['cpi'],
-                                                  currwave=states['currwave'], currfc=states['currfc'],
-                                                  currbw=states['currbw']))
-        motion_actions = motion_agent.act(states=dict(currscan=states['currscan'],
-                                                      currelscan=states['currelscan'],
-                                                      platform_motion=states['platform_motion']))
+        wave_actions = wave_agent.act(states={key: states[key] for key in wave_state.keys()})
+        motion_actions = motion_agent.act(states={key: states[key] for key in motion_state.keys()})
         actions = {**wave_actions, **motion_actions}
         states, terminal, reward = env.execute(actions=actions)
         num_updates += wave_agent.observe(terminal=terminal, reward=reward[0])
@@ -105,14 +114,11 @@ for g in tqdm(range(eval_games)):
 
     while not terminal:
         # Episode timestep
-        wa, internals[0] = wave_agent.act(states=dict(cpi=states['cpi'],
-                                                      currwave=states['currwave'], currfc=states['currfc'],
-                                                      currbw=states['currbw']), internals=internals[0],
-                                          independent=True, deterministic=True)
-        ma, internals[1] = motion_agent.act(states=dict(currscan=states['currscan'],
-                                                        currelscan=states['currelscan'],
-                                                      platform_motion=states['platform_motion']), internals=internals[1],
-                                            independent=True, deterministic=True)
+        wa, internals[0] = wave_agent.act(states={key: states[key] for key in wave_state.keys()}, internals=internals[0],
+                                                    independent=True, deterministic=True)
+        ma, internals[1] = motion_agent.act(states={key: states[key] for key in motion_state.keys()},
+                                                        internals=internals[1],
+                                                        independent=True, deterministic=True)
         actions = {**wa, **ma}
         states, terminal, reward = env.execute(actions=actions)
 
@@ -163,10 +169,10 @@ except IndexError:
 
 cols = ['red', 'blue', 'green', 'orange', 'yellow', 'purple', 'black', 'cyan']
 fig = plt.figure()
-gs = gridspec.GridSpec(3, env.n_tx)
+gs = gridspec.GridSpec(3, 2)
 axes = []
-for ant in range(env.n_tx):
-    axes.append(plt.subplot(gs[0, ant]))
+axes.append(plt.subplot(gs[0, 0]))
+axes.append(plt.subplot(gs[0, 1]))
 axes.append(plt.subplot(gs[1, :]))
 axes.append(plt.subplot(gs[2, :]))
 # Calc Doppler shifts and velocities
@@ -178,13 +184,13 @@ for l in logs:
     # Draw the beam and platform
     bm_x, bm_y, bm_a, bm_b = env.env.getAntennaBeamLocation(l[2][0], l[3][0], l[4][0])
     main_beam = ellipse(bm_x, bm_y, bm_a, bm_b, l[3][0])
-    axes[env.n_tx].plot(main_beam[0, :], main_beam[1, :], 'gray')
-    axes[env.n_tx].scatter(fpos[0], fpos[1], marker='*', c='blue')
+    axes[2].plot(main_beam[0, :], main_beam[1, :], 'gray')
+    axes[2].scatter(fpos[0], fpos[1], marker='*', c='blue')
     beam_dir = np.exp(1j * l[3][0]) * fpos[2] / np.tan(l[4][0])
-    axes[env.n_tx].arrow(fpos[0], fpos[1], beam_dir.real, beam_dir.imag)
+    axes[2].arrow(fpos[0], fpos[1], beam_dir.real, beam_dir.imag)
     if len(l[6]) > 0:
         t_dir = np.exp(1j * l[6][0]) * fpos[2] / np.tan(l[4][0])
-        axes[env.n_tx].arrow(fpos[0], fpos[1], t_dir.real, t_dir.imag)
+        axes[2].arrow(fpos[0], fpos[1], t_dir.real, t_dir.imag)
 
     # Draw the targets
     for idx, s in enumerate(env.env.targets):
@@ -198,21 +204,36 @@ for l in logs:
             pcols.append(cols[idx])
         pos = np.array(pos)
         if len(pos) > 0:
-            axes[env.n_tx].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
+            axes[2].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
 
             # Range to target
             plt_rng = 2 * (np.linalg.norm(env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
                            np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
                       (l[2][-1] - l[2][0])
-            axes[env.n_tx].text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='black')
-    axes[env.n_tx].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
+            axes[2].text(pos[0, 0], pos[0, 1],
+                                f'{-plt_rng:.2f}, {np.linalg.norm(env.env.pos(l[2])[:2, -1] - np.array([pos[-1, 0], pos[-1, 1]])):.2f}', c='black')
+    axes[2].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
+    axes[0].imshow(np.fft.fftshift(l[0], axes=1),
+                   extent=[dopp_freqs[0], dopp_freqs[-1], env.env.gnrange, env.env.gfrange], origin='lower')
+    axes[0].axis('tight')
+
+    # Draw beamformed array pattern
+    az_angs = np.linspace(env.az_lims[0], env.az_lims[1], 180)
+    R = abs(np.sin(np.pi / env.az_bw * az_angs) / (np.pi / env.az_bw * az_angs))
+    Y = np.zeros(R.shape, dtype=np.complex128)
+    for ang in range(len(R)):
+        a = np.exp(-1j * 2 * np.pi * np.array([env.fc[n[1]] for n in env.apc]) *
+                   env.virtual_array.T.dot(np.array([np.cos(R[ang]) * np.sin(env.el_pt),
+                                                      np.sin(R[ang]) * np.sin(env.el_pt), np.cos(env.el_pt)])) / c0)
+        Y[ang] = sum(R[ang] * l[7] * a)
+    Y = db(Y)
+    Y = Y - Y.max()
+    axes[1].plot(az_angs, Y, c='blue')
+    axes[1].set_ylim([-60, 2])
 
     # Draw the RD maps for each antenna
     for ant in range(env.n_tx):
-        axes[ant].imshow(np.fft.fftshift(l[0], axes=1),
-                         extent=[dopp_freqs[0], dopp_freqs[-1], env.env.gnrange, env.env.gfrange])
-        axes[ant].axis('tight')
-        axes[env.n_tx + 1].plot(db(
+        axes[3].plot(db(
             np.fft.fft(
                 genPulse(np.linspace(0, 1, len(l[5][:, ant])), l[5][:, ant], env.nr, env.nr / env.fs,
                          env.fc[ant], env.bw[ant]),
@@ -253,9 +274,13 @@ bgpts = np.array([xx.flatten(), yy.flatten()])
 for l in logs:
     gv, gz = env.env.getBG(bgpts.T, l[2][0])
     p_pos = env.env.pos(l[2][0])
-    illum = (p_pos[0] * gv[:, 0] + p_pos[1] * gv[:, 1] + p_pos[2] * gv[:, 2]) / np.linalg.norm(p_pos)
+    pn = p_pos / np.linalg.norm(p_pos)
+    rd = 2 * np.dot(gv, pn)[:, None] * gv - pn[None, :]
+    illum = np.dot(rd, pn)
+    illum[illum < 0] = 0
     ax[0].imshow(gz.reshape(xx.shape), extent=[0, env.env.swath, 0, env.env.eswath])
     ax[1].imshow(illum.reshape(xx.shape), extent=[0, env.env.swath, 0, env.env.eswath])
+    plt.axis('off')
     for idx, s in enumerate(env.env.targets):
         pos = []
         amp = []
@@ -273,9 +298,11 @@ for l in logs:
                       (l[2][-1] - l[2][0])
             ax[0].text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='black')
     ax[0].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
+    ax[0].axis('off')
     camw.snap()
 
 animw = camw.animate(interval=500)
+animw.save('ocean.mp4')
 
 plt.figure('VA positions')
 ax = plt.subplot(111, projection='3d')

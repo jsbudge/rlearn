@@ -8,6 +8,7 @@ import numpy as np
 from tqdm import tqdm
 import keras
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.constraints import NonNeg
 from keras.layers import Input, Conv2D, Flatten, Dense, BatchNormalization, MaxPooling2D, AveragePooling2D, \
     Dropout, GaussianNoise, Concatenate
 from kapre import STFT, MagnitudeToDecibel, Magnitude, Phase
@@ -25,7 +26,7 @@ import matplotlib.pyplot as plt
 
 c0 = 299792458.0
 TAC = 125e6
-fs = 2e9 / 4
+fs = 2e9 / 8
 DTR = np.pi / 180
 
 
@@ -114,22 +115,25 @@ def genParamModel(nsam):
     lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100), hop_length=stft_sz // 4, window_name='hann_window')(
         inp)
     lay = Magnitude()(lay)
+    lay = MaxPooling2D((2, 2))(lay)
     lay = BatchNormalization()(lay)
-    lay = Conv2D(25, (16, 16))(lay)
-    lay = Conv2D(25, (16, 16))(lay)
     lay = Conv2D(25, (16, 16), activation=keras.layers.LeakyReLU(alpha=.1))(lay)
     lay = Flatten()(lay)
     lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
     # lay = GaussianNoise(1)(lay)
-    outp = Dense(2)(lay)
+    outp = Dense(2, kernel_constraint=NonNeg())(lay)
     return keras.Model(inputs=inp, outputs=outp)
 
 
-# Generate models for different sampling rates
+# Generate models for detection and estimation
 mdl = genModel(minp_sz)
-mdl_comp_opts = dict(optimizer=Adam(learning_rate=1e-7), loss='binary_crossentropy', metrics=['accuracy'])
+mdl_comp_opts = dict(optimizer=Adam(learning_rate=1e-6), loss='binary_crossentropy', metrics=['accuracy'])
 mdl.compile(**mdl_comp_opts)
+par_mdl = genParamModel(seg_sz)
+par_comp_opts = dict(optimizer=Adam(learning_rate=1e-6), loss='huber_loss', metrics=['mean_squared_error'])
+par_mdl.compile(**par_comp_opts)
+
 ramp = np.linspace(0, 1, 100)
 hist_loss = []
 hist_val_loss = []
@@ -147,6 +151,7 @@ for run in tqdm(range(10)):
     count = 0
     Xt = []
     yt = []
+    p_yt = []
     prf, nr, bw = genparams()
     pcnt = 0
     while len(Xt) < epoch_sz * 2:
@@ -174,6 +179,7 @@ for run in tqdm(range(10)):
         if len(yt) == 0:
             if np.any(seg_truth):
                 yt.append([0])
+                p_yt.append([nr / fs * 1e6, bw * 2 / fs])
             else:
                 yt.append([1])
                 count += 1
@@ -182,6 +188,7 @@ for run in tqdm(range(10)):
             if np.any(seg_truth):
                 if count >= neg_per_pos:
                     yt.append([0])
+                    p_yt.append([nr / fs * 1e6, bw * 2 / fs])
                     Xt.append(bgn)
                     count = 0
             else:
@@ -190,15 +197,20 @@ for run in tqdm(range(10)):
                     Xt.append(bgn)
                     count += 1
         t0 += segment_t0
+    p_Xt = np.array(Xt)[(np.array(yt) == 0).flatten(), ...]
+    p_yt = np.array(p_yt)
     Xs = np.array(Xt)[:batch_sz, ...]
     ys = np.array(yt)[:batch_sz, ...]
     Xt = np.array(Xt)[batch_sz:, ...]
     yt = np.array(yt)[batch_sz:, ...]
     Xs, ys = shuffle(Xs, ys)
     Xt, yt = shuffle(Xt, yt)
+    p_Xt, p_yt = shuffle(p_Xt, p_yt)
 
     h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=5, batch_size=batch_sz,
                 callbacks=[ReduceLROnPlateau(), TerminateOnNaN()])
+    ph = par_mdl.fit(p_Xt, p_yt, epochs=5, batch_size=batch_sz,
+                callbacks=[TerminateOnNaN()])
     hist_loss = np.concatenate((hist_loss, h.history['loss']))
     hist_val_loss = np.concatenate((hist_val_loss, h.history['val_loss']))
     hist_acc = np.concatenate((hist_acc, h.history['accuracy']))
@@ -263,10 +275,14 @@ for n in range(Xs.shape[0]):
         plt.imshow(db(stft(Xs[n, :], return_onesided=False)[2]))
         plt.axis('tight')
 
-plot_model(mdl, to_file='mdl.png', show_shapes=True)
+# Save out the model for future use
+mdl.save('./id_model')
+par_mdl.save('./par_model')
 
-'''
------------- STAGE 2: PARAMETER DETECTION ---------------
-'''
+# plot_model(mdl, to_file='mdl.png', show_shapes=True)
+# plot_model(par_mdl, to_file='par_mdl.png', show_shapes=True)
 
-# Isolate several sets of positive detections
+
+
+
+
