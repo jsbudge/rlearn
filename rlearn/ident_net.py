@@ -145,7 +145,7 @@ sig_on = True
 genparams = lambda: (np.random.rand() * 400 + 100, int((np.random.rand() * (base_pl - 1e-6) + 1e-6) * fs),
                      np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0])
 
-for run in tqdm(range(10)):
+for run in tqdm(range(120)):
     t0 = 0
     sig_t = 0
     count = 0

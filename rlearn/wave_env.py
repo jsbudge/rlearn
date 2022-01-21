@@ -1,3 +1,4 @@
+import cupyx.scipy.signal
 from tensorforce import Environment
 import numpy as np
 from music import MUSIC
@@ -16,6 +17,7 @@ from scipy.ndimage import binary_dilation, binary_erosion, label
 from DFJeff import MUSICSinglePoint as music
 import matplotlib.pyplot as plt
 from scipy.interpolate import UnivariateSpline, interp1d
+from sklearn.metrics import log_loss
 from numba import cuda, njit
 from tensorflow import keras
 import cmath
@@ -105,8 +107,9 @@ class SinglePulseBackground(Environment):
         self.step = 0
 
         # Antenna array definition
-        self.tx_locs = np.array([(-.5, 0, 0), (.5, 0, 0)]).T
-        self.rx_locs = np.array([(0, .5, 0), (0, 0, 0)]).T
+        dr = c0 / 9.6e9
+        self.tx_locs = np.array([(0, 0, 0)]).T
+        self.rx_locs = np.array([(dr, 0, 0), (-dr, 0, 0), (dr * 2, 0, 0), (-dr * 2, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -180,7 +183,7 @@ class SinglePulseBackground(Environment):
         self.fc = actions['fc']
         self.bw = actions['bw']
         mid_tf = self.tf[len(self.tf) // 2]
-        # motion = (abs(self.az_pt - actions['scan'][0]) + abs(self.el_pt - actions['elscan'][0])) ** .1
+        motion = (abs(self.az_pt - actions['scan'][0]) + abs(self.el_pt - actions['elscan'][0])) ** .1
         self.az_pt = actions['scan'][0]
         self.el_pt = actions['elscan'][0]
         chirps = np.zeros((self.nr, self.n_tx), dtype=np.complex128)
@@ -194,7 +197,6 @@ class SinglePulseBackground(Environment):
         curr_cpi = np.zeros((self.nsam, self.cpi_len, self.v_ants), dtype=np.complex128)
         for idx, ap in enumerate(self.apc):
             curr_cpi[:, :, idx] = genRD(cpi[:, :, ap[0]], fft_chirp[:, ap[1]], self.nsam)
-        el_sc = 0
 
         # Ambiguity score
         amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx)))
@@ -206,22 +208,22 @@ class SinglePulseBackground(Environment):
                          2, 1]) for n in range(self.n_tx)]
         res_sc += max([self.fs / c0 / (f * self.fs * self.fft_len / self.nsam / c0) for f in filt_szs])
 
-        # Azimuth score. If no target, motion score
+        # Azimuth and elevation score. If no target, motion score
         az_sc = 0
+        el_sc = 0
 
         # Detectability score
         det_sc = 0
 
         # Find truth sub direction for pulse power
         detb_sc = 0
-        # n_dets = int(np.ceil(self.cpi_len / actions['radar'][0] * self.fs / 40000))
         if self.det_model is not None:
             id_data, blen, n_dets = self.genDetBlock(chirps, 20)
-            n_close = np.linalg.norm(self.det_model.predict(id_data.T).flatten() - n_dets)
+            n_close = 1 - log_loss(n_dets, self.det_model.predict(id_data.T).flatten())
             detb_sc += -n_close
 
         # Colton MUSIC input here
-        single_pulse = np.fft.ifft(cpi[:, :2, :], axis=0)[:self.nsam, :].T
+        single_pulse = curr_cpi[:, :2, :].T
         ea = np.zeros((2,))
         n_hits = 0
         for pulse in range(2):
@@ -246,6 +248,8 @@ class SinglePulseBackground(Environment):
         else:
             # No targets found, incentivize the antenna to move
             ea = []
+            el_sc += motion - 1
+            az_sc += motion - 1
 
         # MIMO beamforming using some CPI stuff
         if len(ea) == 0:
@@ -254,14 +258,17 @@ class SinglePulseBackground(Environment):
         a = np.exp(-1j * 2 * np.pi * np.array([self.fc[n[1]] for n in self.apc]) *
                    va.T.dot(np.array([np.cos(ea[0]) * np.sin(ea[1]),
                                       np.sin(ea[0]) * np.sin(ea[1]), np.cos(ea[1])])) / c0)
-        Rs = np.outer(a, a)
         U = None
         for tt in range(self.cpi_len):
             self.Rx += (np.cov(curr_cpi[:, tt, :].T) + np.diag(np.linalg.norm(curr_cpi[:, tt, :], axis=0)))
             self.Rx /= 2
-            U, eigs = np.linalg.eig(np.linalg.pinv(self.Rx).dot(Rs))
+            U = np.linalg.norm(curr_cpi[:, tt, :]) * np.linalg.pinv(self.Rx).dot(a)
             beamform[:, tt] = curr_cpi[:, tt, :].dot(U)
         beamform = db(np.fft.fft(beamform, axis=1))
+
+        # Clipping
+        beamform[beamform > 100] = 100
+        beamform[beamform < -300] = -300
 
         # Append everything to the logs, for pretty pictures later
         self.log.append([beamform, [amb_sc, res_sc, detb_sc, det_sc, el_sc, az_sc],
@@ -302,7 +309,7 @@ class SinglePulseBackground(Environment):
         mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 4
         cpi_threads = int(np.ceil(self.cpi_len / self.samples))
         samp_threads = mx_threads // cpi_threads - 1
-        threads_per_block = (2, 16)
+        threads_per_block = (16, 16)
         blocks_per_grid = (
             int(np.ceil(self.cpi_len / cpi_threads)), int(np.ceil(self.samples / samp_threads)))
         sub_blocks = (int(np.ceil(self.cpi_len / threads_per_block[0])),
@@ -371,7 +378,7 @@ class SinglePulseBackground(Environment):
         block_len = np.arange(self.cpi_len)[
                         np.logical_and(self.tf[block_init] <= self.tf,
                                        self.tf < self.tf[block_init] + n_dets * self.det_sz / self.fs)].max() + 1
-        threads_per_block = (2, 16)  # (cpi_threads, samp_threads)
+        threads_per_block = (16, 16)  # (cpi_threads, samp_threads)
         sub_blocks = (int(np.ceil(block_len / threads_per_block[0])),
                       int(np.ceil(len(self.env.targets) / threads_per_block[1])))
         az_pan = self.az_pt * np.ones((block_len,))
@@ -409,7 +416,7 @@ class SinglePulseBackground(Environment):
                                      axis=0)[:self.det_sz, :]
             cupy.cuda.Device().synchronize()
             rd_cpu += ret_data.get()
-        n_pulses = det_spread.get() / self.n_tx
+        n_pulses = det_spread.get()
 
         del ret_data
         del pan_gpu

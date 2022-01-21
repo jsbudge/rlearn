@@ -29,50 +29,51 @@ games = 1
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64
+feedback_train = False
 
 # Pre-defined or custom environment
 env = SinglePulseBackground(max_timesteps)
 
 # Define preprocessing layer (just a normalization)
-state_prelayer = [dict(type='linear_normalization', min_value=-1, max_value=1),
+state_prelayer = [dict(type='linear_normalization'),
                   dict(type='exponential_normalization', decay=.8)]
 
 # Define states for different agents
 wave_state = dict(cpi=dict(type='float', shape=(env.nsam, env.cpi_len),
-                                                            min_value=-300, max_value=100),
-                                                   currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
-                                                                 max_value=1),
-                                                   currfc=dict(type='float', shape=(env.n_tx,), min_value=8e9,
-                                                               max_value=12e9),
-                                                   currbw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
-                                                               max_value=env.fs / 2 - 5e6),
-                                                     platform_motion=dict(type='float', shape=(2, 3),
-                                                                          min_value=-2000, max_value=2000))
+                           min_value=-300, max_value=100),
+                  currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
+                                max_value=1),
+                  currfc=dict(type='float', shape=(env.n_tx,), min_value=8e9,
+                              max_value=12e9),
+                  currbw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
+                              max_value=env.fs / 2 - 5e6),
+                  platform_motion=dict(type='float', shape=(2, 3),
+                                       min_value=-2000, max_value=2000))
 motion_state = dict(currscan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
-                                                                   max_value=env.az_lims[1]),
-                                                     currelscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
-                                                                     max_value=env.el_lims[1]),
-                                                     platform_motion=dict(type='float', shape=(2, 3),
-                                                                          min_value=-2000, max_value=2000))
+                                  max_value=env.az_lims[1]),
+                    currelscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
+                                    max_value=env.el_lims[1]),
+                    platform_motion=dict(type='float', shape=(2, 3),
+                                         min_value=-2000, max_value=2000))
 
 # Define actions for different agents
 wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, max_value=1),
-                                       fc=dict(type='float', shape=(env.n_tx,), min_value=8e9, max_value=12e9),
-                                       bw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
-                                               max_value=env.fs / 2 - 5e6),
-                                        power=dict(type='float', shape=(env.n_tx,), min_value=1,
-                                               max_value=100)
-                                       )
+                   fc=dict(type='float', shape=(env.n_tx,), min_value=8e9, max_value=12e9),
+                   bw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
+                           max_value=env.fs / 2 - 5e6),
+                   power=dict(type='float', shape=(env.n_tx,), min_value=1,
+                              max_value=100)
+                   )
 
 motion_action = dict(radar=dict(type='float', shape=(1,), min_value=100, max_value=env.maxPRF * 2),
-                                         scan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
-                                                   max_value=env.az_lims[1]),
-                                         elscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
-                                                     max_value=env.el_lims[1]))
+                     scan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
+                               max_value=env.az_lims[1]),
+                     elscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
+                                 max_value=env.el_lims[1]))
 
 # Instantiate wave agent
-wave_agent = Agent.create(agent='a2c', states=wave_state,
-                          actions=wave_action, state_preprocessing=state_prelayer,
+wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=state_prelayer,
+                          actions=wave_action,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.9,
                           learning_rate=5e-4,
                           memory=max_timesteps, exploration=.1, entropy_regularization=.1, variable_noise=.4)
@@ -114,11 +115,12 @@ for g in tqdm(range(eval_games)):
 
     while not terminal:
         # Episode timestep
-        wa, internals[0] = wave_agent.act(states={key: states[key] for key in wave_state.keys()}, internals=internals[0],
-                                                    independent=True, deterministic=True)
+        wa, internals[0] = wave_agent.act(states={key: states[key] for key in wave_state.keys()},
+                                          internals=internals[0],
+                                          independent=True, deterministic=True)
         ma, internals[1] = motion_agent.act(states={key: states[key] for key in motion_state.keys()},
-                                                        internals=internals[1],
-                                                        independent=True, deterministic=True)
+                                            internals=internals[1],
+                                            independent=True, deterministic=True)
         actions = {**wa, **ma}
         states, terminal, reward = env.execute(actions=actions)
 
@@ -142,13 +144,16 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-plt.figure('Training Reward Track')
-mav = sliding_window(reward_track, 5, func=np.mean)
-plt.plot(reward_track)
-plt.plot(mav, linestyle='dashed')
-plt.legend(['Sum', 'Moving Average'])
+if len(reward_track) >= 5:
+    plt.figure('Training Reward Track')
+    mav = sliding_window(reward_track, 5, func=np.mean)
+    plt.plot(reward_track)
+    plt.plot(mav, linestyle='dashed')
+    plt.legend(['Sum', 'Moving Average'])
+else:
+    print('Not enough training episodes for track display.')
 
-plt.figure('RC Pulses')
+plt.figure('RC Pulse Width')
 for ant in range(env.n_tx):
     pulse = genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, ant],
                      env.nr, env.nr / env.fs, env.fc[ant], env.bw[ant])
@@ -170,16 +175,12 @@ except IndexError:
 cols = ['red', 'blue', 'green', 'orange', 'yellow', 'purple', 'black', 'cyan']
 fig = plt.figure()
 gs = gridspec.GridSpec(3, 2)
-axes = []
-axes.append(plt.subplot(gs[0, 0]))
-axes.append(plt.subplot(gs[0, 1]))
-axes.append(plt.subplot(gs[1, :]))
-axes.append(plt.subplot(gs[2, :]))
+axes = [plt.subplot(gs[0, 0]), plt.subplot(gs[0, 1]), plt.subplot(gs[1, :]), plt.subplot(gs[2, :])]
 # Calc Doppler shifts and velocities
 camera = Camera(fig)
 for l in logs:
     fpos = env.env.pos(l[2])[:, 0]
-    dopp_freqs = np.fft.fftshift(np.fft.fftfreq(l[0].shape[1], (l[2][1] - l[2][0]))) / env.fc[0] * c0 * 2
+    dopp_freqs = np.fft.fftshift(np.fft.fftfreq(l[0].shape[1], (l[2][1] - l[2][0]))) / env.fc[0] * c0
 
     # Draw the beam and platform
     bm_x, bm_y, bm_a, bm_b = env.env.getAntennaBeamLocation(l[2][0], l[3][0], l[4][0])
@@ -211,25 +212,30 @@ for l in logs:
                            np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
                       (l[2][-1] - l[2][0])
             axes[2].text(pos[0, 0], pos[0, 1],
-                                f'{-plt_rng:.2f}, {np.linalg.norm(env.env.pos(l[2])[:2, -1] - np.array([pos[-1, 0], pos[-1, 1]])):.2f}', c='black')
+                         f'{-plt_rng:.2f}, {np.linalg.norm(env.env.pos(l[2])[:2, -1] - np.array([pos[-1, 0], pos[-1, 1]])):.2f}',
+                         c='black')
     axes[2].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
     axes[0].imshow(np.fft.fftshift(l[0], axes=1),
-                   extent=[dopp_freqs[0], dopp_freqs[-1], env.env.gnrange, env.env.gfrange], origin='lower')
+                   extent=[dopp_freqs[0], dopp_freqs[-1], env.env.gnrange, env.env.gfrange], origin='lower',
+                   clim=[-300, 100])
     axes[0].axis('tight')
 
     # Draw beamformed array pattern
-    az_angs = np.linspace(env.az_lims[0], env.az_lims[1], 180)
-    R = abs(np.sin(np.pi / env.az_bw * az_angs) / (np.pi / env.az_bw * az_angs))
+    az_angs = np.linspace(-np.pi / 2, np.pi / 2, 180)
+    el_angs = np.linspace(1e-9, -np.pi / 2, 180).reshape((-1, 1))
+    R = np.sin(np.pi / env.az_bw * az_angs) / (np.pi / env.az_bw * az_angs) * \
+        np.sin(np.pi / env.el_bw * el_angs) / (np.pi / env.el_bw * el_angs)
     Y = np.zeros(R.shape, dtype=np.complex128)
-    for ang in range(len(R)):
-        a = np.exp(-1j * 2 * np.pi * np.array([env.fc[n[1]] for n in env.apc]) *
-                   env.virtual_array.T.dot(np.array([np.cos(R[ang]) * np.sin(env.el_pt),
-                                                      np.sin(R[ang]) * np.sin(env.el_pt), np.cos(env.el_pt)])) / c0)
-        Y[ang] = sum(R[ang] * l[7] * a)
-    Y = db(Y)
+    for az_a in range(len(R)):
+        for el_a in range(len(R)):
+            a = np.exp(-1j * 2 * np.pi * np.array([env.fc[n[1]] for n in env.apc]) *
+                       env.virtual_array.T.dot(np.array([np.cos(az_angs[az_a]) * np.sin(el_angs[el_a]),
+                                                         np.sin(az_angs[az_a]) * np.sin(el_angs[el_a]),
+                                                         np.cos(el_angs[el_a])])) / c0)
+            Y[az_a, el_a] = sum(l[7].dot(a))
+    Y = abs(Y)
     Y = Y - Y.max()
-    axes[1].plot(az_angs, Y, c='blue')
-    axes[1].set_ylim([-60, 2])
+    axes[1].imshow(Y, clim=[-60, 2])
 
     # Draw the RD maps for each antenna
     for ant in range(env.n_tx):

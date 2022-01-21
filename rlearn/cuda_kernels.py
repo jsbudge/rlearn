@@ -173,7 +173,7 @@ def getDetectionCheck(pathtx, subs, pan, el, pd_r, pd_i, det_spread, params):
 
         # Find exact spot in detection chunk to place pulse
         ptt = int((params[5] + rngtx / c0) * params[4])
-        pt_s = ptt // params[6]
+        pt_s = int(ptt // params[6])
         pt_f = int(ptt % params[6])
         cuda.atomic.add(pd_r, (pt_f, pt_s), acc_val.real)
         cuda.atomic.add(pd_i, (pt_f, pt_s), acc_val.imag)
