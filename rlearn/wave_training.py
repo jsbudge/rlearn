@@ -25,7 +25,7 @@ def findPowerOf2(x):
     return int(2 ** (np.ceil(np.log2(x))))
 
 
-games = 1
+games = 5
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64
@@ -221,10 +221,12 @@ for l in logs:
     axes[0].axis('tight')
 
     # Draw beamformed array pattern
-    az_angs = np.linspace(-np.pi / 2, np.pi / 2, 180)
-    el_angs = np.linspace(1e-9, -np.pi / 2, 180).reshape((-1, 1))
-    R = np.sin(np.pi / env.az_bw * az_angs) / (np.pi / env.az_bw * az_angs) * \
-        np.sin(np.pi / env.el_bw * el_angs) / (np.pi / env.el_bw * el_angs)
+    az_angs = np.linspace(-np.pi / 2, np.pi / 2, 45)
+    az_angs[az_angs == 0] = 1e-9
+    el_angs = np.linspace(1e-9, -np.pi / 2, 45).reshape((-1, 1))
+    el_angs[el_angs == 0] = 1e-9
+    R = abs(np.sin(np.pi / env.az_bw * az_angs) / (np.pi / env.az_bw * az_angs)) * \
+        abs(np.sin(np.pi / env.el_bw * el_angs) / (np.pi / env.el_bw * el_angs))
     Y = np.zeros(R.shape, dtype=np.complex128)
     for az_a in range(len(R)):
         for el_a in range(len(R)):
@@ -232,10 +234,10 @@ for l in logs:
                        env.virtual_array.T.dot(np.array([np.cos(az_angs[az_a]) * np.sin(el_angs[el_a]),
                                                          np.sin(az_angs[az_a]) * np.sin(el_angs[el_a]),
                                                          np.cos(el_angs[el_a])])) / c0)
-            Y[az_a, el_a] = sum(l[7].dot(a))
-    Y = abs(Y)
+            Y[az_a, el_a] = R[az_a, el_a] * sum(l[7].dot(a))
+    Y = db(Y)
     Y = Y - Y.max()
-    axes[1].imshow(Y, clim=[-60, 2])
+    axes[1].imshow(Y, extent=[-90, 90, -90, 0], clim=[-60, 2])
 
     # Draw the RD maps for each antenna
     for ant in range(env.n_tx):

@@ -100,7 +100,7 @@ def genModel(nsam):
     lay = Magnitude()(lay)
     lay = MaxPooling2D((4, 4))(lay)
     lay = BatchNormalization()(lay)
-    lay = Conv2D(25, (16, 16))(lay)
+    lay = Conv2D(35, (16, 16))(lay)
     lay = Conv2D(25, (16, 16))(lay)
     lay = Flatten()(lay)
     lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),

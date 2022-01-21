@@ -28,9 +28,9 @@ def interp(x, y, tt, bg):
 
 
 @cuda.jit(
-    'void(float64[:, :], float64[:, :], float64[:, :], float64[:, :, :], float64[:], float64[:], ' +
+    'void(float64[:, :], float64[:, :], float64[:, :], float64[:, :, :], ' +
     'float64[:, :], float64[:, :], float64[:])')
-def genRangeProfile(pathrx, pathtx, gp, bg, pan, el, pd_r, pd_i, params):
+def genRangeProfile(pathrx, pathtx, gp, bg, pd_r, pd_i, params):
     tt, samp_point = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and samp_point < gp.shape[0]:
         # Load in all the parameters that don't change
@@ -75,14 +75,14 @@ def genRangeProfile(pathrx, pathtx, gp, bg, pan, el, pd_r, pd_i, params):
                 gv = 0
             el_tx = math.asin(-s_tz / rngtx)
             az_tx = math.atan2(s_tx, s_ty)
-            eldiff = diff(el_tx, el[tt])
-            azdiff = diff(az_tx, pan[tt])
+            eldiff = diff(el_tx, params[5])
+            azdiff = diff(az_tx, params[8])
             tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
             tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
             el_rx = math.asin(-s_rz / rngrx)
             az_rx = math.atan2(s_rx, s_ry)
-            eldiff = diff(el_rx, el[tt])
-            azdiff = diff(az_rx, pan[tt])
+            eldiff = diff(el_rx, params[5])
+            azdiff = diff(az_rx, params[8])
             rx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
             rx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
             att = tx_elpat * tx_azpat * rx_elpat * rx_azpat
@@ -91,9 +91,9 @@ def genRangeProfile(pathrx, pathtx, gp, bg, pan, el, pd_r, pd_i, params):
             cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
 
-@cuda.jit('void(float64[:, :], float64[:, :], float64[:, :, :], float64[:], float64[:], ' +
+@cuda.jit('void(float64[:, :], float64[:, :], float64[:, :, :], ' +
           'float64[:, :], float64[:, :], float64[:])')
-def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
+def genSubProfile(pathrx, pathtx, subs, pd_r, pd_i, params):
     tt, subnum = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and subnum < subs.shape[0]:
         # Load in all the parameters that don't change
@@ -130,14 +130,14 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
                 if n_samples > but > 0:
                     el_tx = math.asin(-s_tz / rngtx)
                     az_tx = math.atan2(s_tx, s_ty)
-                    eldiff = diff(el_tx, el[tt])
-                    azdiff = diff(az_tx, pan[tt])
+                    eldiff = diff(el_tx, params[5])
+                    azdiff = diff(az_tx, params[8])
                     tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
                     tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
                     el_rx = math.asin(-s_rz / rngrx)
                     az_rx = math.atan2(s_rx, s_ry)
-                    eldiff = diff(el_rx, el[tt])
-                    azdiff = diff(az_rx, pan[tt])
+                    eldiff = diff(el_rx, params[5])
+                    azdiff = diff(az_rx, params[8])
                     rx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
                     rx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
                     att = tx_elpat * tx_azpat * rx_elpat * rx_azpat
@@ -147,7 +147,7 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
 
 
 @cuda.jit()
-def getDetectionCheck(pathtx, subs, pan, el, pd_r, pd_i, det_spread, params):
+def getDetectionCheck(pathtx, subs, pd_r, pd_i, det_spread, params):
     tt, subnum = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and subnum < subs.shape[0]:
         # Load in all the parameters that don't change
@@ -164,8 +164,8 @@ def getDetectionCheck(pathtx, subs, pan, el, pd_r, pd_i, det_spread, params):
         rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz) + c0 / params[4]
         el_tx = math.asin(-s_tz / rngtx)
         az_tx = math.atan2(s_tx, s_ty)
-        eldiff = diff(el_tx, el[tt])
-        azdiff = diff(az_tx, pan[tt])
+        eldiff = diff(el_tx, params[7])
+        azdiff = diff(az_tx, params[8])
         tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
         tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
         att = tx_elpat * tx_azpat
