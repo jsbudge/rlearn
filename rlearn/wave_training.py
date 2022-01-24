@@ -25,7 +25,7 @@ def findPowerOf2(x):
     return int(2 ** (np.ceil(np.log2(x))))
 
 
-games = 5
+games = 140
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64
@@ -40,7 +40,7 @@ state_prelayer = [dict(type='linear_normalization'),
 
 # Define states for different agents
 wave_state = dict(cpi=dict(type='float', shape=(env.nsam, env.cpi_len),
-                           min_value=-300, max_value=100),
+                           min_value=env.clipping[0], max_value=env.clipping[1]),
                   currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
                                 max_value=1),
                   currfc=dict(type='float', shape=(env.n_tx,), min_value=8e9,
@@ -54,7 +54,8 @@ motion_state = dict(currscan=dict(type='float', shape=(1,), min_value=env.az_lim
                     currelscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
                                     max_value=env.el_lims[1]),
                     platform_motion=dict(type='float', shape=(2, 3),
-                                         min_value=-2000, max_value=2000))
+                                         min_value=-2000, max_value=2000),
+                    target_angs=dict(type='float', shape=(2,), min_value=-np.pi, max_value=np.pi))
 
 # Define actions for different agents
 wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, max_value=1),
@@ -82,8 +83,8 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
                             state_preprocessing=state_prelayer,
-                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.95, learning_rate=1e-3,
-                            memory=max_timesteps, exploration=.9)
+                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.95, learning_rate=1e-6,
+                            memory=max_timesteps, exploration=.9, variable_noise=.4)
 
 # Training regimen
 reward_track = np.zeros(games)
@@ -180,17 +181,19 @@ axes = [plt.subplot(gs[0, 0]), plt.subplot(gs[0, 1]), plt.subplot(gs[1, :]), plt
 camera = Camera(fig)
 for l in logs:
     fpos = env.env.pos(l[2])[:, 0]
+    az_bm = (l[3][0] + env.squint_ang)
+    el_bm = (l[4][0] + env.dep_ang)
     dopp_freqs = np.fft.fftshift(np.fft.fftfreq(l[0].shape[1], (l[2][1] - l[2][0]))) / env.fc[0] * c0
 
     # Draw the beam and platform
-    bm_x, bm_y, bm_a, bm_b = env.env.getAntennaBeamLocation(l[2][0], l[3][0], l[4][0])
-    main_beam = ellipse(bm_x, bm_y, bm_a, bm_b, l[3][0])
+    bm_x, bm_y, bm_a, bm_b = env.env.getAntennaBeamLocation(l[2][0], az_bm, el_bm)
+    main_beam = ellipse(bm_x, bm_y, bm_a, bm_b, az_bm)
     axes[2].plot(main_beam[0, :], main_beam[1, :], 'gray')
     axes[2].scatter(fpos[0], fpos[1], marker='*', c='blue')
-    beam_dir = np.exp(1j * l[3][0]) * fpos[2] / np.tan(l[4][0])
+    beam_dir = np.exp(1j * az_bm) * fpos[2] / np.tan(el_bm)
     axes[2].arrow(fpos[0], fpos[1], beam_dir.real, beam_dir.imag)
     if len(l[6]) > 0:
-        t_dir = np.exp(1j * l[6][0]) * fpos[2] / np.tan(l[4][0])
+        t_dir = np.exp(1j * (l[6][0] + env.squint_ang)) * fpos[2] / np.tan(el_bm)
         axes[2].arrow(fpos[0], fpos[1], t_dir.real, t_dir.imag)
 
     # Draw the targets
@@ -217,27 +220,26 @@ for l in logs:
     axes[2].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
     axes[0].imshow(np.fft.fftshift(l[0], axes=1),
                    extent=[dopp_freqs[0], dopp_freqs[-1], env.env.gnrange, env.env.gfrange], origin='lower',
-                   clim=[-300, 100])
+                   clim=[env.clipping[0], env.clipping[1]])
     axes[0].axis('tight')
 
     # Draw beamformed array pattern
-    az_angs = np.linspace(-np.pi / 2, np.pi / 2, 45)
+    az_angs = np.linspace(1e-9, np.pi, 90)
     az_angs[az_angs == 0] = 1e-9
-    el_angs = np.linspace(1e-9, -np.pi / 2, 45).reshape((-1, 1))
+    el_angs = np.linspace(1e-9, np.pi, 90)
     el_angs[el_angs == 0] = 1e-9
-    R = abs(np.sin(np.pi / env.az_bw * az_angs) / (np.pi / env.az_bw * az_angs)) * \
-        abs(np.sin(np.pi / env.el_bw * el_angs) / (np.pi / env.el_bw * el_angs))
-    Y = np.zeros(R.shape, dtype=np.complex128)
-    for az_a in range(len(R)):
-        for el_a in range(len(R)):
-            a = np.exp(-1j * 2 * np.pi * np.array([env.fc[n[1]] for n in env.apc]) *
-                       env.virtual_array.T.dot(np.array([np.cos(az_angs[az_a]) * np.sin(el_angs[el_a]),
+    Y = np.zeros((len(az_angs), len(el_angs)), dtype=np.complex128)
+    for az_a in range(len(az_angs)):
+        for el_a in range(len(el_angs)):
+            u = 2 * np.pi * 9.6e9 / c0 * np.array([np.cos(az_angs[az_a]) * np.sin(el_angs[el_a]),
                                                          np.sin(az_angs[az_a]) * np.sin(el_angs[el_a]),
-                                                         np.cos(el_angs[el_a])])) / c0)
-            Y[az_a, el_a] = R[az_a, el_a] * sum(l[7].dot(a))
+                                                         np.cos(el_angs[el_a])])
+            va_u = np.exp(-1j * env.virtual_array.T.dot(u))
+            E = 1
+            Y[az_a, el_a] = l[7].dot(va_u)
     Y = db(Y)
     Y = Y - Y.max()
-    axes[1].imshow(Y, extent=[-90, 90, -90, 0], clim=[-60, 2])
+    axes[1].imshow(Y, extent=[0, 180, 0, 180], clim=[-60, 2])
 
     # Draw the RD maps for each antenna
     for ant in range(env.n_tx):
@@ -314,10 +316,10 @@ animw.save('ocean.mp4')
 
 plt.figure('VA positions')
 ax = plt.subplot(111, projection='3d')
+ax.scatter(env.virtual_array[0, :],
+               env.virtual_array[1, :],
+               env.virtual_array[2, :])
 for n in range(env.n_rx):
-    ax.scatter(env.virtual_array[0, n * env.n_tx:(n + 1) * env.n_tx],
-               env.virtual_array[1, n * env.n_tx:(n + 1) * env.n_tx],
-               env.virtual_array[2, n * env.n_tx:(n + 1) * env.n_tx])
     ax.scatter(env.rx_locs[0, n], env.rx_locs[1, n], env.rx_locs[2, n], marker='*')
 
 '''
