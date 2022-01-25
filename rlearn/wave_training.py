@@ -15,24 +15,35 @@ fs = 2e9
 DTR = np.pi / 180
 
 
-def db(x):
-    ret = abs(x)
+def db(db_x):
+    ret = abs(db_x)
     ret[ret == 0] = 1e-9
     return 20 * np.log10(ret)
 
 
-def findPowerOf2(x):
-    return int(2 ** (np.ceil(np.log2(x))))
+def findPowerOf2(fpo2x):
+    return int(2 ** (np.ceil(np.log2(fpo2x))))
 
 
-games = 5
+def sliding_window(data, win_size, func=None):
+    sz = len(data)
+    thresh = np.zeros_like(data)
+    for i in range(sz):
+        tmp = np.concatenate((data[max(i - win_size, 0):max(i, 0)], data[min(i, sz):min(i + win_size, sz)]))
+        thresh[i] = func(tmp)
+    return thresh
+
+
+games = 2
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64
 feedback_train = False
 
 # Pre-defined or custom environment
-env = SinglePulseBackground(max_timesteps)
+env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90,
+                            altitude=1524, plp=.5, env_samples=500000, fs_decimation=8, az_lim=90, el_lim=10,
+                            beamform_type='phased')
 
 # Define preprocessing layer (just a normalization)
 state_prelayer = [dict(type='linear_normalization'),
@@ -75,14 +86,14 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
                           actions=wave_action,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.9,
                           learning_rate=1e-4,
-                          memory=max_timesteps, exploration=5.0, entropy_regularization=5.0, variable_noise=2.0)
+                          memory=max_timesteps, exploration=.5, entropy_regularization=5.0)
 
 # Instantiate motion agent
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
                             state_preprocessing=state_prelayer,
-                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.95, learning_rate=1e-6,
-                            memory=max_timesteps, exploration=6.0)
+                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.1, learning_rate=1e-3,
+                            memory=max_timesteps, exploration=16.0, entropy_regularization=5.0, variable_noise=2.0)
 
 # Training regimen
 reward_track = np.zeros(games)
@@ -104,6 +115,7 @@ for episode in tqdm(range(games)):
     reward_track[episode] = sum_rewards
 
 # Testing loop
+actions = None
 print('Evaluation...')
 for g in tqdm(range(eval_games)):
     # Initialize episode
@@ -139,16 +151,6 @@ log_num = 10
 nr = int((env.env.max_pl * env.plp) * env.fs)
 back_noise = np.random.rand(max(nr, 5000)) - .5 + 1j * (np.random.rand(max(nr, 5000)) - .5)
 
-
-def sliding_window(data, win_size, func=None):
-    sz = len(data)
-    thresh = np.zeros_like(data)
-    for i in range(sz):
-        tmp = np.concatenate((data[max(i - win_size, 0):max(i, 0)], data[min(i, sz):min(i + win_size, sz)]))
-        thresh[i] = func(tmp)
-    return thresh
-
-
 if len(reward_track) >= 5:
     plt.figure('Training Reward Track')
     mav = sliding_window(reward_track, 5, func=np.mean)
@@ -177,7 +179,6 @@ try:
 except IndexError:
     print('Pulse too small?')
 
-
 '''
 --------------- ANIMATED ENVIRONMENT ----------------
 '''
@@ -189,7 +190,7 @@ axes = [plt.subplot(gs[0, 0]), plt.subplot(gs[0, 1]), plt.subplot(gs[1, :]), plt
 camera = Camera(fig)
 for l in logs:
     fpos = env.env.pos(l[2])[:, 0]
-    az_bm = (l[3][0] + env.squint_ang)
+    az_bm = (l[3][0] + env.boresight_ang)
     el_bm = (l[4][0] + env.dep_ang)
     dopp_freqs = np.fft.fftshift(np.fft.fftfreq(l[0].shape[1], (l[2][1] - l[2][0]))) / env.fc[0] * c0
 
@@ -201,7 +202,7 @@ for l in logs:
     beam_dir = np.exp(1j * az_bm) * fpos[2] / np.tan(el_bm)
     axes[2].arrow(fpos[0], fpos[1], beam_dir.real, beam_dir.imag)
     if len(l[6]) > 0:
-        t_dir = np.exp(1j * (l[6][0] + env.squint_ang)) * fpos[2] / np.tan(el_bm)
+        t_dir = np.exp(1j * (l[6][0] + env.boresight_ang)) * fpos[2] / np.tan(el_bm)
         axes[2].arrow(fpos[0], fpos[1], t_dir.real, t_dir.imag)
 
     # Draw the targets
@@ -221,14 +222,14 @@ for l in logs:
             # Range to target
             plt_rng = 2 * (np.linalg.norm(env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
                            np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
-                      (l[2][-1] - l[2][0])
+                (l[2][-1] - l[2][0])
             axes[2].text(pos[0, 0], pos[0, 1],
-                         f'{-plt_rng:.2f}, {np.linalg.norm(env.env.pos(l[2])[:2, -1] - np.array([pos[-1, 0], pos[-1, 1]])):.2f}',
+                         f'{-plt_rng:.2f}, '
+                         f'{np.linalg.norm(env.env.pos(l[2])[:2, -1] - np.array([pos[-1, 0], pos[-1, 1]])):.2f}',
                          c='black')
     axes[2].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
     axes[0].imshow(np.fft.fftshift(l[0], axes=1),
-                   extent=[dopp_freqs[0], dopp_freqs[-1], env.env.gnrange, env.env.gfrange], origin='lower',
-                   clim=[env.clipping[0], env.clipping[1]])
+                   extent=[dopp_freqs[0], dopp_freqs[-1], env.env.gnrange, env.env.gfrange], origin='lower')
     axes[0].axis('tight')
 
     # Draw beamformed array pattern
@@ -240,8 +241,8 @@ for l in logs:
     for az_a in range(len(az_angs)):
         for el_a in range(len(el_angs)):
             u = 2 * np.pi * 9.6e9 / c0 * np.array([np.cos(az_angs[az_a]) * np.sin(el_angs[el_a]),
-                                                         np.sin(az_angs[az_a]) * np.sin(el_angs[el_a]),
-                                                         np.cos(el_angs[el_a])])
+                                                   np.sin(az_angs[az_a]) * np.sin(el_angs[el_a]),
+                                                   np.cos(el_angs[el_a])])
             va_u = np.exp(-1j * env.virtual_array.T.dot(u))
             E = 1
             Y[az_a, el_a] = l[7].dot(va_u)
@@ -266,18 +267,20 @@ animation = camera.animate(interval=250)
 plt.figure('Ambiguity')
 cmin = None
 cmax = None
+prf_val = 500.0
 for x in range(env.n_tx):
     pulse = genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, x],
                      env.nr, env.nr / env.fs, env.fc[x], env.bw[x])
     window_pulse = np.fft.ifft(np.fft.fft(pulse, findPowerOf2(nr)) * taylor(findPowerOf2(nr)))
     for y in range(env.n_tx):
         plt.subplot(env.n_tx, env.n_tx, x * env.n_tx + y + 1)
+        prf_plot = actions['radar'][0] * 2 if actions['radar'] is not None else prf_val
         amb = ambiguity(genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, y],
                                  env.nr, env.nr / env.fs, env.fc[y], env.bw[y]),
-                        window_pulse, actions['radar'][0] * 2, 150, mag=True, normalize=False)
+                        window_pulse, prf_plot, 150, mag=True, normalize=False)
         cmin = np.min(amb[0]) if cmin is None else cmin
         cmax = np.max(amb[0]) if cmax is None else cmax
-        plt.imshow(amb[0], clim=[cmin, cmax])
+        plt.imshow(amb[0])
 plt.tight_layout()
 
 plt.figure('Rewards')
@@ -315,22 +318,24 @@ for l in logs:
             ax[0].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
             plt_rng = 2 * (np.linalg.norm(env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
                            np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
-                      (l[2][-1] - l[2][0])
+                (l[2][-1] - l[2][0])
             ax[0].text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='black')
     ax[0].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
     ax[0].axis('off')
     camw.snap()
 
-animw = camw.animate(interval=500)
+animw = camw.animate(interval=250)
 animw.save('ocean.mp4')
 
 plt.figure('VA positions')
 ax = plt.subplot(111, projection='3d')
+rot_array = env.el_rot(env.dep_ang, env.az_rot(env.boresight_ang - np.pi / 2, env.rx_locs))
 ax.scatter(env.virtual_array[0, :],
-               env.virtual_array[1, :],
-               env.virtual_array[2, :])
-for n in range(env.n_rx):
-    ax.scatter(env.rx_locs[0, n], env.rx_locs[1, n], env.rx_locs[2, n], marker='*')
+           env.virtual_array[1, :],
+           env.virtual_array[2, :])
+ax.scatter(rot_array[0, :],
+           rot_array[1, :],
+           rot_array[2, :], marker='*')
 
 '''
 fig = plt.figure('Ocean3D')

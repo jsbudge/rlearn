@@ -96,7 +96,8 @@ seg_sz = int(np.ceil(segment_t0 * fs))
 
 def genModel(nsam):
     inp = Input(shape=(nsam, 1))
-    lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100), hop_length=stft_sz // 4, window_name='hann_window')(inp)
+    lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100),
+               hop_length=stft_sz // 4, window_name='hann_window')(inp)
     lay = Magnitude()(lay)
     lay = MaxPooling2D((4, 4))(lay)
     lay = BatchNormalization()(lay)
@@ -111,8 +112,8 @@ def genModel(nsam):
 
 def genParamModel(nsam):
     inp = Input(shape=(nsam, 1))
-    lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100), hop_length=stft_sz // 4, window_name='hann_window')(
-        inp)
+    lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100),
+               hop_length=stft_sz // 4, window_name='hann_window')(inp)
     lay = Magnitude()(lay)
     lay = MaxPooling2D((2, 2))(lay)
     lay = BatchNormalization()(lay)
