@@ -105,7 +105,6 @@ def genModel(nsam):
     lay = Flatten()(lay)
     lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
-    #lay = GaussianNoise(1)(lay)
     outp = Dense(1, activation='sigmoid')(lay)
     return keras.Model(inputs=inp, outputs=outp)
 
@@ -121,7 +120,6 @@ def genParamModel(nsam):
     lay = Flatten()(lay)
     lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
-    # lay = GaussianNoise(1)(lay)
     outp = Dense(2, kernel_constraint=NonNeg())(lay)
     return keras.Model(inputs=inp, outputs=outp)
 

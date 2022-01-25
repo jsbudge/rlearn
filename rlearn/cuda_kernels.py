@@ -17,6 +17,7 @@ def diff(x, y):
 
 @cuda.jit(device=True)
 def interp(x, y, tt, bg):
+    # Simple 2d linear nearest neighbor interpolation
     x0 = int(x)
     y0 = int(y)
     x1 = int(x0 + 1 if x - x0 >= 0 else -1)
@@ -117,12 +118,14 @@ def genSubProfile(pathrx, pathtx, subs, pd_r, pd_i, params):
         # Get LOS vector in XYZ and spherical coordinates at pulse time
         xpts = 5
         ypts = 3
+        sub_length = 10.0
+        sub_width = 2.5
         for n in range(xpts):
             for m in range(ypts):
-                shift_x = sub_x + (n - xpts // 2) / (xpts // 2) * 10.0 * sub_sin
-                shift_y = sub_y + 2.5 / 10.0 * math.sqrt(
-                    10.0 * 10.0 - ((n - xpts // 2) / (xpts // 2) * 10.0) *
-                    ((n - xpts // 2) / (xpts // 2) * 10.0)) * sub_cos * (m - ypts // 2) / (ypts // 2)
+                shift_x = sub_x + (n - xpts // 2) / (xpts // 2) * sub_length * sub_sin
+                shift_y = sub_y + sub_width / sub_length * math.sqrt(
+                    sub_length * sub_length - ((n - xpts // 2) / (xpts // 2) * sub_length) *
+                    ((n - xpts // 2) / (xpts // 2) * sub_length)) * sub_cos * (m - ypts // 2) / (ypts // 2)
                 s_tx = shift_x - pathtx[0, tt]
                 s_ty = shift_y - pathtx[1, tt]
                 s_tz = sub_z - pathtx[2, tt]

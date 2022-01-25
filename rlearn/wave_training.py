@@ -25,7 +25,7 @@ def findPowerOf2(x):
     return int(2 ** (np.ceil(np.log2(x))))
 
 
-games = 140
+games = 5
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64
@@ -49,10 +49,8 @@ wave_state = dict(cpi=dict(type='float', shape=(env.nsam, env.cpi_len),
                               max_value=env.fs / 2 - 5e6),
                   platform_motion=dict(type='float', shape=(2, 3),
                                        min_value=-2000, max_value=2000))
-motion_state = dict(currscan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
-                                  max_value=env.az_lims[1]),
-                    currelscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
-                                    max_value=env.el_lims[1]),
+motion_state = dict(point_angs=dict(type='float', shape=(2,), min_value=min([env.az_lims[0], env.el_lims[0]]),
+                                    max_value=max([env.az_lims[1], env.el_lims[1]])),
                     platform_motion=dict(type='float', shape=(2, 3),
                                          min_value=-2000, max_value=2000),
                     target_angs=dict(type='float', shape=(2,), min_value=-np.pi, max_value=np.pi))
@@ -76,15 +74,15 @@ motion_action = dict(radar=dict(type='float', shape=(1,), min_value=100, max_val
 wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=state_prelayer,
                           actions=wave_action,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.9,
-                          learning_rate=5e-4,
-                          memory=max_timesteps, exploration=.1, entropy_regularization=.1, variable_noise=.4)
+                          learning_rate=1e-4,
+                          memory=max_timesteps, exploration=5.0, entropy_regularization=5.0, variable_noise=2.0)
 
 # Instantiate motion agent
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
                             state_preprocessing=state_prelayer,
                             max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.95, learning_rate=1e-6,
-                            memory=max_timesteps, exploration=.9, variable_noise=.4)
+                            memory=max_timesteps, exploration=6.0)
 
 # Training regimen
 reward_track = np.zeros(games)
@@ -128,6 +126,12 @@ for g in tqdm(range(eval_games)):
 env.close()
 # wave_agent.close()
 # motion_agent.close()
+
+'''
+-------------------------------------------------------------------------------------------
+------------------------------ PLOTS ------------------------------------------------------
+-------------------------------------------------------------------------------------------
+'''
 
 logs = env.log
 log_num = 10
@@ -173,6 +177,10 @@ try:
 except IndexError:
     print('Pulse too small?')
 
+
+'''
+--------------- ANIMATED ENVIRONMENT ----------------
+'''
 cols = ['red', 'blue', 'green', 'orange', 'yellow', 'purple', 'black', 'cyan']
 fig = plt.figure()
 gs = gridspec.GridSpec(3, 2)
@@ -224,9 +232,9 @@ for l in logs:
     axes[0].axis('tight')
 
     # Draw beamformed array pattern
-    az_angs = np.linspace(1e-9, np.pi, 90)
+    az_angs = np.linspace(-np.pi / 2, np.pi / 2, 90)
     az_angs[az_angs == 0] = 1e-9
-    el_angs = np.linspace(1e-9, np.pi, 90)
+    el_angs = np.linspace(-np.pi / 2, np.pi / 2, 90)
     el_angs[el_angs == 0] = 1e-9
     Y = np.zeros((len(az_angs), len(el_angs)), dtype=np.complex128)
     for az_a in range(len(az_angs)):
@@ -239,7 +247,9 @@ for l in logs:
             Y[az_a, el_a] = l[7].dot(va_u)
     Y = db(Y)
     Y = Y - Y.max()
-    axes[1].imshow(Y, extent=[0, 180, 0, 180], clim=[-60, 2])
+    axes[1].imshow(Y, extent=[az_angs[0] / DTR, az_angs[-1] / DTR, el_angs[0] / DTR, el_angs[-1] / DTR], clim=[-20, 2])
+    axes[1].set_ylabel('Azimuth')
+    axes[1].set_xlabel('Elevation')
 
     # Draw the RD maps for each antenna
     for ant in range(env.n_tx):
@@ -250,7 +260,7 @@ for l in logs:
                 env.fft_len)), c=cols[ant])
     camera.snap()
 
-animation = camera.animate(interval=500)
+animation = camera.animate(interval=250)
 # animation.save('test.mp4')
 
 plt.figure('Ambiguity')

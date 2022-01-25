@@ -112,16 +112,16 @@ class SinglePulseBackground(Environment):
         self.fs = fs / 8
         self.az_pt = 0
         self.el_pt = 0
-        self.az_lims = (-np.pi / 3, np.pi / 3)
+        self.az_lims = (-np.pi / 2, np.pi / 2)
         self.el_lims = (-10 * DTR, 10 * DTR)
         self.curr_cpi = None
         self.max_steps = max_timesteps
         self.step = 0
 
         # Antenna array definition
-        dr = c0 / 9.6e9 / 2
-        self.tx_locs = np.array([(0, 0, 0), (0, dr, 0)]).T
-        self.rx_locs = np.array([(-dr, 0, 0), (0, 0, 0)]).T
+        dr = c0 / 9.6e9
+        self.tx_locs = np.array([(0, -dr / 2, 0), (0, dr / 2, 0)]).T
+        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -143,7 +143,7 @@ class SinglePulseBackground(Environment):
             for m in range(self.n_tx):
                 va[:, n * self.n_tx + m] = self.rx_locs[:, n] + self.tx_locs[:, m]
                 apc.append([n, m])
-        self.virtual_array = self.el_rot(self.dep_ang, self.az_rot(self.squint_ang, va))
+        self.virtual_array = self.el_rot(self.dep_ang, self.az_rot(self.squint_ang - np.pi / 2, va))
         self.apc = apc
 
         # Generate beamforming matrix
@@ -216,14 +216,8 @@ class SinglePulseBackground(Environment):
         # Ambiguity score
         amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx)))
 
-        # Target resolution score. Also used for detection.
+        # Target resolution score
         res_sc = 0
-        '''
-        chirp_amb = db(np.fft.ifft(fft_chirp * fft_chirp.conj(), axis=0))
-        filt_szs = [max([np.arange(self.fft_len)[chirp_amb[:, n] < chirp_amb[:, n].max() - 3].min() *
-                         2, 1]) for n in range(self.n_tx)]
-        res_sc += max([self.fs / c0 / (f * self.fs * self.fft_len / self.nsam / c0) for f in filt_szs])
-        '''
 
         # Azimuth and elevation score. If no target, motion score
         az_sc = 0
@@ -272,6 +266,8 @@ class SinglePulseBackground(Environment):
         t_pos = np.array([*self.env.targets[0].pos(mid_tf), 1]) - self.env.pos(mid_tf)
         ea = [np.arctan2(t_pos[1], t_pos[0]) - self.squint_ang,
               np.arcsin(-t_pos[2] / np.linalg.norm(t_pos)) - self.dep_ang]
+        el_sc += 1 - abs(ea[1])
+        az_sc += 1 - abs(ea[0])
 
         # MIMO beamforming using some CPI stuff
         if len(ea) == 0:
@@ -279,16 +275,26 @@ class SinglePulseBackground(Environment):
         beamform = np.zeros((self.nsam, self.cpi_len), dtype=np.complex128)
 
         # Direction of beam to synthesize from data
-        a = np.exp(1j * 2 * np.pi * np.array([self.fc[n[1]] for n in self.apc]) *
+        a = np.exp(-1j * 2 * np.pi * np.array([self.fc[n[1]] for n in self.apc]) *
                    self.virtual_array.T.dot(np.array([np.cos(ea[0]) * np.sin(ea[1]),
                                       np.sin(ea[0]) * np.sin(ea[1]), np.cos(ea[1])])) / c0)
 
         # Generate MMSE beamformer and apply to data
-        U = a
-        #self.Rx += (np.cov(curr_cpi[:, 0, :].T) + np.diag(np.linalg.norm(curr_cpi[:, 0, :], axis=0)))
-        #self.Rx /= 2
+        # Focus mostly on clutter so as to avoid nulling out targets
+        Rx_thresh = np.max(db(curr_cpi[:, 0, :]), axis=1)
+        window = np.where(Rx_thresh == Rx_thresh.max())[0][0]
+        min_win = window - 10
+        max_win = window + 10
+        guard_sz = 3
+        while min_win < 0 and min_win < window - guard_sz:
+            min_win += 1
+        while max_win > curr_cpi.shape[0] and max_win > window + guard_sz:
+            max_win -= 1
+        Rx_data = np.concatenate((curr_cpi[min_win:window-guard_sz, 0, :], curr_cpi[window+guard_sz:max_win, 0, :]))
+        Rx = (np.cov(Rx_data.T) + np.diag([actions['power'][n[1]] for n in self.apc]))
+        Rx_inv = np.linalg.pinv(Rx)
+        U = Rx_inv.dot(a)
         for tt in range(self.cpi_len):
-            #U = np.linalg.pinv(self.Rx).dot(a)
             beamform[:, tt] = curr_cpi[:, tt, :].dot(U)
         beamform = db(np.fft.fft(beamform, axis=1))
 
@@ -316,7 +322,7 @@ class SinglePulseBackground(Environment):
                          self.tf, actions['scan'], actions['elscan'], actions['wave'], ea, U])
 
         # Whole state space to be split into the various agents
-        full_state = {'cpi': beamform, 'currscan': [self.az_pt], 'currelscan': [self.el_pt],
+        full_state = {'cpi': beamform, 'point_angs': np.array([self.az_pt, self.el_pt]),
                       'currwave': actions['wave'], 'currfc': self.fc, 'currbw': self.bw,
                       'platform_motion': np.array([self.env.pos(mid_tf),
                                                    (self.env.pos(self.tf[1]) - self.env.pos(self.tf[0])) /
@@ -338,7 +344,7 @@ class SinglePulseBackground(Environment):
         init_wave[0:3, :] = .01
         init_wave[-3:, :] = .99
         return {'cpi': np.zeros((self.nsam, self.cpi_len)),
-                'currscan': [0], 'currelscan': [0],
+                'point_angs': np.array([0.0, 0.0]),
                 'currwave': init_wave, 'currfc': [9.6e9 for _ in range(self.n_tx)],
                 'currbw': [self.fs / 2 - 10e6 for _ in range(self.n_tx)],
                 'platform_motion': np.array([self.env.pos(self.tf[0]),
@@ -537,8 +543,8 @@ class SimEnv(object):
         self.bg_ext = (self.eswath / 2, self.swath / 2)
         self.bg = wavefunction(self.bg_ext, npts=(32, 32))
         for n in range(1):
-            self.targets.append(Sub(-self.eswath / 4, self.eswath - self.eswath / 2,
-                                    0, self.swath / 2, f_ts))
+            self.targets.append(Sub(self.swath / 4, self.swath / 2, -self.eswath / 4, self.eswath - self.eswath / 2,
+                                    f_ts))
 
     def genFlightPath(self):
         # We start assuming that the bottom left corner of scene is (0, 0, 0) ENU
