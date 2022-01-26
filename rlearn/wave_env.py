@@ -125,8 +125,7 @@ class SinglePulseBackground(Environment):
         # Antenna array definition
         dr = c0 / 9.6e9
         self.tx_locs = np.array([(0, -dr / 2, 0), (0, dr / 2, 0)]).T
-        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (-dr * 2, 0, 0), (dr * 2, 0, 0),
-                                 (-dr * 3 / 2, dr, 0), (dr * 3 / 2, dr, 0)]).T
+        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (0, dr, 0), (0, -dr, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -201,6 +200,7 @@ class SinglePulseBackground(Environment):
         self.fc = actions['fc']
         self.bw = actions['bw']
         mid_tf = self.tf[len(self.tf) // 2]
+        motion = np.linalg.norm([self.az_pt - actions['scan'][0], self.el_pt - actions['elscan'][0]])**2
         self.az_pt = actions['scan'][0]
         self.el_pt = actions['elscan'][0]
         chirps = np.zeros((self.nr, self.n_tx), dtype=np.complex128)
@@ -221,7 +221,7 @@ class SinglePulseBackground(Environment):
         dist_sc = 0
 
         # Detectability score
-        det_sc = 0
+        det_sc = motion
 
         # Find truth sub direction for pulse power
         detb_sc = 0
@@ -263,17 +263,17 @@ class SinglePulseBackground(Environment):
         t_pos = np.array([*self.env.targets[0].pos(mid_tf), 1]) - self.env.pos(mid_tf)
         ea = [np.arctan2(t_pos[1], t_pos[0]) - self.boresight_ang,
               np.arcsin(-t_pos[2] / np.linalg.norm(t_pos)) - self.dep_ang]
-        dist_sc += np.linalg.norm([1 - abs(ea[1]), 1 - abs(ea[0])])
+        dist_sc += np.linalg.norm([(.0001 / abs(ea[1] - self.az_pt)), (.0001 / abs(ea[0] - self.el_pt))])
 
         # MIMO beamforming using some CPI stuff
         # if len(ea) == 0:
-        ea = np.array([self.az_pt, self.el_pt])
+        ea = np.array([self.az_pt, self.el_pt + np.pi / 2])
         beamform = np.zeros((self.nsam, self.cpi_len), dtype=np.complex128)
 
         # Direction of beam to synthesize from data
-        a = np.exp(-1j * 2 * np.pi * np.array([self.fc[n[1]] for n in self.apc]) *
+        a = np.exp(1j * 2 * np.pi * np.array([self.fc[n[1]] for n in self.apc]) *
                    self.virtual_array.T.dot(np.array([np.cos(ea[0]) * np.sin(ea[1]),
-                                      np.sin(ea[0]) * np.sin(ea[1]), np.cos(ea[1])])) / c0)
+                                                      np.sin(ea[0]) * np.sin(ea[1]), np.cos(ea[1])])) / c0)
 
         if self.bf_type == 'mmse':
             # Generate MMSE beamformer and apply to data
@@ -287,8 +287,9 @@ class SinglePulseBackground(Environment):
                 min_win += 1
             while max_win > curr_cpi.shape[0] and max_win > window + guard_sz:
                 max_win -= 1
-            Rx_data = np.concatenate((curr_cpi[min_win:window-guard_sz, 0, :], curr_cpi[window+guard_sz:max_win, 0, :]))
-            Rx = (np.cov(Rx_data.T) + np.diag([actions['power'][n[1]]**2 for n in self.apc]))
+            Rx_data = np.concatenate(
+                (curr_cpi[min_win:window - guard_sz, 0, :], curr_cpi[window + guard_sz:max_win, 0, :]))
+            Rx = (np.cov(Rx_data.T) + np.diag([actions['power'][n[1]] ** 2 for n in self.apc]))
             Rx_inv = np.linalg.pinv(Rx)
             U = Rx_inv.dot(a)
         elif self.bf_type == 'phased':
@@ -544,7 +545,7 @@ class SimEnv(object):
         self.bg_ext = (self.eswath / 2, self.swath / 2)
         self.bg = wavefunction(self.bg_ext, npts=(64, 64))
         for n in range(1):
-            self.targets.append(Sub(self.swath / 4, self.swath / 2, self.eswath / 4, self.eswath - self.eswath / 2,
+            self.targets.append(Sub(0, self.swath, 0, self.eswath,
                                     f_ts))
 
     def genFlightPath(self):
@@ -622,17 +623,17 @@ class SimEnv(object):
         gx1 = np.zeros((pts.shape[0], 3))
         gx1[:, 0] = 1
         gx1[:, 2] = gx[x1, y1] * xdiff * ydiff + gx[x1, y0] * xdiff * (1 - ydiff) + gx[x0, y1] * \
-            (1 - xdiff) * ydiff + gx[x0, y0] * (1 - xdiff) * (1 - ydiff)
+                    (1 - xdiff) * ydiff + gx[x0, y0] * (1 - xdiff) * (1 - ydiff)
         gx1[:, 0] = 1 / np.sqrt(1 + gx1[:, 2] ** 2)
         gx1[:, 2] = gx1[:, 2] / np.sqrt(1 + gx1[:, 2] ** 2)
         gx2 = np.zeros((pts.shape[0], 3))
         gx2[:, 2] = gy[x1, y1] * xdiff * ydiff + gy[x1, y0] * xdiff * (1 - ydiff) + gy[x0, y1] * \
-            (1 - xdiff) * ydiff + gy[x0, y0] * (1 - xdiff) * (1 - ydiff)
+                    (1 - xdiff) * ydiff + gy[x0, y0] * (1 - xdiff) * (1 - ydiff)
         gx2[:, 1] = 1 / np.sqrt(1 + gx2[:, 2] ** 2)
         gx2[:, 2] = gx2[:, 2] / np.sqrt(1 + gx2[:, 2] ** 2)
         n_dir = np.cross(gx1, gx2)
         hght = bg[x1, y1] * xdiff * ydiff + bg[x1, y0] * xdiff * (1 - ydiff) + bg[x0, y1] * \
-            (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
+               (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
         return n_dir, hght
 
 

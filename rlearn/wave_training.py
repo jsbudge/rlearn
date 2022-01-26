@@ -34,16 +34,16 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 2
+games = 150
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64
 feedback_train = False
 
 # Pre-defined or custom environment
-env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90,
-                            altitude=1524, plp=.5, env_samples=500000, fs_decimation=8, az_lim=90, el_lim=10,
-                            beamform_type='phased')
+env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18, dep_ang=60, boresight_ang=90,
+                            altitude=1024, plp=.5, env_samples=500000, fs_decimation=8, az_lim=90, el_lim=20,
+                            beamform_type='mmse')
 
 # Define preprocessing layer (just a normalization)
 state_prelayer = [dict(type='linear_normalization'),
@@ -82,6 +82,7 @@ motion_action = dict(radar=dict(type='float', shape=(1,), min_value=100, max_val
                                  max_value=env.el_lims[1]))
 
 # Instantiate wave agent
+print('Initializing agents...')
 wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=state_prelayer,
                           actions=wave_action,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.9,
@@ -92,10 +93,12 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
                             state_preprocessing=state_prelayer,
-                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.1, learning_rate=1e-3,
-                            memory=max_timesteps, exploration=16.0, entropy_regularization=5.0, variable_noise=2.0)
+                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-4,
+                            memory=max_timesteps, exploration=30.0, entropy_regularization=5.0,
+                            horizon=3)
 
 # Training regimen
+print('Beginning training...')
 reward_track = np.zeros(games)
 for episode in tqdm(range(games)):
 
@@ -138,6 +141,7 @@ for g in tqdm(range(eval_games)):
 env.close()
 # wave_agent.close()
 # motion_agent.close()
+print('Training and evaluation completed. Running plots...')
 
 '''
 -------------------------------------------------------------------------------------------
@@ -184,8 +188,9 @@ except IndexError:
 '''
 cols = ['red', 'blue', 'green', 'orange', 'yellow', 'purple', 'black', 'cyan']
 fig = plt.figure()
-gs = gridspec.GridSpec(3, 2)
-axes = [plt.subplot(gs[0, 0]), plt.subplot(gs[0, 1]), plt.subplot(gs[1, :]), plt.subplot(gs[2, :])]
+gs = gridspec.GridSpec(3, 3)
+axes = [plt.subplot(gs[0, 0], projection='polar'), plt.subplot(gs[0, 1]), plt.subplot(gs[0, 2], projection='polar'),
+        plt.subplot(gs[1, :]), plt.subplot(gs[2, :2]), plt.subplot(gs[2, 2])]
 # Calc Doppler shifts and velocities
 camera = Camera(fig)
 for l in logs:
@@ -194,18 +199,16 @@ for l in logs:
     el_bm = (l[4][0] + env.dep_ang)
     dopp_freqs = np.fft.fftshift(np.fft.fftfreq(l[0].shape[1], (l[2][1] - l[2][0]))) / env.fc[0] * c0
 
-    # Draw the beam and platform
-    bm_x, bm_y, bm_a, bm_b = env.env.getAntennaBeamLocation(l[2][0], az_bm, el_bm)
-    main_beam = ellipse(bm_x, bm_y, bm_a, bm_b, az_bm)
-    axes[2].plot(main_beam[0, :], main_beam[1, :], 'gray')
-    axes[2].scatter(fpos[0], fpos[1], marker='*', c='blue')
+    # Draw the beam direction and platform
+    axes[3].scatter(fpos[0], fpos[1], marker='*', c='blue')
     beam_dir = np.exp(1j * az_bm) * fpos[2] / np.tan(el_bm)
-    axes[2].arrow(fpos[0], fpos[1], beam_dir.real, beam_dir.imag)
+    axes[3].arrow(fpos[0], fpos[1], beam_dir.real, beam_dir.imag)
     if len(l[6]) > 0:
         t_dir = np.exp(1j * (l[6][0] + env.boresight_ang)) * fpos[2] / np.tan(el_bm)
-        axes[2].arrow(fpos[0], fpos[1], t_dir.real, t_dir.imag)
+        axes[3].arrow(fpos[0], fpos[1], t_dir.real, t_dir.imag)
 
     # Draw the targets
+    t_vec = None
     for idx, s in enumerate(env.env.targets):
         pos = []
         amp = []
@@ -217,33 +220,36 @@ for l in logs:
             pcols.append(cols[idx])
         pos = np.array(pos)
         if len(pos) > 0:
-            axes[2].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
+            axes[3].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
 
             # Range to target
-            plt_rng = 2 * (np.linalg.norm(env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
+            t_vec = env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])
+            plt_vel = 2 * (np.linalg.norm(t_vec) -
                            np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
                 (l[2][-1] - l[2][0])
-            axes[2].text(pos[0, 0], pos[0, 1],
-                         f'{-plt_rng:.2f}, '
-                         f'{np.linalg.norm(env.env.pos(l[2])[:2, -1] - np.array([pos[-1, 0], pos[-1, 1]])):.2f}',
+            axes[3].text(pos[0, 0], pos[0, 1],
+                         f'{-plt_vel:.2f}, '
+                         f'{np.linalg.norm(t_vec):.2f}',
                          c='black')
-    axes[2].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
-    axes[0].imshow(np.fft.fftshift(l[0], axes=1),
+    axes[3].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
+
+    # Plot the Range-Doppler beamformed data
+    axes[4].imshow(np.fft.fftshift(l[0], axes=1),
                    extent=[dopp_freqs[0], dopp_freqs[-1], env.env.gnrange, env.env.gfrange], origin='lower')
-    axes[0].axis('tight')
+    axes[4].axis('tight')
 
     # Draw beamformed array pattern
-    az_angs = np.linspace(-np.pi / 2, np.pi / 2, 90)
+    az_angs = np.linspace(-np.pi, np.pi, 90)
     az_angs[az_angs == 0] = 1e-9
-    el_angs = np.linspace(-np.pi / 2, np.pi / 2, 90)
+    el_angs = np.linspace(-np.pi, np.pi, 90)
     el_angs[el_angs == 0] = 1e-9
     Y = np.zeros((len(az_angs), len(el_angs)), dtype=np.complex128)
     for az_a in range(len(az_angs)):
         for el_a in range(len(el_angs)):
-            u = 2 * np.pi * 9.6e9 / c0 * np.array([np.cos(az_angs[az_a]) * np.sin(el_angs[el_a]),
-                                                   np.sin(az_angs[az_a]) * np.sin(el_angs[el_a]),
-                                                   np.cos(el_angs[el_a])])
-            va_u = np.exp(-1j * env.virtual_array.T.dot(u))
+            u = 2 * np.pi * 9.6e9 / c0 * np.array([np.cos(az_angs[az_a]) * np.sin(el_angs[el_a] + np.pi / 2),
+                                                   np.sin(az_angs[az_a]) * np.sin(el_angs[el_a] + np.pi / 2),
+                                                   np.cos(el_angs[el_a] + np.pi / 2)])
+            va_u = np.exp(1j * env.virtual_array.T.dot(u))
             E = 1
             Y[az_a, el_a] = l[7].dot(va_u)
     Y = db(Y)
@@ -252,9 +258,17 @@ for l in logs:
     axes[1].set_ylabel('Azimuth')
     axes[1].set_xlabel('Elevation')
 
+    # Azimuth beam projection at target location
+    az_to_target = np.arctan2(-t_vec[1], -t_vec[0]) - env.boresight_ang
+    el_to_target = np.arcsin(t_vec[2] / np.linalg.norm(t_vec)) - env.dep_ang
+    axes[0].plot(az_angs, Y[abs(az_angs - az_to_target) == abs(az_angs - az_to_target).min(), :].flatten(), c='blue')
+    axes[0].scatter(az_to_target, 1, c='red')
+    axes[2].plot(el_angs, Y[:, abs(el_angs - el_to_target) == abs(el_angs - el_to_target).min()].flatten(), c='blue')
+    axes[2].scatter(el_to_target, 1, c='red')
+
     # Draw the RD maps for each antenna
     for ant in range(env.n_tx):
-        axes[3].plot(db(
+        axes[5].plot(db(
             np.fft.fft(
                 genPulse(np.linspace(0, 1, len(l[5][:, ant])), l[5][:, ant], env.nr, env.nr / env.fs,
                          env.fc[ant], env.bw[ant]),
@@ -280,7 +294,10 @@ for x in range(env.n_tx):
                         window_pulse, prf_plot, 150, mag=True, normalize=False)
         cmin = np.min(amb[0]) if cmin is None else cmin
         cmax = np.max(amb[0]) if cmax is None else cmax
-        plt.imshow(amb[0])
+        if x == y:
+            plt.imshow(amb[0])
+        else:
+            plt.imshow(amb[0], clim=[cmin, cmax])
 plt.tight_layout()
 
 plt.figure('Rewards')
