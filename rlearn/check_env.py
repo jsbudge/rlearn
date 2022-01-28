@@ -35,121 +35,27 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 2000
-eval_games = 1
-max_timesteps = 128
-batch_sz = 64
-feedback_train = False
+max_timesteps = 100
 
 # Pre-defined or custom environment
 env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90,
-                            altitude=1524, plp=.5, env_samples=500000, fs_decimation=8, az_lim=90, el_lim=20,
-                            beamform_type='mmse')
+                            altitude=1524, plp=.5, env_samples=300000, fs_decimation=8, az_lim=90, el_lim=20,
+                            beamform_type='none')
+linear = np.zeros((100, env.n_tx))
+linear[:, 0] = np.linspace(0, 1, 100)
+linear[:, 1] = np.linspace(1, 0, 100)
 
-# Define preprocessing layer (just a normalization)
-state_prelayer = [dict(type='linear_normalization'),
-                  dict(type='exponential_normalization', decay=.8)]
 
-# Give a sense of motion to the agent
-seq_layer = [dict(type='sequence', length=2)]
-
-# Define states for different agents
-wave_state = dict(currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
-                                max_value=1),
-                  currfc=dict(type='float', shape=(env.n_tx,), min_value=8e9,
-                              max_value=12e9),
-                  currbw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
-                              max_value=env.fs / 2 - 5e6),
-                  platform_motion=dict(type='float', shape=(2, 3),
-                                       min_value=-2000, max_value=2000))
-motion_state = dict(point_angs=dict(type='float', shape=(2,), min_value=min([env.az_lims[0], env.el_lims[0]]),
-                                    max_value=max([env.az_lims[1], env.el_lims[1]])),
-                    platform_motion=dict(type='float', shape=(2, 3),
-                                         min_value=-2000, max_value=2000),
-                    target_angs=dict(type='float', shape=(2,), min_value=-np.pi, max_value=np.pi))
-
-# Define actions for different agents
-wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, max_value=1),
-                   fc=dict(type='float', shape=(env.n_tx,), min_value=8e9, max_value=12e9),
-                   bw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
-                           max_value=env.fs / 2 - 5e6),
-                   power=dict(type='float', shape=(env.n_tx,), min_value=1,
-                              max_value=100)
-                   )
-
-motion_action = dict(radar=dict(type='float', shape=(1,), min_value=100, max_value=env.maxPRF * 2),
-                     scan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
-                               max_value=env.az_lims[1]),
-                     elscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
-                                 max_value=env.el_lims[1]))
-
-# Instantiate wave agent
-print('Initializing agents...')
-wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=state_prelayer,
-                          actions=wave_action,
-                          max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
-                          learning_rate=1e-4,
-                          memory=max_timesteps, exploration=5.5, entropy_regularization=5.0)
-
-# Instantiate motion agent
-motion_agent = Agent.create(agent='ac', states=motion_state,
-                            actions=motion_action,
-                            state_preprocessing=state_prelayer + seq_layer,
-                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-4,
-                            memory=max_timesteps, exploration=300.0, entropy_regularization=5.0,
-                            horizon=10)
-
-# Training regimen
-print('Beginning training...')
-reward_track = np.zeros(games)
-for episode in tqdm(range(games)):
-
-    # Episode using act and observe
-    env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18,
-                                dep_ang=np.random.uniform(40, 60),
-                                boresight_ang=np.random.uniform(80, 100), altitude=np.random.uniform(1000, 2000),
-                                plp=.5, env_samples=500000, fs_decimation=8, az_lim=90, el_lim=20,
-                                beamform_type='mmse')
-    states = env.reset()
-    terminal = False
-    sum_rewards = 0.0
-    num_updates = 0
-    while not terminal:
-        wave_actions = wave_agent.act(states={key: states[key] for key in wave_state.keys()})
-        motion_actions = motion_agent.act(states={key: states[key] for key in motion_state.keys()})
-        actions = {**wave_actions, **motion_actions}
-        states, terminal, reward = env.execute(actions=actions)
-        num_updates += wave_agent.observe(terminal=terminal, reward=reward[0])
-        num_updates += motion_agent.observe(terminal=terminal, reward=reward[1])
-        sum_rewards += sum(reward)
-    reward_track[episode] = sum_rewards
-
-# Testing loop
-actions = None
-print('Evaluation...')
-for g in tqdm(range(eval_games)):
-    # Initialize episode
-    states = env.reset()
-    terminal = False
-    internals = [wave_agent.initial_internals(), motion_agent.initial_internals()]
-    timestep = 0
-
-    while not terminal:
-        # Episode timestep
-        wa, internals[0] = wave_agent.act(states={key: states[key] for key in wave_state.keys()},
-                                          internals=internals[0],
-                                          independent=True, deterministic=True)
-        ma, internals[1] = motion_agent.act(states={key: states[key] for key in motion_state.keys()},
-                                            internals=internals[1],
-                                            independent=True, deterministic=True)
-        actions = {**wa, **ma}
-        states, terminal, reward = env.execute(actions=actions)
-
-env.close()
-# wave_agent.close()
-# motion_agent.close()
-print('Training and evaluation completed. Running plots...')
-
+states = env.reset()
+for step in tqdm(range(max_timesteps)):
+    actions = dict(wave=linear,
+                   fc=np.array([9.6e9 for _ in range(env.n_tx)]),
+                   bw=np.array([env.fs / 2 for _ in range(env.n_tx)]),
+                   power=np.array([1 for _ in range(env.n_tx)]),
+                   radar=np.array([500]),
+                    scan=np.array([0]),
+                    elscan=np.array([0]))
+    states, terminal, reward = env.execute(actions=actions)
 '''
 -------------------------------------------------------------------------------------------
 ------------------------------ PLOTS ------------------------------------------------------
@@ -161,15 +67,6 @@ log_num = 10
 
 nr = int((env.env.max_pl * env.plp) * env.fs)
 back_noise = np.random.rand(max(nr, 5000)) - .5 + 1j * (np.random.rand(max(nr, 5000)) - .5)
-
-if len(reward_track) >= 5:
-    plt.figure('Training Reward Track')
-    mav = sliding_window(reward_track, 5, func=np.mean)
-    plt.plot(reward_track)
-    plt.plot(mav, linestyle='dashed')
-    plt.legend(['Sum', 'Moving Average'])
-else:
-    print('Not enough training episodes for track display.')
 
 plt.figure('RC Pulse Width')
 for ant in range(env.n_tx):
@@ -189,6 +86,7 @@ try:
     wd.plot(kind='contour', show_tf=True)
 except IndexError:
     print('Pulse too small?')
+
 
 '''
 --------------- ANIMATED ENVIRONMENT ----------------
@@ -355,7 +253,7 @@ for l in logs:
     camw.snap()
 
 animw = camw.animate(interval=250)
-animw.save('ocean.mp4')
+# animw.save('ocean.mp4')
 
 plt.figure('VA positions')
 ax = plt.subplot(111, projection='3d')
@@ -366,35 +264,3 @@ ax.scatter(env.virtual_array[0, :],
 ax.scatter(rot_array[0, :],
            rot_array[1, :],
            rot_array[2, :], marker='*')
-
-'''
-fig = plt.figure('Ocean3D')
-xx, yy = np.meshgrid(np.linspace(0, env.env.eswath, 1500), np.linspace(0, env.env.swath, 1500))
-bgpts = np.array([xx.flatten(), yy.flatten()])
-gv, gz = env.env.getBG(bgpts.T, l[2][0])
-disp_oc = fftconvolve(gz.reshape(xx.shape), np.ones((30, 30)) / (30**2), mode='same')
-ax3d = fig.add_subplot(1, 2, 1, projection='3d')
-ax = fig.add_subplot(1, 2, 2)
-ax3d.plot_surface(xx, yy, disp_oc, rstride=10, cstride=10, cmap='ocean')
-ax3d.set_zlim([-1, 10])
-im2d = ax.imshow(disp_oc, extent=[0, env.env.swath, 0, env.env.eswath], cmap='ocean')
-ax.set_ylabel('Northing (m)')
-ax.set_xlabel('Easting (m)')
-plt.colorbar(ScalarMappable(cmap='ocean'), ax=ax, fraction=.046, pad=.04)
-pos = []
-amp = []
-pcols = []
-for t in l[2]:
-    spow, loc1, loc2 = s(t)
-    pos.append([loc1, loc2])
-    amp.append(spow + 1)
-    pcols.append(cols[idx])
-pos = np.array(pos)
-if len(pos) > 0:
-    ax.scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
-    plt_rng = 2 * (np.linalg.norm(env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
-                   np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
-              (l[2][-1] - l[2][0])
-    ax.text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='white')
-plt.tight_layout()
-'''

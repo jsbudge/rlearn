@@ -15,6 +15,11 @@ def diff(x, y):
     return (a + np.pi) - math.floor((a + np.pi) / (2 * np.pi)) * 2 * np.pi - np.pi
 
 
+def cpudiff(x, y):
+    a = y - x
+    return (a + np.pi) - np.floor((a + np.pi) / (2 * np.pi)) * 2 * np.pi - np.pi
+
+
 @cuda.jit(device=True)
 def interp(x, y, tt, bg):
     # Simple 2d linear nearest neighbor interpolation
@@ -29,28 +34,61 @@ def interp(x, y, tt, bg):
 
 
 @cuda.jit(device=True)
-def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, params):
-    '''
+def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, el, k):
+    a = .1 / k * (2 * np.pi)
+    b = .1 / k * (2 * np.pi)
     el_tx = math.asin(-s_tz / rngtx)
-    az_tx = math.atan2(s_tx, s_ty)
-    eldiff = diff(el_tx, params[5])
-    azdiff = diff(az_tx, params[8])
-    tx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
-    tx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
+    az_tx = math.atan2(s_ty, s_tx)
+    eldiff = diff(el_tx, el)
+    azdiff = diff(az_tx, az)
+    tx_pat = abs(math.sin(math.pi * a * k * math.cos(azdiff) * math.cos(eldiff) / (2 * np.pi)) /
+                 (np.pi * a * k * math.cos(azdiff) * math.cos(eldiff) / (2 * np.pi)) *
+                 math.sin(np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi)) /
+                 (np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi))) * \
+             math.sqrt(math.sin(eldiff) * math.sin(eldiff) * math.cos(azdiff) * math.cos(azdiff) +
+                     math.cos(eldiff) * math.cos(eldiff))
     el_rx = math.asin(-s_rz / rngrx)
     az_rx = math.atan2(s_rx, s_ry)
-    eldiff = diff(el_rx, params[5])
-    azdiff = diff(az_rx, params[8])
-    rx_elpat = abs(math.sin(params[0] * eldiff) / (params[0] * eldiff)) if eldiff != 0 else 1
-    rx_azpat = abs(math.sin(params[1] * azdiff) / (params[1] * azdiff)) if azdiff != 0 else 1
-    '''
-    return 1
+    eldiff = diff(el_rx, el)
+    azdiff = diff(az_rx, az)
+    rx_pat = abs(math.sin(math.pi * a * k * math.cos(azdiff) * math.cos(eldiff) / (2 * np.pi)) /
+                 (np.pi * a * k * math.cos(azdiff) * math.cos(eldiff) / (2 * np.pi)) *
+                 math.sin(np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi)) /
+                 (np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi))) * \
+             math.sqrt(math.sin(eldiff) * math.sin(eldiff) * math.cos(azdiff) * math.cos(azdiff) +
+                     math.cos(eldiff) * math.cos(eldiff))
+    return tx_pat * rx_pat
 
 
-@cuda.jit(
-    'void(float64[:, :], float64[:, :], float64[:, :], float64[:, :, :], ' +
-    'float64[:, :], float64[:, :], float64[:])')
-def genRangeProfile(pathrx, pathtx, gp, bg, pd_r, pd_i, params):
+# CPU version
+def applyRadiationPatternCPU(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, el, k):
+    a = .1 / k * (2 * np.pi)
+    b = .1 / k * (2 * np.pi)
+    el_tx = np.arcsin(-s_tz / rngtx)
+    az_tx = np.arctan2(s_ty, s_tx)
+    eldiff = cpudiff(el_tx, el) if el_tx != el else 1e-9
+    azdiff = cpudiff(az_tx, az) if az_tx != az else 1e-9
+    tx_pat = abs(np.sin(np.pi * a * k * np.cos(azdiff) * np.cos(eldiff) / (2 * np.pi)) /
+                 (np.pi * a * k * np.cos(azdiff) * np.cos(eldiff) / (2 * np.pi)) *
+                 np.sin(np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi)) /
+                 (np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi))) * \
+             np.sqrt(np.sin(eldiff) * np.sin(eldiff) * np.cos(azdiff) * np.cos(azdiff) +
+                       np.cos(eldiff) * np.cos(eldiff))
+    el_rx = np.arcsin(-s_rz / rngrx)
+    az_rx = np.arctan2(s_ry, s_rx)
+    eldiff = cpudiff(el_rx, el) if el_rx != el else 1e-9
+    azdiff = cpudiff(az_rx, az) if az_rx != az else 1e-9
+    rx_pat = abs(np.sin(np.pi * a * k * np.cos(azdiff) * np.cos(eldiff) / (2 * np.pi)) /
+                 (np.pi * a * k * np.cos(azdiff) * np.cos(eldiff) / (2 * np.pi)) *
+                 np.sin(np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi)) /
+                 (np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi))) * \
+             np.sqrt(np.sin(eldiff) * np.sin(eldiff) * np.cos(azdiff) * np.cos(azdiff) +
+                       np.cos(eldiff) * np.cos(eldiff))
+    return tx_pat * rx_pat
+
+
+@cuda.jit
+def genRangeProfile(pathrx, pathtx, gp, pan, el, bg, pd_r, pd_i, params):
     tt, samp_point = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and samp_point < gp.shape[0]:
         # Load in all the parameters that don't change
@@ -90,18 +128,17 @@ def genRangeProfile(pathrx, pathtx, gp, bg, pd_r, pd_i, params):
             ref_y = 2 * rnorm * -.01 * tz_v2 / nnorm - s_ty / rngtx
             ref_z = 2 * rnorm * .0001 / nnorm - s_tz / rngtx
             # Dot product of wave with Rx vector
-            gv = ref_x * s_rx + ref_y * s_ry + ref_z * s_rz
-            if gv < 0:
-                gv = 0
-            att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, params)
+            gv = abs(ref_x * s_rx + ref_y * s_ry + ref_z * s_rz) * 5
+            #if gv < 0:
+            #    gv = 0
+            att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, pan[tt], el[tt], wavenumber)
             acc_val = gv * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
             cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
             cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
 
-@cuda.jit('void(float64[:, :], float64[:, :], float64[:, :, :], ' +
-          'float64[:, :], float64[:, :], float64[:])')
-def genSubProfile(pathrx, pathtx, subs, pd_r, pd_i, params):
+@cuda.jit
+def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
     tt, subnum = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and subnum < subs.shape[0]:
         # Load in all the parameters that don't change
@@ -112,7 +149,7 @@ def genSubProfile(pathrx, pathtx, subs, pd_r, pd_i, params):
         sub_y = subs[subnum, tt, 2]
         sub_cos = subs[subnum, tt, 3]
         sub_sin = subs[subnum, tt, 4]
-        spow = subs[subnum, tt, 0] * 2000
+        spow = subs[subnum, tt, 0] * 50
         sub_z = subs[subnum, tt, 0]
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
@@ -138,14 +175,15 @@ def genSubProfile(pathrx, pathtx, subs, pd_r, pd_i, params):
                 rng_bin = (rng / c0 - 2 * params[3]) * params[4]
                 but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
                 if n_samples > but > 0:
-                    att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, params)
+                    att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx,
+                                                pan[tt], el[tt], wavenumber)
                     acc_val = spow * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
                     cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
                     cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
 
 @cuda.jit()
-def getDetectionCheck(pathtx, subs, pd_r, pd_i, det_spread, params):
+def getDetectionCheck(pathtx, subs, pd_r, pd_i, pan, el, det_spread, params):
     tt, subnum = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and subnum < subs.shape[0]:
         # Load in all the parameters that don't change
@@ -160,7 +198,7 @@ def getDetectionCheck(pathtx, subs, pd_r, pd_i, det_spread, params):
         s_ty = sub_y - pathtx[1, tt]
         s_tz = sub_z - pathtx[2, tt]
         rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz) + c0 / params[4]
-        att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_tx, s_ty, s_tz, rngtx, params)
+        att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_tx, s_ty, s_tz, rngtx, pan[tt], el[tt], wavenumber)
         acc_val = att * cmath.exp(1j * wavenumber * rngtx) * 1 / (rngtx * rngtx)
 
         # Find exact spot in detection chunk to place pulse

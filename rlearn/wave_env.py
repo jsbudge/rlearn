@@ -63,14 +63,6 @@ def multilateration(rngs, va_pos, x0=None):
     return minimize(error, x0, args=(va_pos, rngs), method='Nelder-Mead').x
 
 
-def hornPattern(a, b, theta, phi):
-    k = 2 * np.pi * 9.6e9 / c0
-    E = -1j * 2 * np.pi * 9.6e9 * 377 * np.exp(-1j * k) / (4 * np.pi) * a * b * \
-        np.sinc(a * k * np.sin(theta) * np.cos(phi) / (2 * np.pi)) * \
-        np.sinc(b * k * np.sin(theta) * np.sin(phi) / (2 * np.pi)) * (np.cos(theta) * np.cos(phi) - np.sin(phi))
-    return E
-
-
 def gaus_2d(size, sigma, angle=0, height=1):
     x, y = np.meshgrid(np.linspace(-1, 1, size[0]), np.linspace(-1, 1, size[1]))
     a = np.cos(angle) ** 2 / (2 * sigma[0] ** 2) + np.sin(angle) ** 2 / (2 * sigma[1] ** 2)
@@ -223,43 +215,17 @@ class SinglePulseBackground(Environment):
         # Detectability score
         det_sc = motion
 
-        # Find truth sub direction for pulse power
+        # PRF quality score
+        clutter_bw = 2 * self.env.spd * np.sin(self.az_bw / 2) * (max(self.fc) + max(self.bw)) / c0
+
+        # Check pulse detection quality
         detb_sc = 0
         if self.det_model is not None:
             id_data, blen, n_dets = self.genDetBlock(chirps, 20)
             n_close = 1 - log_loss(n_dets, self.det_model.predict(id_data.T).flatten())
             detb_sc += -n_close
 
-        # Colton MUSIC input here
-        '''
-        single_pulse = curr_cpi[:, :2, :].T
-        ea = np.zeros((2,))
-        n_hits = 0
-        for pulse in range(2):
-            for n in range(self.n_tx):
-                mus_res = music(single_pulse[:, pulse, :], 1, self.virtual_array.T, self.fc[n], .2 * DTR,
-                                a_elevationRange=np.array([-self.el_bw, self.el_bw]),
-                                a_azimuthRange=np.array([-self.az_bw, self.az_bw]),
-                                a_scaleElevation=False).flatten()
-                ea += 0 if len(mus_res) == 0 else mus_res
-                n_hits += 0 if len(mus_res) == 0 else 1
-
-        if n_hits > 0:
-            det_sc += 1
-            ea /= n_hits
-            ea += np.array([self.az_pt, self.el_pt])
-            eldiff = cpudiff(ea[1], self.el_pt)
-            azdiff = cpudiff(ea[0], self.az_pt)
-
-            # Only add reward if music finds possible angles
-            el_sc += 1 - abs(eldiff / self.el_bw)
-            az_sc += 1 - abs(azdiff / self.az_bw)
-        else:
-            # No targets found, incentivize the antenna to move
-            ea = []
-            el_sc += motion - 1
-            az_sc += motion - 1
-        '''
+        # Find truth sub direction for pulse power
         t_pos = np.array([*self.env.targets[0].pos(mid_tf), 1]) - self.env.pos(mid_tf)
         ea = [np.arctan2(t_pos[1], t_pos[0]) - self.boresight_ang,
               np.arcsin(-t_pos[2] / np.linalg.norm(t_pos)) - self.dep_ang]
@@ -324,11 +290,10 @@ class SinglePulseBackground(Environment):
                          self.tf, actions['scan'], actions['elscan'], actions['wave'], ea, U])
 
         # Whole state space to be split into the various agents
-        full_state = {'cpi': beamform, 'point_angs': np.array([self.az_pt, self.el_pt]),
+        full_state = {'point_angs': np.array([self.az_pt, self.el_pt]),
                       'currwave': actions['wave'], 'currfc': self.fc, 'currbw': self.bw,
                       'platform_motion': np.array([self.env.pos(mid_tf),
-                                                   (self.env.pos(self.tf[1]) - self.env.pos(self.tf[0])) /
-                                                   (self.tf[1] - self.tf[0])]),
+                                                   self.env.vel(mid_tf)]),
                       'target_angs': np.array(ea)}
 
         return full_state, done, np.array([amb_sc + detb_sc, det_sc + dist_sc])
@@ -345,8 +310,7 @@ class SinglePulseBackground(Environment):
         init_wave = np.ones((WAVEPOINTS, self.n_tx)) * .5
         init_wave[0:3, :] = .01
         init_wave[-3:, :] = .99
-        return {'cpi': np.zeros((self.nsam, self.cpi_len)),
-                'point_angs': np.array([0.0, 0.0]),
+        return {'point_angs': np.array([0.0, 0.0]),
                 'currwave': init_wave, 'currfc': [9.6e9 for _ in range(self.n_tx)],
                 'currbw': [self.fs / 2 - 10e6 for _ in range(self.n_tx)],
                 'platform_motion': np.array([self.env.pos(self.tf[0]),
@@ -366,21 +330,37 @@ class SinglePulseBackground(Environment):
         sub_blocks = (int(np.ceil(mx_threads // self.cpi_len // len(self.env.targets))),
                       len(self.env.targets))
         zo_t = np.zeros((len(self.tf), *self.env.bg[0].shape), dtype=np.complex128)
-        gpts = np.random.rand(self.samples, 2)
-        gpts[:, 0] *= self.env.eswath
-        gpts[:, 1] *= self.env.swath
+        # Get pan and tilt angles for fixed array
+        mot_pos = self.el_rot(self.dep_ang, self.az_rot(self.boresight_ang, self.env.vel(self.tf)))
+        pan = np.arctan2(mot_pos[1, :], mot_pos[0, :])
+        el = np.arcsin(mot_pos[2, :] / np.linalg.norm(mot_pos, axis=0))
+        pan_gpu = cupy.array(np.ascontiguousarray(pan), dtype=np.float64)
+        el_gpu = cupy.array(np.ascontiguousarray(el), dtype=np.float64)
+        # Make a big box around the swath
+        p_pos = self.env.pos(self.tf[0])
+        bx_rng = p_pos[2] / np.tan(el[0])
+        bx_srng = np.sqrt(bx_rng**2 + p_pos[2]**2)
+        bx_cent = self.az_rot(pan[0], np.array([bx_rng, 0, 0])) + p_pos
+        bx_perp = bx_srng * np.tan(self.az_bw / 2)
+        gpts = np.zeros((3, self.samples))
+        gpts[1, :] = np.random.uniform(-bx_perp * 2, bx_perp * 2, self.samples)
+        gpts[0, :] = np.random.uniform((p_pos[2] / np.tan(el[0] + self.el_bw / 2) - bx_rng) * 2,
+                                       (p_pos[2] / np.tan(el[0] - self.el_bw / 2) - bx_rng) * 2, self.samples)
+        gpts = self.az_rot(pan[0], gpts).T
+        gpts[:, 0] += bx_cent[0]
+        gpts[:, 1] += bx_cent[1]
         for t in range(len(self.tf)):
             zo_t[t, ...] = self.env.getBGFreqMap(self.tf[t])
         sv = []
         bg_gpu = cupy.array(zo_t, dtype=np.complex128)
         bg_gpu = cupy.fft.ifft2(bg_gpu, axes=(1, 2))
-        gpts_gpu = cupy.array(gpts, dtype=np.float64)
+        gpts_gpu = cupy.array(gpts[:, :2], dtype=np.float64)
         for sub in self.env.targets:
             sv.append([sub(t, fullset=True) for t in self.tf])
         sub_pos = cupy.array(np.ascontiguousarray(sv), dtype=np.float64)
         rd_cpu = np.zeros((self.fft_len, self.cpi_len, self.n_rx), dtype=np.complex128)
         for rx in range(self.n_rx):
-            posrx_gpu = cupy.array(np.ascontiguousarray(self.env.pos(self.tf) + self.rx_locs[:, rx][:, None]),
+            posrx_gpu = cupy.array(np.ascontiguousarray(p_pos + self.rx_locs[:, rx][:, None]),
                                    dtype=np.float64)
             data_r = cupy.zeros(self.data_block, dtype=np.float64)
             data_i = cupy.zeros(self.data_block, dtype=np.float64)
@@ -391,12 +371,12 @@ class SinglePulseBackground(Environment):
                                              self.boresight_ang]),
                                    dtype=np.float64)
                 chirp_gpu = cupy.array(np.tile(chirp[:, tx], (self.cpi_len, 1)).T, dtype=np.complex128)
-                postx_gpu = cupy.array(np.ascontiguousarray(self.env.pos(self.tf) + self.tx_locs[:, tx][:, None]),
+                postx_gpu = cupy.array(np.ascontiguousarray(p_pos + self.tx_locs[:, tx][:, None]),
                                        dtype=np.float64)
-                genRangeProfile[blocks_per_grid, threads_per_block](posrx_gpu, postx_gpu, gpts_gpu, bg_gpu,
-                                                                    data_r, data_i, p_gpu)
+                genRangeProfile[blocks_per_grid, threads_per_block](posrx_gpu, postx_gpu, gpts_gpu, pan_gpu, el_gpu,
+                                                                    bg_gpu, data_r, data_i, p_gpu)
                 cupy.cuda.Device().synchronize()
-                genSubProfile[sub_blocks, threads_per_block](posrx_gpu, postx_gpu, sub_pos,
+                genSubProfile[sub_blocks, threads_per_block](posrx_gpu, postx_gpu, sub_pos, pan_gpu, el_gpu,
                                                              data_r, data_i, p_gpu)
                 cupy.cuda.Device().synchronize()
                 data = data_r + 1j * data_i
@@ -414,6 +394,8 @@ class SinglePulseBackground(Environment):
         del sub_pos
         del gpts_gpu
         del bg_gpu
+        del pan_gpu
+        del el_gpu
         cupy.get_default_memory_pool().free_all_blocks()
 
         return rd_cpu
@@ -431,6 +413,14 @@ class SinglePulseBackground(Environment):
         for sub in self.env.targets:
             sv.append([sub(t, fullset=True) for t in self.tf[block_init:block_len + block_init]])
         sub_pos = cupy.array(np.ascontiguousarray(sv), dtype=np.float64)
+
+        # Get pan and tilt angles for fixed array
+        mot_pos = self.el_rot(self.dep_ang,
+                              self.az_rot(self.boresight_ang, self.env.vel(self.tf[block_init:block_len + block_init])))
+        pan = np.arctan2(mot_pos[1, :], mot_pos[0, :])
+        el = np.arcsin(mot_pos[2, :] / np.linalg.norm(mot_pos, axis=0))
+        pan_gpu = cupy.array(np.ascontiguousarray(pan), dtype=np.float64)
+        el_gpu = cupy.array(np.ascontiguousarray(el), dtype=np.float64)
 
         # Calculate how much detection data we'll need
         pt_s = n_dets
@@ -451,7 +441,7 @@ class SinglePulseBackground(Environment):
                     self.env.pos(self.tf[block_init:block_len + block_init]) + self.tx_locs[:, tx][:, None]),
                 dtype=np.float64)
             getDetectionCheck[sub_blocks, threads_per_block](postx_gpu, sub_pos,
-                                                             data_r, data_i, det_spread, p_gpu)
+                                                             data_r, data_i, pan_gpu, el_gpu, det_spread, p_gpu)
             cupy.cuda.Device().synchronize()
             data = data_r + 1j * data_i
             ret_data = cupy.fft.ifft(cupy.fft.fft(data, fft_len, axis=0) * cupy.fft.fft(chirp_gpu, fft_len, axis=0),
@@ -468,6 +458,8 @@ class SinglePulseBackground(Environment):
         del chirp_gpu
         del sub_pos
         del det_spread
+        del pan_gpu
+        del el_gpu
         cupy.get_default_memory_pool().free_all_blocks()
 
         return rd_cpu, block_len + block_init, n_pulses
@@ -518,6 +510,7 @@ class SimEnv(object):
     nrange = 0
     frange = 0
     pos = None
+    vel = None
     spd = 0
     max_pl = 0
     wave = None
@@ -557,15 +550,20 @@ class SimEnv(object):
             np.linspace(self.eswath / 4, self.eswath - self.eswath / 4, npts) + (np.random.rand(npts) - .5) * 3, 3)
         n = gaussian_filter(-self.gnrange + (np.random.rand(npts) - .5) * 3, 3)
         u = gaussian_filter(self.h_agl + (np.random.rand(npts) - .5) * 3, 3)
-        # e = np.zeros(npts) + self.eswath / 2
-        # n = np.zeros(npts) - self.gmrange
-        # u = self.h_agl + np.zeros(npts)
         re = UnivariateSpline(tt, e, s=.7, k=3)
         rn = UnivariateSpline(tt, n, s=.7, k=3)
         ru = UnivariateSpline(tt, u, s=.7, k=3)
+
         self.pos = lambda t: np.array([re(t), rn(t), ru(t)])
+        ttt = np.linspace(0, self.f_ts, npts * 20)
+        vels = np.gradient(self.pos(ttt),
+                           axis=1) / (ttt[1] - ttt[0])
+        ve = UnivariateSpline(ttt, vels[0, :])
+        vn = UnivariateSpline(ttt, vels[1, :])
+        vu = UnivariateSpline(ttt, vels[2, :])
+        self.vel = lambda t: np.array([ve(t), vn(t), vu(t)])
         self.spd = np.linalg.norm(np.gradient(self.pos(np.linspace(0, self.f_ts, int(100 * self.f_ts / 10))),
-                                              axis=1), axis=0).mean()
+                                              axis=1), axis=0).mean() * 100 * self.f_ts / 10
 
         # Environment pulse info
         self.max_pl = (self.nrange * 2 / c0 - 1 / TAC) * .99
