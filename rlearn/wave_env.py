@@ -116,8 +116,8 @@ class SinglePulseBackground(Environment):
 
         # Antenna array definition
         dr = c0 / 9.6e9
-        self.tx_locs = np.array([(0, -dr / 2, 0), (0, dr / 2, 0), (0, dr, 0)]).T
-        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (-dr * 2, 0, 0), (dr * 2, 0, 0)]).T
+        self.tx_locs = np.array([(0, -dr / 2, 0), (0, dr / 2, 0)]).T
+        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (0, 0, 0), (-dr * 2, 0, 0), (dr * 2, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)

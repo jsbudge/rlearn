@@ -35,7 +35,7 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 1
+games = 200
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64

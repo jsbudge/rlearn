@@ -35,7 +35,7 @@ def interp(x, y, tt, bg):
 
 @cuda.jit(device=True)
 def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, el, k):
-    a = .1 / k * (2 * np.pi)
+    '''a = .1 / k * (2 * np.pi)
     b = .1 / k * (2 * np.pi)
     el_tx = math.asin(-s_tz / rngtx)
     az_tx = math.atan2(s_ty, s_tx)
@@ -56,13 +56,13 @@ def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, 
                  math.sin(np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi)) /
                  (np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi))) * \
              math.sqrt(math.sin(eldiff) * math.sin(eldiff) * math.cos(azdiff) * math.cos(azdiff) +
-                     math.cos(eldiff) * math.cos(eldiff))
-    return tx_pat * rx_pat
+                     math.cos(eldiff) * math.cos(eldiff))'''
+    return 1 #tx_pat * rx_pat
 
 
 # CPU version
 def applyRadiationPatternCPU(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, el, k):
-    a = .1 / k * (2 * np.pi)
+    '''a = .1 / k * (2 * np.pi)
     b = .1 / k * (2 * np.pi)
     el_tx = np.arcsin(-s_tz / rngtx)
     az_tx = np.arctan2(s_ty, s_tx)
@@ -83,8 +83,8 @@ def applyRadiationPatternCPU(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, a
                  np.sin(np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi)) /
                  (np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi))) * \
              np.sqrt(np.sin(eldiff) * np.sin(eldiff) * np.cos(azdiff) * np.cos(azdiff) +
-                       np.cos(eldiff) * np.cos(eldiff))
-    return tx_pat * rx_pat
+                       np.cos(eldiff) * np.cos(eldiff))'''
+    return 1 #tx_pat * rx_pat
 
 
 @cuda.jit
