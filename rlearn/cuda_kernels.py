@@ -128,9 +128,7 @@ def genRangeProfile(pathrx, pathtx, gp, pan, el, bg, pd_r, pd_i, params):
             ref_y = 2 * rnorm * -.01 * tz_v2 / nnorm - s_ty / rngtx
             ref_z = 2 * rnorm * .0001 / nnorm - s_tz / rngtx
             # Dot product of wave with Rx vector
-            gv = abs(ref_x * s_rx + ref_y * s_ry + ref_z * s_rz) * 5
-            #if gv < 0:
-            #    gv = 0
+            gv = abs(ref_x * s_rx / rngrx + ref_y * s_ry / rngrx + ref_z * s_rz / rngrx)
             att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, pan[tt], el[tt], wavenumber)
             acc_val = gv * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
             cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
@@ -149,12 +147,12 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
         sub_y = subs[subnum, tt, 2]
         sub_cos = subs[subnum, tt, 3]
         sub_sin = subs[subnum, tt, 4]
-        spow = subs[subnum, tt, 0] * 50
+        spow = subs[subnum, tt, 0] * 5
         sub_z = subs[subnum, tt, 0]
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
-        xpts = 5
-        ypts = 3
+        xpts = 15
+        ypts = 11
         sub_length = 10.0
         sub_width = 2.5
         for n in range(xpts):

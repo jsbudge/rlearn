@@ -39,8 +39,8 @@ max_timesteps = 100
 
 # Pre-defined or custom environment
 env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90,
-                            altitude=1524, plp=.5, env_samples=300000, fs_decimation=8, az_lim=90, el_lim=20,
-                            beamform_type='none')
+                            altitude=1524, plp=.5, env_samples=500000, fs_decimation=8, az_lim=90, el_lim=20,
+                            beamform_type='phased')
 linear = np.zeros((100, env.n_tx))
 linear[:, 0] = np.linspace(0, 1, 100)
 linear[:, 1] = np.linspace(1, 0, 100)
@@ -140,7 +140,7 @@ for l in logs:
 
     # Plot the Range-Doppler beamformed data
     axes[4].imshow(np.fft.fftshift(l[0], axes=1),
-                   extent=[dopp_freqs[0], dopp_freqs[-1], env.env.gnrange, env.env.gfrange], origin='lower')
+                   extent=[dopp_freqs[0], dopp_freqs[-1], env.env.nrange, env.env.frange], origin='lower')
     axes[4].axis('tight')
 
     # Draw beamformed array pattern

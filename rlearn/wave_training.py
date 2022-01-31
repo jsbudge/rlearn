@@ -35,7 +35,7 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 2000
+games = 1
 eval_games = 1
 max_timesteps = 128
 batch_sz = 64
@@ -43,7 +43,7 @@ feedback_train = False
 
 # Pre-defined or custom environment
 env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90,
-                            altitude=1524, plp=.5, env_samples=500000, fs_decimation=8, az_lim=90, el_lim=20,
+                            altitude=1524, plp=.5, env_samples=200000, fs_decimation=8, az_lim=90, el_lim=20,
                             beamform_type='mmse')
 
 # Define preprocessing layer (just a normalization)
@@ -77,7 +77,7 @@ wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, m
                               max_value=100)
                    )
 
-motion_action = dict(radar=dict(type='float', shape=(1,), min_value=100, max_value=env.maxPRF * 2),
+motion_action = dict(radar=dict(type='float', shape=(1,), min_value=env.PRFrange[0], max_value=env.PRFrange[1]),
                      scan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
                                max_value=env.az_lims[1]),
                      elscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
@@ -89,7 +89,7 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
                           actions=wave_action,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
                           learning_rate=1e-4,
-                          memory=max_timesteps, exploration=5.5, entropy_regularization=5.0)
+                          memory=max_timesteps, exploration=.5)
 
 # Instantiate motion agent
 motion_agent = Agent.create(agent='ac', states=motion_state,
@@ -108,7 +108,7 @@ for episode in tqdm(range(games)):
     env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18,
                                 dep_ang=np.random.uniform(40, 60),
                                 boresight_ang=np.random.uniform(80, 100), altitude=np.random.uniform(1000, 2000),
-                                plp=.5, env_samples=500000, fs_decimation=8, az_lim=90, el_lim=20,
+                                plp=.5, env_samples=200000, fs_decimation=8, az_lim=90, el_lim=20,
                                 beamform_type='mmse')
     states = env.reset()
     terminal = False
@@ -242,7 +242,7 @@ for l in logs:
 
     # Plot the Range-Doppler beamformed data
     axes[4].imshow(np.fft.fftshift(l[0], axes=1),
-                   extent=[dopp_freqs[0], dopp_freqs[-1], env.env.gnrange, env.env.gfrange], origin='lower')
+                   extent=[dopp_freqs[0], dopp_freqs[-1], env.env.nrange, env.env.frange], origin='lower')
     axes[4].axis('tight')
 
     # Draw beamformed array pattern
