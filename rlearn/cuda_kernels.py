@@ -35,8 +35,8 @@ def interp(x, y, tt, bg):
 
 @cuda.jit(device=True)
 def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, el, k):
-    '''a = .1 / k * (2 * np.pi)
-    b = .1 / k * (2 * np.pi)
+    a = .01 / k * (2 * np.pi)
+    b = .01 / k * (2 * np.pi)
     el_tx = math.asin(-s_tz / rngtx)
     az_tx = math.atan2(s_ty, s_tx)
     eldiff = diff(el_tx, el)
@@ -56,14 +56,14 @@ def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, 
                  math.sin(np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi)) /
                  (np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi))) * \
              math.sqrt(math.sin(eldiff) * math.sin(eldiff) * math.cos(azdiff) * math.cos(azdiff) +
-                     math.cos(eldiff) * math.cos(eldiff))'''
-    return 1 #tx_pat * rx_pat
+                     math.cos(eldiff) * math.cos(eldiff))
+    return tx_pat * rx_pat
 
 
 # CPU version
 def applyRadiationPatternCPU(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, el, k):
-    '''a = .1 / k * (2 * np.pi)
-    b = .1 / k * (2 * np.pi)
+    a = .01 / k * (2 * np.pi)
+    b = .01 / k * (2 * np.pi)
     el_tx = np.arcsin(-s_tz / rngtx)
     az_tx = np.arctan2(s_ty, s_tx)
     eldiff = cpudiff(el_tx, el) if el_tx != el else 1e-9
@@ -83,8 +83,8 @@ def applyRadiationPatternCPU(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, a
                  np.sin(np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi)) /
                  (np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi))) * \
              np.sqrt(np.sin(eldiff) * np.sin(eldiff) * np.cos(azdiff) * np.cos(azdiff) +
-                       np.cos(eldiff) * np.cos(eldiff))'''
-    return 1 #tx_pat * rx_pat
+                       np.cos(eldiff) * np.cos(eldiff))
+    return tx_pat * rx_pat
 
 
 @cuda.jit
@@ -136,7 +136,7 @@ def genRangeProfile(pathrx, pathtx, gp, pan, el, bg, pd_r, pd_i, params):
 
 
 @cuda.jit
-def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
+def genSubProfile(pathrx, pathtx, subs, pan, el, bg, pd_r, pd_i, params):
     tt, subnum = cuda.grid(ndim=2)
     if tt < pd_r.shape[1] and subnum < subs.shape[0]:
         # Load in all the parameters that don't change
@@ -148,10 +148,15 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, pd_r, pd_i, params):
         sub_cos = subs[subnum, tt, 3]
         sub_sin = subs[subnum, tt, 4]
         spow = subs[subnum, tt, 0] * 5
-        sub_z = subs[subnum, tt, 0]
+
+        # Calc out wave height
+        x_i = sub_x % params[6] / params[6] * bg.shape[1]
+        y_i = sub_y % params[7] / params[7] * bg.shape[2]
+        tz = interp(x_i, y_i, tt, bg)
+        sub_z = subs[subnum, tt, 0] + tz
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
-        xpts = 15
+        xpts = 21
         ypts = 11
         sub_length = 10.0
         sub_width = 2.5

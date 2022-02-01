@@ -1,3 +1,4 @@
+import cupy
 from tensorforce import Agent, Environment, Runner
 from wave_env import SinglePulseBackground, genPulse, ambiguity, ellipse
 import numpy as np
@@ -35,23 +36,27 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 200
-eval_games = 1
+games = 600
+eval_games = 10
 max_timesteps = 128
 batch_sz = 64
 feedback_train = False
 
+print('Initial memory on GPU:')
+print(f'Memory: {cupy.get_default_memory_pool().used_bytes()} / {cupy.get_default_memory_pool().total_bytes()}')
+print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} free blocks')
+
 # Pre-defined or custom environment
 env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90,
                             altitude=1524, plp=.5, env_samples=200000, fs_decimation=8, az_lim=90, el_lim=20,
-                            beamform_type='mmse')
+                            beamform_type='phased')
 
 # Define preprocessing layer (just a normalization)
 state_prelayer = [dict(type='linear_normalization'),
                   dict(type='exponential_normalization', decay=.8)]
 
 # Give a sense of motion to the agent
-seq_layer = [dict(type='sequence', length=2)]
+seq_layer = [dict(type='sequence', length=4)]
 
 # Define states for different agents
 wave_state = dict(currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
@@ -60,12 +65,12 @@ wave_state = dict(currwave=dict(type='float', shape=(100, env.n_tx), min_value=0
                               max_value=12e9),
                   currbw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
                               max_value=env.fs / 2 - 5e6),
-                  platform_motion=dict(type='float', shape=(2, 3),
-                                       min_value=-2000, max_value=2000))
+                  platform_motion=dict(type='float', shape=(3,),
+                                       min_value=-200, max_value=200))
 motion_state = dict(point_angs=dict(type='float', shape=(2,), min_value=min([env.az_lims[0], env.el_lims[0]]),
                                     max_value=max([env.az_lims[1], env.el_lims[1]])),
-                    platform_motion=dict(type='float', shape=(2, 3),
-                                         min_value=-2000, max_value=2000),
+                    platform_motion=dict(type='float', shape=(3,),
+                                         min_value=-200, max_value=200),
                     target_angs=dict(type='float', shape=(2,), min_value=-np.pi, max_value=np.pi))
 
 # Define actions for different agents
@@ -89,14 +94,14 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
                           actions=wave_action,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
                           learning_rate=1e-4,
-                          memory=max_timesteps, exploration=.5)
+                          memory=max_timesteps, exploration=.005, entropy_regularization=5.0)
 
 # Instantiate motion agent
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
                             state_preprocessing=state_prelayer + seq_layer,
-                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-4,
-                            memory=max_timesteps, exploration=300.0, entropy_regularization=5.0,
+                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-2,
+                            memory=max_timesteps, exploration=.003,
                             horizon=10)
 
 # Training regimen
@@ -148,7 +153,10 @@ for g in tqdm(range(eval_games)):
 env.close()
 # wave_agent.close()
 # motion_agent.close()
-print('Training and evaluation completed. Running plots...')
+print('Training and evaluation completed. Running plots.')
+print('Final memory on GPU:')
+print(f'Memory: {cupy.get_default_memory_pool().used_bytes()} / {cupy.get_default_memory_pool().total_bytes()}')
+print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} free blocks')
 
 '''
 -------------------------------------------------------------------------------------------
@@ -314,11 +322,19 @@ for x in range(env.n_tx):
 plt.tight_layout()
 
 plt.figure('Rewards')
-scores = np.array([l[1] for l in logs])
+wave_scores = np.array([l[1][0] for l in logs])
+motion_scores = np.array([l[1][1] for l in logs])
 times = np.array([l[2][0] for l in logs])
-for sc_part in range(scores.shape[1] + 1, -1, -1):
-    plt.plot(times, np.sum(scores[:, :sc_part], axis=1))
-    plt.fill_between(times, np.sum(scores[:, :sc_part], axis=1))
+plt.subplot(2, 1, 1)
+plt.title('Wave Agent')
+for sc_part in range(wave_scores.shape[1], 0, -1):
+    plt.plot(times, np.sum(wave_scores[:, :sc_part], axis=1))
+    plt.fill_between(times, np.sum(wave_scores[:, :sc_part], axis=1))
+plt.subplot(2, 1, 2)
+plt.title('Motion Agent')
+for sc_part in range(motion_scores.shape[1], 0, -1):
+    plt.plot(times, np.sum(motion_scores[:, :sc_part], axis=1))
+    plt.fill_between(times, np.sum(motion_scores[:, :sc_part], axis=1))
 
 figw, ax = plt.subplots(2)
 camw = Camera(figw)
@@ -366,6 +382,8 @@ ax.scatter(env.virtual_array[0, :],
 ax.scatter(rot_array[0, :],
            rot_array[1, :],
            rot_array[2, :], marker='*')
+
+plt.show()
 
 '''
 fig = plt.figure('Ocean3D')
