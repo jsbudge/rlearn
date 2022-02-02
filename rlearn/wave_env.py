@@ -114,10 +114,20 @@ class SinglePulseBackground(Environment):
         self.bf_type = beamform_type
         self.step = 0
 
+        # Hard code in the FFT_Length so we can use it in policy NN
+        self.fft_len = 16384
+
+        # Calculate size of horns to get desired beamwidths
+        # This is an empirically derived rough estimate of radiation function params
+        rad_cons = np.array([4, 3, 2, 1, .01])
+        rad_bws = np.array([4.01, 6, 8.6, 18.33, 33])
+        self.az_fac = np.interp(az_bw / 2, rad_bws, rad_cons)
+        self.el_fac = np.interp(el_bw / 2, rad_bws, rad_cons)
+
         # Antenna array definition
         dr = c0 / 9.6e9
         self.tx_locs = np.array([(0, -dr, 0), (0, dr, 0)]).T
-        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (0, 0, 0)]).T
+        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -168,20 +178,10 @@ class SinglePulseBackground(Environment):
         return self.max_steps
 
     def states(self):
-        return dict(cpi=dict(type='float', shape=(self.nsam, self.cpi_len), min_value=-300, max_value=100),
-                    currscan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
-                    currelscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]),
-                    currwave=dict(type='float', shape=(WAVEPOINTS, self.n_tx), min_value=0, max_value=1),
-                    currfc=dict(type='float', shape=(self.n_tx,), min_value=8e9, max_value=12e9),
-                    currbw=dict(type='float', shape=(self.n_tx,), min_value=10e6, max_value=self.fs / 2 - 5e6))
+        return None
 
     def actions(self):
-        return dict(wave=dict(type='float', shape=(WAVEPOINTS, self.n_tx), min_value=0, max_value=1),
-                    radar=dict(type='float', shape=(1,), min_value=100, max_value=self.maxPRF),
-                    scan=dict(type='float', shape=(1,), min_value=self.az_lims[0], max_value=self.az_lims[1]),
-                    elscan=dict(type='float', shape=(1,), min_value=self.el_lims[0], max_value=self.el_lims[1]),
-                    fc=dict(type='float', shape=(self.n_tx,), min_value=8e9, max_value=12e9),
-                    bw=dict(type='float', shape=(self.n_tx,), min_value=10e6, max_value=self.fs / 2 - 5e6))
+        return None
 
     def execute(self, actions):
         # Calculate times for this CPI based on given PRF
@@ -204,6 +204,9 @@ class SinglePulseBackground(Environment):
         for n in range(self.n_tx):
             chirps[:, n] = self.genChirp(actions['wave'][:, n], self.bw[n]) * actions['power'][n]
         fft_chirp = np.fft.fft(chirps, self.fft_len, axis=0)
+        state_corr = np.fft.fftshift(db(np.fft.ifft(fft_chirp * fft_chirp.conj(), axis=0)), axes=0)
+        state_corr = state_corr - np.max(state_corr, axis=0)[None, :]
+        state_corr[state_corr < -100] = -100
 
         # Generate the CPI using chirps; generates a nsam x cpi_len x n_ants block of FFT data
         cpi = self.genCPI(fft_chirp)
@@ -251,29 +254,29 @@ class SinglePulseBackground(Environment):
                    self.virtual_array.T.dot(np.array([np.cos(ea[0]) * np.sin(ea[1]),
                                                       np.sin(ea[0]) * np.sin(ea[1]), np.cos(ea[1])])) / c0)
 
+        # Get clutter covariance for this CPI
+        # This is used for waveform evaluation and MMSE beamforming, if selected
+        Rx_thresh = np.max(db(curr_cpi[:, 0, :]), axis=1)
+        clutt_ind = np.logical_and(np.median(Rx_thresh) - np.std(Rx_thresh) < Rx_thresh,
+                                   Rx_thresh < np.median(Rx_thresh) + np.std(Rx_thresh))
+        Rx_data = curr_cpi[clutt_ind, 0, :]
+        Rx = (np.cov(Rx_data.T) + np.diag([actions['power'][n[1]] ** 2 for n in self.apc]))
+        clutter_cov = np.corrcoef(Rx_data.T)
+
         if self.bf_type == 'mmse':
             # Generate MMSE beamformer and apply to data
-            # Focus mostly on clutter so as to avoid nulling out targets
-            Rx_thresh = np.max(db(curr_cpi[:, 0, :]), axis=1)
-            window = np.where(Rx_thresh == Rx_thresh.max())[0][0]
-            min_win = window - 10
-            max_win = window + 10
-            guard_sz = 3
-            while min_win < 0 and min_win < window - guard_sz:
-                min_win += 1
-            while max_win > curr_cpi.shape[0] and max_win > window + guard_sz:
-                max_win -= 1
-            Rx_data = np.concatenate(
-                (curr_cpi[min_win:window - guard_sz, 0, :], curr_cpi[window + guard_sz:max_win, 0, :]))
-            Rx = (np.cov(Rx_data.T) + np.diag([actions['power'][n[1]] ** 2 for n in self.apc]))
             Rx_inv = np.linalg.pinv(Rx)
             U = Rx_inv.dot(a)
         elif self.bf_type == 'phased':
+            # Generated phased array weights in indicated direction
             U = a
         else:
+            # This weighting points the beam at 90 degrees
             U = np.ones((self.v_ants,), dtype=np.complex128)
         for tt in range(self.cpi_len):
             beamform[:, tt] = curr_cpi[:, tt, :].dot(U)
+
+        # Put data into Range-Doppler space and window it in Doppler
         beamform = db(np.fft.fft(beamform * taylor(self.cpi_len)[None, :], axis=1))
 
         # Detection of targets
@@ -306,10 +309,6 @@ class SinglePulseBackground(Environment):
             if 0 < truth_rbin < self.nsam:
                 det_sc -= .25
 
-        # Clipping
-        beamform[beamform > self.clipping[1]] = self.clipping[1]
-        beamform[beamform < self.clipping[0]] = self.clipping[0]
-
         self.PRF = actions['radar'][0] + 0.0
 
         # Append everything to the logs, for pretty pictures later
@@ -321,6 +320,7 @@ class SinglePulseBackground(Environment):
 
         # Whole state space to be split into the various agents
         full_state = {'point_angs': np.array([self.az_pt, self.el_pt]),
+                      'wave_corr': state_corr, 'clutter': np.array([clutter_cov.real, clutter_cov.imag]),
                       'currwave': actions['wave'], 'currfc': self.fc, 'currbw': self.bw,
                       'platform_motion': self.env.vel(mid_tf),
                       'target_angs': np.array(ea)}
@@ -335,13 +335,13 @@ class SinglePulseBackground(Environment):
         self.nsam = int((np.ceil((2 * self.env.frange / c0 + self.env.max_pl * self.plp) * TAC) -
                          np.floor(2 * self.env.nrange / c0 * TAC)) * self.fs / TAC)
         self.nr = int(self.env.max_pl * self.plp * self.fs)
-        self.fft_len = findPowerOf2(self.nsam + self.nr)
 
         # Initial wave is pretty much a single tone at center frequency
         init_wave = np.ones((WAVEPOINTS, self.n_tx)) * .5
         init_wave[0:3, :] = .01
         init_wave[-3:, :] = .99
-        return {'point_angs': np.array([0.0, 0.0]),
+        return {'point_angs': np.array([0.0, 0.0]), 'wave_corr': np.zeros((self.fft_len, self.n_tx)),
+                'clutter': np.array([np.eye(self.v_ants), np.zeros((self.v_ants, self.v_ants))]),
                 'currwave': init_wave, 'currfc': [9.6e9 for _ in range(self.n_tx)],
                 'currbw': [self.fs / 2 - 10e6 for _ in range(self.n_tx)],
                 'platform_motion': self.env.vel(0),
@@ -411,7 +411,7 @@ class SinglePulseBackground(Environment):
                 p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc[tx],
                                              self.alt / np.sin(self.dep_ang + self.el_bw / 2) / c0,
                                              self.fs, self.dep_ang, self.env.bg_ext[0], self.env.bg_ext[1],
-                                             self.boresight_ang]),
+                                             self.boresight_ang, self.az_fac, self.el_fac]),
                                    dtype=np.float64)
                 chirp_gpu = cupy.array(np.tile(chirp[:, tx], (self.cpi_len, 1)).T, dtype=np.complex128)
                 postx_gpu = cupy.array(np.ascontiguousarray(p_pos + rot_txlocs[:, tx][:, None]),
@@ -476,7 +476,7 @@ class SinglePulseBackground(Environment):
             p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc[tx],
                                          self.alt / np.sin(self.dep_ang + self.el_bw / 2) / c0,
                                          self.fs, self.dep_ang, block_init * self.fs / c0, self.det_sz,
-                                         self.boresight_ang]),
+                                         self.boresight_ang, self.az_fac, self.el_fac]),
                                dtype=np.float64)
             chirp_gpu = cupy.array(np.tile(chirp[:, tx], (n_dets, 1)).T, dtype=np.complex128)
             postx_gpu = cupy.array(

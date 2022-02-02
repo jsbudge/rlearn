@@ -34,9 +34,9 @@ def interp(x, y, tt, bg):
 
 
 @cuda.jit(device=True)
-def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, el, k):
-    a = .01 / k * (2 * np.pi)
-    b = .01 / k * (2 * np.pi)
+def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, el, k, a_k, b_k):
+    a = a_k / k * (2 * np.pi)
+    b = b_k / k * (2 * np.pi)
     el_tx = math.asin(-s_tz / rngtx)
     az_tx = math.atan2(s_ty, s_tx)
     eldiff = diff(el_tx, el)
@@ -61,9 +61,9 @@ def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, 
 
 
 # CPU version
-def applyRadiationPatternCPU(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, el, k):
-    a = .01 / k * (2 * np.pi)
-    b = .01 / k * (2 * np.pi)
+def applyRadiationPatternCPU(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, el, k, a_k=3, b_k=.01):
+    a = a_k / k * (2 * np.pi)
+    b = b_k / k * (2 * np.pi)
     el_tx = np.arcsin(-s_tz / rngtx)
     az_tx = np.arctan2(s_ty, s_tx)
     eldiff = cpudiff(el_tx, el) if el_tx != el else 1e-9
@@ -129,7 +129,8 @@ def genRangeProfile(pathrx, pathtx, gp, pan, el, bg, pd_r, pd_i, params):
             ref_z = 2 * rnorm * .0001 / nnorm - s_tz / rngtx
             # Dot product of wave with Rx vector
             gv = abs(ref_x * s_rx / rngrx + ref_y * s_ry / rngrx + ref_z * s_rz / rngrx)
-            att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, pan[tt], el[tt], wavenumber)
+            att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, pan[tt], el[tt],
+                                        wavenumber, params[9], params[10])
             acc_val = gv * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
             cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
             cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
@@ -179,7 +180,7 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, bg, pd_r, pd_i, params):
                 but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
                 if n_samples > but > 0:
                     att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx,
-                                                pan[tt], el[tt], wavenumber)
+                                                pan[tt], el[tt], wavenumber, params[9], params[10])
                     acc_val = spow * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
                     cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
                     cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
@@ -201,7 +202,8 @@ def getDetectionCheck(pathtx, subs, pd_r, pd_i, pan, el, det_spread, params):
         s_ty = sub_y - pathtx[1, tt]
         s_tz = sub_z - pathtx[2, tt]
         rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz) + c0 / params[4]
-        att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_tx, s_ty, s_tz, rngtx, pan[tt], el[tt], wavenumber)
+        att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_tx, s_ty, s_tz, rngtx, pan[tt], el[tt],
+                                    wavenumber, params[9], params[10])
         acc_val = att * cmath.exp(1j * wavenumber * rngtx) * 1 / (rngtx * rngtx)
 
         # Find exact spot in detection chunk to place pulse

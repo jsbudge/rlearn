@@ -11,6 +11,9 @@ from celluloid import Camera
 from tftb.processing import WignerVilleDistribution
 from cuda_kernels import applyRadiationPatternCPU
 
+# Set the heap memory allotment to 1 GB (this is way more than we need)
+cupy.get_default_memory_pool().set_limit(size=1024**3)
+
 c0 = 299792458.0
 TAC = 125e6
 fs = 2e9
@@ -36,20 +39,36 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 600
-eval_games = 10
-max_timesteps = 128
+games = 3
+eval_games = 1
+max_timesteps = 100
 batch_sz = 64
 feedback_train = False
+
+# Parameters for the environment (and therefore the agents)
+cpi_len = 64
+az_bw = 30
+el_bw = 36
+dep_ang = np.random.uniform(45, 60)
+boresight_ang = np.random.uniform(80, 100)
+altitude = np.random.uniform(1000, 1600)
+plp = .5
+env_samples = 200000
+fs_decimation = 4
+az_lim = 90
+el_lim = 20
+beamform_type = 'mmse'
 
 print('Initial memory on GPU:')
 print(f'Memory: {cupy.get_default_memory_pool().used_bytes()} / {cupy.get_default_memory_pool().total_bytes()}')
 print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} free blocks')
 
 # Pre-defined or custom environment
-env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90,
-                            altitude=1524, plp=.5, env_samples=200000, fs_decimation=8, az_lim=90, el_lim=20,
-                            beamform_type='phased')
+env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=cpi_len, az_bw=az_bw, el_bw=el_bw, dep_ang=dep_ang,
+                            boresight_ang=boresight_ang,
+                            altitude=altitude, plp=plp, env_samples=env_samples, fs_decimation=fs_decimation,
+                            az_lim=az_lim, el_lim=el_lim,
+                            beamform_type=beamform_type)
 
 # Define preprocessing layer (just a normalization)
 state_prelayer = [dict(type='linear_normalization'),
@@ -61,12 +80,12 @@ seq_layer = [dict(type='sequence', length=4)]
 # Define states for different agents
 wave_state = dict(currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
                                 max_value=1),
+                  wave_corr=dict(type='float', shape=(env.fft_len, env.n_tx), min_value=-100, max_value=0),
                   currfc=dict(type='float', shape=(env.n_tx,), min_value=8e9,
                               max_value=12e9),
                   currbw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
                               max_value=env.fs / 2 - 5e6),
-                  platform_motion=dict(type='float', shape=(3,),
-                                       min_value=-200, max_value=200))
+                  clutter=dict(type='float', shape=(2, env.v_ants, env.v_ants), min_value=-1, max_value=1))
 motion_state = dict(point_angs=dict(type='float', shape=(2,), min_value=min([env.az_lims[0], env.el_lims[0]]),
                                     max_value=max([env.az_lims[1], env.el_lims[1]])),
                     platform_motion=dict(type='float', shape=(3,),
@@ -94,14 +113,14 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
                           actions=wave_action,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
                           learning_rate=1e-4,
-                          memory=max_timesteps, exploration=.005, entropy_regularization=5.0)
+                          memory=max_timesteps, exploration=.5, entropy_regularization=5.0)
 
 # Instantiate motion agent
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
                             state_preprocessing=state_prelayer + seq_layer,
-                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-2,
-                            memory=max_timesteps, exploration=.003,
+                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=5e-3,
+                            memory=max_timesteps, exploration=.03,
                             horizon=10)
 
 # Training regimen
@@ -110,11 +129,11 @@ reward_track = np.zeros(games)
 for episode in tqdm(range(games)):
 
     # Episode using act and observe
-    env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18,
-                                dep_ang=np.random.uniform(40, 60),
-                                boresight_ang=np.random.uniform(80, 100), altitude=np.random.uniform(1000, 2000),
-                                plp=.5, env_samples=200000, fs_decimation=8, az_lim=90, el_lim=20,
-                                beamform_type='mmse')
+    env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=cpi_len, az_bw=az_bw, el_bw=el_bw, dep_ang=dep_ang,
+                                boresight_ang=boresight_ang,
+                                altitude=altitude, plp=plp, env_samples=env_samples, fs_decimation=fs_decimation,
+                                az_lim=az_lim, el_lim=el_lim,
+                                beamform_type=beamform_type)
     states = env.reset()
     terminal = False
     sum_rewards = 0.0
@@ -271,7 +290,7 @@ for l in logs:
             E = 1
             Y[az_a, el_a] = l[7].dot(va_u) * applyRadiationPatternCPU(*du, 1, *du, 1,
                                                      1e-9, 1e-9,
-                                                     2 * np.pi * 9.6e9 / c0)
+                                                     2 * np.pi * 9.6e9 / c0, env.az_fac, env.el_fac)
     Y = db(Y)
     Y = Y - Y.max()
     # fig, axes = plt.subplots(3)
@@ -330,11 +349,13 @@ plt.title('Wave Agent')
 for sc_part in range(wave_scores.shape[1], 0, -1):
     plt.plot(times, np.sum(wave_scores[:, :sc_part], axis=1))
     plt.fill_between(times, np.sum(wave_scores[:, :sc_part], axis=1))
+plt.legend(['Detection', 'Detected', 'Ambiguity'])
 plt.subplot(2, 1, 2)
 plt.title('Motion Agent')
 for sc_part in range(motion_scores.shape[1], 0, -1):
     plt.plot(times, np.sum(motion_scores[:, :sc_part], axis=1))
     plt.fill_between(times, np.sum(motion_scores[:, :sc_part], axis=1))
+plt.legend(['Detection', 'Pointing', 'PRF Agility'])
 
 figw, ax = plt.subplots(2)
 camw = Camera(figw)
