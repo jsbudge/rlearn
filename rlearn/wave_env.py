@@ -634,9 +634,22 @@ class Platform(object):
         dt = t[1] - t[0]
         nvs = self.vlog[:, -1][:, None] + np.cumsum(self.avec(t) * dt, axis=0)
         nps = self.plog[:, -1][:, None] + np.cumsum(nvs, axis=0)
-        self.plog = np.concatenate((self.plog, nps[:, ::2]), axis=1)
-        self.vlog = np.concatenate((self.vlog, nvs[:, ::2]), axis=1)
-        self.tlog = np.concatenate((self.tlog, t[::2]))
+
+        # Concatenate with old logs
+        self.plog = np.concatenate((self.plog, nps), axis=1)
+        self.vlog = np.concatenate((self.vlog, nvs), axis=1)
+        self.tlog = np.concatenate((self.tlog, t))
+
+        if len(self.tlog) > 512 and self.tlog[-1] - self.tlog[0] > .1:
+            # Decimate everything since we don't need such high fidelity for the interpolation
+            new_tlog = np.arange(self.tlog[0], self.tlog[-1], .1)
+            self.plog = np.array([np.interp(new_tlog, self.tlog, self.plog[0, :]),
+                                  np.interp(new_tlog, self.tlog, self.plog[1, :]),
+                                  np.interp(new_tlog, self.tlog, self.plog[2, :])])
+            self.vlog = np.array([np.interp(new_tlog, self.tlog, self.vlog[0, :]),
+                                  np.interp(new_tlog, self.tlog, self.vlog[1, :]),
+                                  np.interp(new_tlog, self.tlog, self.vlog[2, :])])
+            self.tlog = new_tlog
         self.spd = np.linalg.norm(nvs, axis=0).mean()
         return nps
 
@@ -687,10 +700,19 @@ class Sub(object):
             nvs[:, nvs_norm > MAX_ALFA_SPEED] * MAX_ALFA_SPEED / nvs_norm[nvs_norm > MAX_ALFA_SPEED]
         nps = self.plog[:, -1][:, None] + np.cumsum(nvs, axis=0)
 
-        # Decimate the logs so we don't have so much junk in memory
-        self.plog = np.concatenate((self.plog, nps[:, ::2]), axis=1)
-        self.vlog = np.concatenate((self.vlog, nvs[:, ::2]), axis=1)
-        self.tlog = np.concatenate((self.tlog, t[::2]))
+        # Concatenate with old logs
+        self.plog = np.concatenate((self.plog, nps), axis=1)
+        self.vlog = np.concatenate((self.vlog, nvs), axis=1)
+        self.tlog = np.concatenate((self.tlog, t))
+
+        if len(self.tlog) > 512 and self.tlog[-1] - self.tlog[0] > .1:
+            # Decimate everything since we don't need such high fidelity for the interpolation
+            new_tlog = np.arange(self.tlog[0], self.tlog[-1], .1)
+            self.plog = np.array([np.interp(new_tlog, self.tlog, self.plog[0, :]),
+                                  np.interp(new_tlog, self.tlog, self.plog[1, :])])
+            self.vlog = np.array([np.interp(new_tlog, self.tlog, self.vlog[0, :]),
+                                  np.interp(new_tlog, self.tlog, self.vlog[1, :])])
+            self.tlog = new_tlog
         return nps
 
     def pos(self, t):
