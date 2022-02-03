@@ -39,11 +39,12 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 3
+games = 1
 eval_games = 1
-max_timesteps = 100
-batch_sz = 64
+max_timesteps = 64
+batch_sz = 32
 feedback_train = False
+ocean_debug = False
 
 # Parameters for the environment (and therefore the agents)
 cpi_len = 64
@@ -53,8 +54,8 @@ dep_ang = np.random.uniform(45, 60)
 boresight_ang = np.random.uniform(80, 100)
 altitude = np.random.uniform(1000, 1600)
 plp = .5
-env_samples = 200000
-fs_decimation = 4
+env_samples = 500000
+fs_decimation = 8
 az_lim = 90
 el_lim = 20
 beamform_type = 'mmse'
@@ -119,7 +120,7 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
                             state_preprocessing=state_prelayer + seq_layer,
-                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=5e-3,
+                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-3,
                             memory=max_timesteps, exploration=.03,
                             horizon=10)
 
@@ -186,7 +187,7 @@ print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} f
 logs = env.log
 log_num = 10
 
-nr = int((env.env.max_pl * env.plp) * env.fs)
+nr = int(((env.env.nrange * 2 / c0 - 1 / TAC) * .99 * env.plp) * env.fs)
 back_noise = np.random.rand(max(nr, 5000)) - .5 + 1j * (np.random.rand(max(nr, 5000)) - .5)
 
 if len(reward_track) >= 5:
@@ -224,7 +225,7 @@ cols = ['red', 'blue', 'green', 'orange', 'yellow', 'purple', 'black', 'cyan']
 fig = plt.figure()
 gs = gridspec.GridSpec(3, 3)
 axes = [plt.subplot(gs[0, 0], projection='polar'), plt.subplot(gs[0, 1]), plt.subplot(gs[0, 2], projection='polar'),
-        plt.subplot(gs[1, :]), plt.subplot(gs[2, :2]), plt.subplot(gs[2, 2])]
+        plt.subplot(gs[1, :]), plt.subplot(gs[2, :])]
 # Calc Doppler shifts and velocities
 camera = Camera(fig)
 for l in logs:
@@ -235,15 +236,12 @@ for l in logs:
 
     # Draw the beam direction and platform
     axes[3].scatter(fpos[0], fpos[1], marker='*', c='blue')
-    beam_dir = np.exp(1j * az_bm) * fpos[2] / np.tan(el_bm)
-    axes[3].arrow(fpos[0], fpos[1], beam_dir.real, beam_dir.imag)
-    if len(l[6]) > 0:
-        t_dir = np.exp(1j * (l[6][0] + env.boresight_ang)) * fpos[2] / np.tan(el_bm)
-        axes[3].arrow(fpos[0], fpos[1], t_dir.real, t_dir.imag)
+    beam_dir = np.exp(-1j * az_bm) * fpos[2] / np.tan(el_bm)
+    axes[3].arrow(fpos[0], fpos[1], -beam_dir.real, -beam_dir.imag)
 
     # Draw the targets
     t_vec = None
-    for idx, s in enumerate(env.env.targets):
+    for idx, s in enumerate(env.targets):
         pos = []
         amp = []
         pcols = []
@@ -305,18 +303,25 @@ for l in logs:
     axes[0].scatter(az_to_target, 1, c='red')
     axes[2].plot(el_angs, Y[:, abs(el_angs - el_to_target) == abs(el_angs - el_to_target).min()].flatten(), c='blue')
     axes[2].scatter(el_to_target, 1, c='red')
+    camera.snap()
+animation = camera.animate(interval=250)
 
-    # Draw the RD maps for each antenna
+wave_fig, wave_ax = plt.subplots(2)
+wavecam = Camera(wave_fig)
+wave_ax[0].set_ylim([-30, 1])
+freqs = np.fft.fftshift(np.fft.fftfreq(env.fft_len, 1 / env.fs))
+for l in logs:
     for ant in range(env.n_tx):
-        axes[5].plot(db(
+        spect = np.fft.fftshift(db(
             np.fft.fft(
                 genPulse(np.linspace(0, 1, len(l[5][:, ant])), l[5][:, ant], env.nr, env.nr / env.fs,
                          env.fc[ant], env.bw[ant]),
-                env.fft_len)), c=cols[ant])
-    camera.snap()
-
-animation = camera.animate(interval=250)
-# animation.save('test.mp4')
+                env.fft_len)))
+        spect = spect - spect.max()
+        wave_ax[0].plot(freqs, spect, c=cols[ant])
+        wave_ax[1].plot(l[5][:, ant], c=cols[ant])
+    wavecam.snap()
+wave_animation = wavecam.animate(interval=250)
 
 plt.figure('Ambiguity')
 cmin = None
@@ -357,42 +362,42 @@ for sc_part in range(motion_scores.shape[1], 0, -1):
     plt.fill_between(times, np.sum(motion_scores[:, :sc_part], axis=1))
 plt.legend(['Detection', 'Pointing', 'PRF Agility'])
 
-figw, ax = plt.subplots(2)
-camw = Camera(figw)
-xx, yy = np.meshgrid(np.linspace(0, env.env.eswath, 250), np.linspace(0, env.env.swath, 250))
-bgpts = np.array([xx.flatten(), yy.flatten()])
-for l in logs:
-    gv, gz = env.env.getBG(bgpts.T, l[2][0])
-    p_pos = env.env.pos(l[2][0])
-    pn = p_pos / np.linalg.norm(p_pos)
-    rd = 2 * np.dot(gv, pn)[:, None] * gv - pn[None, :]
-    illum = np.dot(rd, pn)
-    illum[illum < 0] = 0
-    ax[0].imshow(gz.reshape(xx.shape), extent=[0, env.env.swath, 0, env.env.eswath])
-    ax[1].imshow(illum.reshape(xx.shape), extent=[0, env.env.swath, 0, env.env.eswath])
-    plt.axis('off')
-    for idx, s in enumerate(env.env.targets):
-        pos = []
-        amp = []
-        pcols = []
-        for t in l[2]:
-            spow, loc1, loc2 = s(t)
-            pos.append([loc1, loc2])
-            amp.append(spow + 1)
-            pcols.append(cols[idx])
-        pos = np.array(pos)
-        if len(pos) > 0:
-            ax[0].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
-            plt_rng = 2 * (np.linalg.norm(env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
-                           np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
-                (l[2][-1] - l[2][0])
-            ax[0].text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='black')
-    ax[0].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
-    ax[0].axis('off')
-    camw.snap()
-
-animw = camw.animate(interval=250)
-animw.save('ocean.mp4')
+# Ocean waves, for pretty picture and debugging
+if ocean_debug:
+    figw, ax = plt.subplots(2)
+    camw = Camera(figw)
+    xx, yy = np.meshgrid(np.linspace(0, env.env.eswath, 250), np.linspace(0, env.env.swath, 250))
+    bgpts = np.array([xx.flatten(), yy.flatten()])
+    for l in logs:
+        gv, gz = env.getBG(bgpts.T, l[2][0])
+        p_pos = env.env.pos(l[2][0])
+        pn = p_pos / np.linalg.norm(p_pos)
+        rd = 2 * np.dot(gv, pn)[:, None] * gv - pn[None, :]
+        illum = np.dot(rd, pn)
+        illum[illum < 0] = 0
+        ax[0].imshow(gz.reshape(xx.shape), extent=[0, env.env.swath, 0, env.env.eswath])
+        ax[1].imshow(illum.reshape(xx.shape), extent=[0, env.env.swath, 0, env.env.eswath])
+        plt.axis('off')
+        for idx, s in enumerate(env.targets):
+            pos = []
+            amp = []
+            pcols = []
+            for t in l[2]:
+                spow, loc1, loc2 = s(t)
+                pos.append([loc1, loc2])
+                amp.append(spow + 1)
+                pcols.append(cols[idx])
+            pos = np.array(pos)
+            if len(pos) > 0:
+                ax[0].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
+                plt_rng = 2 * (np.linalg.norm(env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
+                               np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
+                    (l[2][-1] - l[2][0])
+                ax[0].text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='black')
+        ax[0].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
+        ax[0].axis('off')
+        camw.snap()
+    animw = camw.animate(interval=250)
 
 plt.figure('VA positions')
 ax = plt.subplot(111, projection='3d')
@@ -405,35 +410,3 @@ ax.scatter(rot_array[0, :],
            rot_array[2, :], marker='*')
 
 plt.show()
-
-'''
-fig = plt.figure('Ocean3D')
-xx, yy = np.meshgrid(np.linspace(0, env.env.eswath, 1500), np.linspace(0, env.env.swath, 1500))
-bgpts = np.array([xx.flatten(), yy.flatten()])
-gv, gz = env.env.getBG(bgpts.T, l[2][0])
-disp_oc = fftconvolve(gz.reshape(xx.shape), np.ones((30, 30)) / (30**2), mode='same')
-ax3d = fig.add_subplot(1, 2, 1, projection='3d')
-ax = fig.add_subplot(1, 2, 2)
-ax3d.plot_surface(xx, yy, disp_oc, rstride=10, cstride=10, cmap='ocean')
-ax3d.set_zlim([-1, 10])
-im2d = ax.imshow(disp_oc, extent=[0, env.env.swath, 0, env.env.eswath], cmap='ocean')
-ax.set_ylabel('Northing (m)')
-ax.set_xlabel('Easting (m)')
-plt.colorbar(ScalarMappable(cmap='ocean'), ax=ax, fraction=.046, pad=.04)
-pos = []
-amp = []
-pcols = []
-for t in l[2]:
-    spow, loc1, loc2 = s(t)
-    pos.append([loc1, loc2])
-    amp.append(spow + 1)
-    pcols.append(cols[idx])
-pos = np.array(pos)
-if len(pos) > 0:
-    ax.scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
-    plt_rng = 2 * (np.linalg.norm(env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
-                   np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
-              (l[2][-1] - l[2][0])
-    ax.text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='white')
-plt.tight_layout()
-'''

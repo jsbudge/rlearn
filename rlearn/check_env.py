@@ -35,7 +35,7 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-max_timesteps = 100
+max_timesteps = 40
 
 # Pre-defined or custom environment
 env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90,
@@ -65,7 +65,7 @@ for step in tqdm(range(max_timesteps)):
 logs = env.log
 log_num = 10
 
-nr = int((env.env.max_pl * env.plp) * env.fs)
+nr = int(((env.env.nrange * 2 / c0 - 1 / TAC) * .99 * env.plp) * env.fs)
 back_noise = np.random.rand(max(nr, 5000)) - .5 + 1j * (np.random.rand(max(nr, 5000)) - .5)
 
 plt.figure('RC Pulse Width')
@@ -95,7 +95,7 @@ cols = ['red', 'blue', 'green', 'orange', 'yellow', 'purple', 'black', 'cyan']
 fig = plt.figure()
 gs = gridspec.GridSpec(3, 3)
 axes = [plt.subplot(gs[0, 0], projection='polar'), plt.subplot(gs[0, 1]), plt.subplot(gs[0, 2], projection='polar'),
-        plt.subplot(gs[1, :]), plt.subplot(gs[2, :2]), plt.subplot(gs[2, 2])]
+        plt.subplot(gs[1, :]), plt.subplot(gs[2, :])]
 # Calc Doppler shifts and velocities
 camera = Camera(fig)
 for l in logs:
@@ -106,15 +106,12 @@ for l in logs:
 
     # Draw the beam direction and platform
     axes[3].scatter(fpos[0], fpos[1], marker='*', c='blue')
-    beam_dir = np.exp(1j * az_bm) * fpos[2] / np.tan(el_bm)
-    axes[3].arrow(fpos[0], fpos[1], beam_dir.real, beam_dir.imag)
-    if len(l[6]) > 0:
-        t_dir = np.exp(1j * (l[6][0] + env.boresight_ang)) * fpos[2] / np.tan(el_bm)
-        axes[3].arrow(fpos[0], fpos[1], t_dir.real, t_dir.imag)
+    beam_dir = np.exp(-1j * az_bm) * fpos[2] / np.tan(el_bm)
+    axes[3].arrow(fpos[0], fpos[1], -beam_dir.real, -beam_dir.imag)
 
     # Draw the targets
     t_vec = None
-    for idx, s in enumerate(env.env.targets):
+    for idx, s in enumerate(env.targets):
         pos = []
         amp = []
         pcols = []
@@ -161,7 +158,7 @@ for l in logs:
             E = 1
             Y[az_a, el_a] = l[7].dot(va_u) * applyRadiationPatternCPU(*du, 1, *du, 1,
                                                      1e-9, 1e-9,
-                                                     2 * np.pi * 9.6e9 / c0)
+                                                     2 * np.pi * 9.6e9 / c0, env.az_fac, env.el_fac)
     Y = db(Y)
     Y = Y - Y.max()
     # fig, axes = plt.subplots(3)
@@ -176,18 +173,25 @@ for l in logs:
     axes[0].scatter(az_to_target, 1, c='red')
     axes[2].plot(el_angs, Y[:, abs(el_angs - el_to_target) == abs(el_angs - el_to_target).min()].flatten(), c='blue')
     axes[2].scatter(el_to_target, 1, c='red')
+    camera.snap()
+animation = camera.animate(interval=250)
 
-    # Draw the RD maps for each antenna
+wave_fig, wave_ax = plt.subplots(2)
+wavecam = Camera(wave_fig)
+wave_ax[0].set_ylim([-30, 1])
+freqs = np.fft.fftshift(np.fft.fftfreq(env.fft_len, 1 / env.fs))
+for l in logs:
     for ant in range(env.n_tx):
-        axes[5].plot(db(
+        spect = np.fft.fftshift(db(
             np.fft.fft(
                 genPulse(np.linspace(0, 1, len(l[5][:, ant])), l[5][:, ant], env.nr, env.nr / env.fs,
                          env.fc[ant], env.bw[ant]),
-                env.fft_len)), c=cols[ant])
-    camera.snap()
-
-animation = camera.animate(interval=250)
-# animation.save('test.mp4')
+                env.fft_len)))
+        spect = spect - spect.max()
+        wave_ax[0].plot(freqs, spect, c=cols[ant])
+        wave_ax[1].plot(l[5][:, ant], c=cols[ant])
+    wavecam.snap()
+wave_animation = wavecam.animate(interval=250)
 
 plt.figure('Ambiguity')
 cmin = None
@@ -212,18 +216,28 @@ for x in range(env.n_tx):
 plt.tight_layout()
 
 plt.figure('Rewards')
-scores = np.array([l[1] for l in logs])
+wave_scores = np.array([l[1][0] for l in logs])
+motion_scores = np.array([l[1][1] for l in logs])
 times = np.array([l[2][0] for l in logs])
-for sc_part in range(scores.shape[1] + 1, -1, -1):
-    plt.plot(times, np.sum(scores[:, :sc_part], axis=1))
-    plt.fill_between(times, np.sum(scores[:, :sc_part], axis=1))
+plt.subplot(2, 1, 1)
+plt.title('Wave Agent')
+for sc_part in range(wave_scores.shape[1], 0, -1):
+    plt.plot(times, np.sum(wave_scores[:, :sc_part], axis=1))
+    plt.fill_between(times, np.sum(wave_scores[:, :sc_part], axis=1))
+plt.legend(['Detection', 'Detected', 'Ambiguity'])
+plt.subplot(2, 1, 2)
+plt.title('Motion Agent')
+for sc_part in range(motion_scores.shape[1], 0, -1):
+    plt.plot(times, np.sum(motion_scores[:, :sc_part], axis=1))
+    plt.fill_between(times, np.sum(motion_scores[:, :sc_part], axis=1))
+plt.legend(['Detection', 'Pointing', 'PRF Agility'])
 
 figw, ax = plt.subplots(2)
 camw = Camera(figw)
 xx, yy = np.meshgrid(np.linspace(0, env.env.eswath, 250), np.linspace(0, env.env.swath, 250))
 bgpts = np.array([xx.flatten(), yy.flatten()])
 for l in logs:
-    gv, gz = env.env.getBG(bgpts.T, l[2][0])
+    gv, gz = env.getBG(bgpts.T, l[2][0])
     p_pos = env.env.pos(l[2][0])
     pn = p_pos / np.linalg.norm(p_pos)
     rd = 2 * np.dot(gv, pn)[:, None] * gv - pn[None, :]
@@ -232,7 +246,7 @@ for l in logs:
     ax[0].imshow(gz.reshape(xx.shape), extent=[0, env.env.swath, 0, env.env.eswath])
     ax[1].imshow(illum.reshape(xx.shape), extent=[0, env.env.swath, 0, env.env.eswath])
     plt.axis('off')
-    for idx, s in enumerate(env.env.targets):
+    for idx, s in enumerate(env.targets):
         pos = []
         amp = []
         pcols = []

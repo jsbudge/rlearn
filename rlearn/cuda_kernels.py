@@ -157,33 +157,23 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, bg, pd_r, pd_i, params):
         sub_z = subs[subnum, tt, 0] + tz
 
         # Get LOS vector in XYZ and spherical coordinates at pulse time
-        xpts = 21
-        ypts = 11
-        sub_length = 10.0
-        sub_width = 2.5
-        for n in range(xpts):
-            for m in range(ypts):
-                shift_x = sub_x + (n - xpts // 2) / (xpts // 2) * sub_length * sub_sin
-                shift_y = sub_y + sub_width / sub_length * math.sqrt(
-                    sub_length * sub_length - ((n - xpts // 2) / (xpts // 2) * sub_length) *
-                    ((n - xpts // 2) / (xpts // 2) * sub_length)) * sub_cos * (m - ypts // 2) / (ypts // 2)
-                s_tx = shift_x - pathtx[0, tt]
-                s_ty = shift_y - pathtx[1, tt]
-                s_tz = sub_z - pathtx[2, tt]
-                rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz) + c0 / params[4]
-                s_rx = shift_x - pathrx[0, tt]
-                s_ry = shift_y - pathrx[1, tt]
-                s_rz = sub_z - pathrx[2, tt]
-                rngrx = math.sqrt(s_rx * s_rx + s_ry * s_ry + s_rz * s_rz) + c0 / params[4]
-                rng = (rngtx + rngrx)
-                rng_bin = (rng / c0 - 2 * params[3]) * params[4]
-                but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
-                if n_samples > but > 0:
-                    att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx,
-                                                pan[tt], el[tt], wavenumber, params[9], params[10])
-                    acc_val = spow * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
-                    cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
-                    cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
+        s_tx = sub_x - pathtx[0, tt]
+        s_ty = sub_y - pathtx[1, tt]
+        s_tz = sub_z - pathtx[2, tt]
+        rngtx = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz) + c0 / params[4]
+        s_rx = sub_x - pathrx[0, tt]
+        s_ry = sub_y - pathrx[1, tt]
+        s_rz = sub_z - pathrx[2, tt]
+        rngrx = math.sqrt(s_rx * s_rx + s_ry * s_ry + s_rz * s_rz) + c0 / params[4]
+        rng = (rngtx + rngrx)
+        rng_bin = (rng / c0 - 2 * params[3]) * params[4]
+        but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
+        if n_samples > but > 0:
+            att = applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx,
+                                        pan[tt], el[tt], wavenumber, params[9], params[10])
+            acc_val = spow * att * cmath.exp(-1j * wavenumber * rng) * 1 / (rng * rng)
+            cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
+            cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
 
 @cuda.jit()
