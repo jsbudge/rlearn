@@ -119,7 +119,7 @@ class SinglePulseBackground(Environment):
         # Set up logger, if wanted
         if log:
             tm = time.gmtime()
-            fnme = f'./{tm.tm_year}{tm.tm_mon}{tm.tm_mday}{tm.tm_hour}{tm.tm_min}{tm.tm_sec}_run.log'
+            fnme = f'./logs/{tm.tm_year}{tm.tm_mon}{tm.tm_mday}{tm.tm_hour}{tm.tm_min}{tm.tm_sec}_run.log'
             basicConfig(filename=fnme, filemode='w', format='%(levelname)s - %(message)s', level=20)
         self.log = log
 
