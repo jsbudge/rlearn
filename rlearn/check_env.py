@@ -40,7 +40,7 @@ max_timesteps = 40
 # Pre-defined or custom environment
 env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90,
                             altitude=1524, plp=.5, env_samples=500000, fs_decimation=8, az_lim=90, el_lim=20,
-                            beamform_type='phased')
+                            beamform_type='phased', initial_velocity=(10, 0))
 linear = np.zeros((100, env.n_tx))
 linear[:, 0] = np.linspace(0, 1, 100)
 linear[:, 1] = np.linspace(1, 0, 100)
@@ -52,9 +52,10 @@ for step in tqdm(range(max_timesteps)):
                    fc=np.array([9.6e9 for _ in range(env.n_tx)]),
                    bw=np.array([env.fs / 2 for _ in range(env.n_tx)]),
                    power=np.array([1 for _ in range(env.n_tx)]),
-                   radar=np.array([500]),
+                   radar=np.array([300]),
                     scan=np.array([0]),
-                    elscan=np.array([0]))
+                    elscan=np.array([0]),
+                   motion=np.array([1, 1]))
     states, terminal, reward = env.execute(actions=actions)
 '''
 -------------------------------------------------------------------------------------------

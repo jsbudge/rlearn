@@ -41,9 +41,8 @@ def sliding_window(data, win_size, func=None):
 
 games = 1
 eval_games = 1
-max_timesteps = 64
-batch_sz = 32
-feedback_train = False
+max_timesteps = 4000
+batch_sz = 64
 ocean_debug = False
 
 # Parameters for the environment (and therefore the agents)
@@ -53,12 +52,18 @@ el_bw = 36
 dep_ang = np.random.uniform(45, 60)
 boresight_ang = np.random.uniform(80, 100)
 altitude = np.random.uniform(1000, 1600)
+pos = (np.random.uniform(-4000, 4000), np.random.uniform(-4000, 4000))
+vel = (np.random.uniform(-10, 10), np.random.uniform(-10, 10))
 plp = .5
-env_samples = 500000
+env_samples = 200000
 fs_decimation = 8
 az_lim = 90
 el_lim = 20
 beamform_type = 'mmse'
+
+spd = np.sqrt(vel[0]**2 + vel[1]**2)
+if spd > 10.0:
+    vel = (vel[0] * 10 / spd, vel[1] * 10 / spd)
 
 print('Initial memory on GPU:')
 print(f'Memory: {cupy.get_default_memory_pool().used_bytes()} / {cupy.get_default_memory_pool().total_bytes()}')
@@ -69,7 +74,7 @@ env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=cpi_len, az_bw=
                             boresight_ang=boresight_ang,
                             altitude=altitude, plp=plp, env_samples=env_samples, fs_decimation=fs_decimation,
                             az_lim=az_lim, el_lim=el_lim,
-                            beamform_type=beamform_type)
+                            beamform_type=beamform_type, initial_pos=pos, initial_velocity=vel, log=True)
 
 # Define preprocessing layer (just a normalization)
 state_prelayer = [dict(type='linear_normalization'),
@@ -106,7 +111,8 @@ motion_action = dict(radar=dict(type='float', shape=(1,), min_value=env.PRFrange
                      scan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
                                max_value=env.az_lims[1]),
                      elscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
-                                 max_value=env.el_lims[1]))
+                                 max_value=env.el_lims[1]),
+                     motion=dict(type='float', shape=(2,), min_value=-5.0, max_value=5.0))
 
 # Instantiate wave agent
 print('Initializing agents...')
@@ -129,12 +135,6 @@ print('Beginning training...')
 reward_track = np.zeros(games)
 for episode in tqdm(range(games)):
 
-    # Episode using act and observe
-    env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=cpi_len, az_bw=az_bw, el_bw=el_bw, dep_ang=dep_ang,
-                                boresight_ang=boresight_ang,
-                                altitude=altitude, plp=plp, env_samples=env_samples, fs_decimation=fs_decimation,
-                                az_lim=az_lim, el_lim=el_lim,
-                                beamform_type=beamform_type)
     states = env.reset()
     terminal = False
     sum_rewards = 0.0
