@@ -3,7 +3,7 @@ import time
 import cupyx.scipy.signal
 from tensorforce import Environment
 import numpy as np
-from music import MUSIC
+# from music import MUSIC
 from tqdm import tqdm
 from scipy.signal.windows import taylor
 from scipy.optimize import minimize
@@ -51,7 +51,6 @@ DTR = np.pi / 180
 
 MAX_ALFA_ACCEL = 0.35185185185185186
 MAX_ALFA_SPEED = 2.577
-EP_LEN_S = 30
 WAVEPOINTS = 100
 
 
@@ -91,7 +90,8 @@ class SinglePulseBackground(Environment):
 
     def __init__(self, max_timesteps=128, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90, altitude=1524,
                  plp=.5, env_samples=100000, fs_decimation=8, az_lim=90, el_lim=10, beamform_type='mmse',
-                 initial_pos=(0, 0), initial_velocity=(0, 0), log=False):
+                 initial_pos=(0, 0), initial_velocity=(0, 0), det_model=None, par_model=None, log=False,
+                 mdl_feedback=False):
         super().__init__()
         self.cpi_len = cpi_len
         self.az_bw = az_bw * DTR
@@ -109,18 +109,19 @@ class SinglePulseBackground(Environment):
         self.curr_cpi = None
         self.max_steps = max_timesteps
         self.bf_type = beamform_type
-        self.bg_ext = (128, 128)
-        self.PRFrange = (50, 500)
+        self.bg_ext = (32, 32)
+        self.PRFrange = (50, 1500)
         self.step = 0
         self.succ_det = 0
         self.v0 = initial_velocity
         self.p0 = initial_pos
+        self.box = (-2000, 2000, -2000, 2000)
 
         # Set up logger, if wanted
         if log:
             tm = time.gmtime()
             fnme = f'./logs/{tm.tm_year}{tm.tm_mon}{tm.tm_mday}{tm.tm_hour}{tm.tm_min}{tm.tm_sec}_run.log'
-            basicConfig(filename=fnme, filemode='w', format='%(levelname)s - %(message)s', level=20)
+            basicConfig(filename=fnme, filemode='w', format='%(message)s', level=20)
         self.log = log
 
         # Hard code in the FFT_Length so we can use it in policy NN
@@ -136,7 +137,7 @@ class SinglePulseBackground(Environment):
         # Antenna array definition
         dr = c0 / 9.6e9
         self.tx_locs = np.array([(0, -dr, 0), (0, dr, 0)]).T
-        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (0, 0, 0)]).T
+        self.rx_locs = np.array([(-dr * 2, 0, 0), (dr * 2, 0, 0), (0, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -186,23 +187,25 @@ class SinglePulseBackground(Environment):
         self.MPP = c0 / 2 / self.fs
         # doppPRF = 2 * self.env.spd * np.sin(self.az_bw / 2) * (max(self.fc) + max(self.bw) / 2) / c0
 
-        try:
-            self.det_model = keras.models.load_model('./id_model')
+        self.mdl_feedback = False
+        if det_model is not None:
+            self.det_model = det_model
             self.det_sz = self.det_model.layers[0].input_shape[0][1]
             self.__log__('Detection Model loaded.')
-        except OSError:
+            self.mdl_feedback = mdl_feedback
+        else:
             self.det_model = None
             self.__log__('No detection model found')
-        try:
-            self.par_model = keras.models.load_model('./par_model')
+        if par_model is not None:
+            self.par_model = par_model
             self.__log__('Parameter Model loaded.')
-        except OSError:
+        else:
             self.par_model = None
             self.__log__('No parameter model found')
 
         # CFAR kernel
         # Trying an inverted gaussian
-        cfk = 1 - gaus_2d((self.nsam // 20, self.cpi_len // 10), (1, .3))
+        cfk = 1 - gaus_2d((self.cpi_len // 10, self.nsam // 20), (.05, .5), height=1000)
         self.cfar_kernel = cfk / np.sum(cfk)
 
     def max_episode_timesteps(self):
@@ -228,10 +231,18 @@ class SinglePulseBackground(Environment):
 
         # Calculate times for this CPI based on given PRF
         self.tf = self.tf[-1] + np.arange(1, self.cpi_len + 1) * 1 / actions['radar'][0]
-        self.__log__(f'Started step {self.step} from {self.tf[0]:.2f}-{self.tf[-1]:.2f}s')
+        self.__log__(f'-------------------------------STEP {self.step}-------------------------------')
+        self.__log__(f'Simulation time: {self.tf[0]:.2f}-{self.tf[-1]:.2f}s')
 
         # Generate positions for the platform
-        self.env.genpos(self.tf, *actions['motion'])
+        cpos = self.env.plog[:, -1]
+        bxsz = 1.414 * 4000 * 2
+        box_accel_e = bxsz / np.linalg.norm(cpos[:2] - np.array([self.box[0], self.box[2]])) - \
+                      bxsz / np.linalg.norm(cpos[:2] - np.array([self.box[1], self.box[2]]))
+        box_accel_n = bxsz / np.linalg.norm(cpos[:2] - np.array([self.box[1], self.box[3]])) - \
+                      bxsz / np.linalg.norm(cpos[:2] - np.array([self.box[0], self.box[3]]))
+        self.__log__(f'Acceleration is {box_accel_e:.2f}, {box_accel_n:.2f}')
+        self.env.genpos(self.tf, box_accel_e, box_accel_n)
         for t in self.targets:
             t.genpos(self.tf)
 
@@ -260,14 +271,18 @@ class SinglePulseBackground(Environment):
         # Ambiguity score
         amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx)))
 
-        # PRF quality score
-        prf_sc = abs(self.PRF - actions['radar'][0]) / 500.0
-
         # Check pulse detection quality
         detb_sc = 0
         if self.det_model is not None:
             id_data, blen, n_dets = self.genDetBlock(chirps, 20)
-            n_close = log_loss(n_dets, self.det_model.predict(id_data.T).flatten()) - 1
+            tmp_lloss = log_loss(n_dets, self.det_model.predict(id_data.T).flatten(), sample_weight=n_dets + .1)
+            n_close = tmp_lloss - 1
+            self.__log__(f'Detection model loss is {tmp_lloss:.2f}')
+            if self.mdl_feedback:
+                self.__log__('Updating detection model with generated waveforms.')
+                self.det_model.fit(id_data.T, n_dets, epochs=5,
+                                   class_weight={0: sum(n_dets) / 20, 1: 1 - sum(n_dets) / 20})
+
             if n_close < -.7:
                 self.__log__('Submarine detected pulse. Episode failed.')
                 done = 1
@@ -285,9 +300,14 @@ class SinglePulseBackground(Environment):
         ea = [np.arctan2(t_pos[1], t_pos[0]) - self.boresight_ang,
               np.arcsin(-t_pos[2] / np.linalg.norm(t_pos)) - self.dep_ang]
 
-        self.__log__(f'Target located at {truth_rbin:.2f}m range, '
+        self.__log__(f'Target located at {np.linalg.norm(t_pos):.2f}m range, '
                      f'{ea[0] / DTR:.2f} az and {ea[1] / DTR:.2f} el from beamcenter.')
         dist_sc = min(np.linalg.norm([(.001 / cpudiff(ea[1], self.az_pt)), (.001 / cpudiff(ea[0], self.el_pt))]), 1)
+
+        # PRF quality score
+        prf_sc = abs(self.PRF - actions['radar'][0]) / 500.0
+        doppPRF = 2 * np.linalg.norm(t_vel) * np.sin(self.az_bw / 2) * (max(self.fc) + max(self.bw) / 2) / c0
+        prf_sc += min(1, (doppPRF - abs(actions['radar'][0])) / 250)
 
         # MIMO beamforming using some CPI stuff
         ea = np.array([self.az_pt, self.el_pt + np.pi / 2])
@@ -300,12 +320,17 @@ class SinglePulseBackground(Environment):
 
         # Get clutter covariance for this CPI
         # This is used for waveform evaluation and MMSE beamforming, if selected
-        Rx_thresh = np.max(db(curr_cpi[:, 0, :]), axis=1)
-        clutt_ind = np.logical_and(np.median(Rx_thresh) - np.std(Rx_thresh) < Rx_thresh,
-                                   Rx_thresh < np.median(Rx_thresh) + np.std(Rx_thresh))
-        Rx_data = curr_cpi[clutt_ind, 0, :]
-        Rx = (np.cov(Rx_data.T) + np.diag([actions['power'][n[1]] ** 2 for n in self.apc]))
-        clutter_cov = np.corrcoef(Rx_data.T)
+        with warnings.catch_warnings():
+            try:
+                Rx_thresh = np.max(db(curr_cpi[:, 0, :]), axis=1)
+                clutt_ind = np.logical_and(np.median(Rx_thresh) - np.std(Rx_thresh) < Rx_thresh,
+                                           Rx_thresh < np.median(Rx_thresh) + np.std(Rx_thresh))
+                Rx_data = curr_cpi[clutt_ind, 0, :]
+                Rx = (np.cov(Rx_data.T) + np.diag([actions['power'][n[1]] ** 2 for n in self.apc]))
+                clutter_cov = np.corrcoef(Rx_data.T)
+            except RuntimeWarning as rw:
+                self.__log__(rw)
+                Rx = np.eye(self.v_ants)
 
         if self.bf_type == 'mmse':
             # Generate MMSE beamformer and apply to data
@@ -325,7 +350,7 @@ class SinglePulseBackground(Environment):
 
         # Detection of targets score
         det_sc = 0
-        '''
+
         kernel = cupy.array(self.cfar_kernel, dtype=np.float64)
         bf = cupy.array(beamform, dtype=np.float64)
         tmp = cupyx.scipy.signal.fftconvolve(bf, kernel, mode='same')
@@ -337,9 +362,10 @@ class SinglePulseBackground(Environment):
         del kernel
         del tmp
         cupy.get_default_memory_pool().free_all_blocks()
-        det_st = binary_dilation(binary_erosion(beamform > thresh + np.std(beamform)))
-        '''
-        det_st = beamform > np.median(beamform) + np.std(beamform) * 3
+        det_st = beamform > thresh + np.std(beamform) * 3
+
+        ea_est = None
+        # det_st = beamform > np.median(beamform) + np.std(beamform) * 3
         labels, ntargets = label(det_st)
         if ntargets > 0:
             best_mu = -np.inf
@@ -351,16 +377,19 @@ class SinglePulseBackground(Environment):
                 if mu > best_mu:
                     best_mu = mu
                     t_rng = n_rng.mean()
-                    t_dopp = n_dopp.mean() % (self.cpi_len // 2) * actions['radar'][0] / (2 * self.cpi_len // 2)
-                    t_dopp = -t_dopp if n_dopp.mean() < self.cpi_len / 2 else t_dopp
+                    t_dopp = (self.cpi_len / 2 - n_dopp.mean()) / \
+                             (self.cpi_len * (self.tf[1] - self.tf[0])) / self.fc[0] * c0
             det_sc = (min(1 / abs(t_rng - truth_rbin), 1) + min(1 / abs(t_dopp - np.linalg.norm(t_vel)), 1)) / 2
-            if det_sc >= .9:
+            self.__log__(f'Detection at {t_rng:.2f}, {t_dopp:.2f}m/s\n'
+                         f'Target was located at {truth_rbin:.2f}, {np.linalg.norm(t_vel):.2f}m/s')
+            if det_sc >= .7:
+                ea_est = music(beamform, 1, self.virtual_array, self.fc[0])
                 self.succ_det += 1
-                self.__log__(f'Successful detection at {t_rng:.2f}m, {t_dopp:.2f}m/s')
+                self.__log__(f'Detection passed threshold.')
         else:
             if 0 < truth_rbin < self.nsam:
                 det_sc = -.25
-        if det_sc < .9 and self.succ_det > 0:
+        if det_sc < .7 and self.succ_det > 0:
             self.succ_det = 0
 
         if self.succ_det > 4:
@@ -373,6 +402,7 @@ class SinglePulseBackground(Environment):
         # Append everything to the logs, for pretty pictures later
         self.log.append([beamform, [[amb_sc, detb_sc, det_sc], [prf_sc, dist_sc, det_sc]],
                          self.tf, actions['scan'], actions['elscan'], actions['wave'], ea, U])
+
         # Remove anything longer than the allowed steps, for arbitrary length episodes
         if len(self.log) > self.max_steps:
             self.log.pop(0)
@@ -388,7 +418,7 @@ class SinglePulseBackground(Environment):
             done = 2
             self.__log__('Reached max timesteps.')
 
-        self.__log__(f'End of step {self.step}')
+        self.__log__(f'------------------------------------END STEP {self.step}--------------------------------------')
 
         return full_state, done, np.array([amb_sc + detb_sc + det_sc + reward, prf_sc + dist_sc + det_sc + reward])
 
@@ -404,7 +434,7 @@ class SinglePulseBackground(Environment):
         self.log = []
 
         self.targets = []
-        self.targets.append(Sub(0, self.env.swath, 0, self.env.eswath))
+        self.targets.append(Sub(0, 100, 0, 100))
 
         for t in self.targets:
             t.genpos(self.tf)
@@ -479,8 +509,8 @@ class SinglePulseBackground(Environment):
             posrx_gpu = cupy.array(np.ascontiguousarray(p_pos + rot_rxlocs[:, rx][:, None]),
                                    dtype=np.float64)
             for tx in range(self.n_tx):
-                data_r = cupy.zeros(self.data_block, dtype=np.float64)
-                data_i = cupy.zeros(self.data_block, dtype=np.float64)
+                data_r = cupy.array(np.random.normal(0, 1, self.data_block), dtype=np.float64)
+                data_i = cupy.array(np.random.normal(0, 1, self.data_block), dtype=np.float64)
                 p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc[tx],
                                              self.alt / np.sin(self.dep_ang + self.el_bw / 2) / c0,
                                              self.fs, self.dep_ang, self.bg_ext[0], self.bg_ext[1],
@@ -695,6 +725,7 @@ class Platform(object):
         self.h_agl = h_agl
         self.p0 = p0
         self.v0 = v0
+        self.max_vel = 20
 
         self.avec = lambda t, e, n: np.array([np.random.normal(e, .2, len(t)),
                                               np.random.normal(n, .2, len(t)),
@@ -715,8 +746,8 @@ class Platform(object):
             av[:, av_norm > 5] * 5 / av_norm[av_norm > 5]
         nvs = self.vlog[:, -1][:, None] + np.cumsum(av * dt, axis=1)
         nvs_norm = np.linalg.norm(nvs, axis=0)
-        nvs[:, nvs_norm > 10] = \
-            nvs[:, nvs_norm > 10] * 10 / nvs_norm[nvs_norm > 10]
+        nvs[:, nvs_norm > self.max_vel] = \
+            nvs[:, nvs_norm > self.max_vel] * self.max_vel / nvs_norm[nvs_norm > self.max_vel]
         nps = self.plog[:, -1][:, None] + np.cumsum(nvs * dt, axis=1)
 
         # Concatenate with old logs

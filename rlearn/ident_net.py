@@ -10,7 +10,7 @@ import keras
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.constraints import NonNeg
 from keras.layers import Input, Conv2D, Flatten, Dense, BatchNormalization, MaxPooling2D, AveragePooling2D, \
-    Dropout, GaussianNoise, Concatenate
+    Dropout, GaussianNoise, Concatenate, LSTM, Embedding
 from kapre import STFT, MagnitudeToDecibel, Magnitude, Phase
 from keras.callbacks import TerminateOnNaN, EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
 from keras.regularizers import l1_l2
@@ -88,6 +88,7 @@ minp_sz = 40000
 stft_sz = 512
 band_limits = (10e6, fs / 2)
 base_pl = 6.468e-6
+train_runs = 10
 
 segment_base_samp = minp_sz * dec_facs[-1]
 segment_t0 = segment_base_samp / fs   # Segment time in secs
@@ -104,8 +105,10 @@ def genModel(nsam):
     lay = Conv2D(35, (16, 16))(lay)
     lay = Conv2D(25, (16, 16))(lay)
     lay = Flatten()(lay)
-    lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
+    lay = Dense(1024, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
+    lay = Embedding(input_dim=1024, output_dim=256)(lay)
+    lay = LSTM(256, activation='relu')(lay)
     outp = Dense(1, activation='sigmoid')(lay)
     return keras.Model(inputs=inp, outputs=outp)
 
@@ -144,7 +147,7 @@ sig_on = True
 genparams = lambda: (np.random.rand() * 400 + 100, int((np.random.rand() * (base_pl - 1e-6) + 1e-6) * fs),
                      np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0])
 
-for run in tqdm(range(120)):
+for run in tqdm(range(train_runs)):
     t0 = 0
     sig_t = 0
     count = 0
@@ -275,8 +278,8 @@ for n in range(Xs.shape[0]):
         plt.axis('tight')
 
 # Save out the model for future use
-mdl.save('./id_model')
-par_mdl.save('./par_model')
+# mdl.save('./id_model')
+# par_mdl.save('./par_model')
 
 # plot_model(mdl, to_file='mdl.png', show_shapes=True)
 # plot_model(par_mdl, to_file='par_mdl.png', show_shapes=True)

@@ -1,4 +1,5 @@
 import cupy
+import keras.models
 from tensorforce import Agent, Environment, Runner
 from wave_env import SinglePulseBackground, genPulse, ambiguity, ellipse
 import numpy as np
@@ -41,19 +42,20 @@ def sliding_window(data, win_size, func=None):
 
 games = 1
 eval_games = 1
-max_timesteps = 4000
+max_timesteps = 256
 batch_sz = 64
 ocean_debug = False
+feedback = True
 
 # Parameters for the environment (and therefore the agents)
 cpi_len = 64
-az_bw = 30
-el_bw = 36
-dep_ang = np.random.uniform(45, 60)
-boresight_ang = np.random.uniform(80, 100)
+az_bw = 50
+el_bw = 50
+dep_ang = 45
+boresight_ang = 90
 altitude = np.random.uniform(1000, 1600)
-pos = (np.random.uniform(-4000, 4000), np.random.uniform(-4000, 4000))
-vel = (np.random.uniform(-10, 10), np.random.uniform(-10, 10))
+pos = (-350, -altitude)
+vel = (20, 0)
 plp = .5
 env_samples = 200000
 fs_decimation = 8
@@ -69,19 +71,23 @@ print('Initial memory on GPU:')
 print(f'Memory: {cupy.get_default_memory_pool().used_bytes()} / {cupy.get_default_memory_pool().total_bytes()}')
 print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} free blocks')
 
+det_model = keras.models.load_model('./id_model')
+par_model = keras.models.load_model('./par_model')
+
 # Pre-defined or custom environment
 env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=cpi_len, az_bw=az_bw, el_bw=el_bw, dep_ang=dep_ang,
                             boresight_ang=boresight_ang,
                             altitude=altitude, plp=plp, env_samples=env_samples, fs_decimation=fs_decimation,
                             az_lim=az_lim, el_lim=el_lim,
-                            beamform_type=beamform_type, initial_pos=pos, initial_velocity=vel, log=True)
+                            beamform_type=beamform_type, initial_pos=pos, initial_velocity=vel, det_model=det_model,
+                            par_model=par_model, mdl_feedback=feedback, log=True)
 
 # Define preprocessing layer (just a normalization)
 state_prelayer = [dict(type='linear_normalization'),
-                  dict(type='exponential_normalization', decay=.8)]
+                  dict(type='exponential_normalization', decay=.5)]
 
 # Give a sense of motion to the agent
-seq_layer = [dict(type='sequence', length=4)]
+seq_layer = [dict(type='sequence', length=2)]
 
 # Define states for different agents
 wave_state = dict(currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
@@ -103,16 +109,15 @@ wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, m
                    fc=dict(type='float', shape=(env.n_tx,), min_value=8e9, max_value=12e9),
                    bw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
                            max_value=env.fs / 2 - 5e6),
-                   power=dict(type='float', shape=(env.n_tx,), min_value=1,
-                              max_value=100)
+                   power=dict(type='float', shape=(env.n_tx,), min_value=.1,
+                              max_value=5)
                    )
 
 motion_action = dict(radar=dict(type='float', shape=(1,), min_value=env.PRFrange[0], max_value=env.PRFrange[1]),
                      scan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
                                max_value=env.az_lims[1]),
                      elscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
-                                 max_value=env.el_lims[1]),
-                     motion=dict(type='float', shape=(2,), min_value=-5.0, max_value=5.0))
+                                 max_value=env.el_lims[1]))
 
 # Instantiate wave agent
 print('Initializing agents...')
@@ -120,14 +125,14 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
                           actions=wave_action,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
                           learning_rate=1e-4,
-                          memory=max_timesteps, exploration=.5, entropy_regularization=5.0)
+                          memory=max_timesteps, exploration=5.0, entropy_regularization=50.0)
 
 # Instantiate motion agent
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
                             state_preprocessing=state_prelayer + seq_layer,
                             max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-3,
-                            memory=max_timesteps, exploration=.03,
+                            memory=max_timesteps, exploration=30.0,
                             horizon=10)
 
 # Training regimen
@@ -237,7 +242,7 @@ for l in logs:
     # Draw the beam direction and platform
     axes[3].scatter(fpos[0], fpos[1], marker='*', c='blue')
     beam_dir = np.exp(-1j * az_bm) * fpos[2] / np.tan(el_bm)
-    axes[3].arrow(fpos[0], fpos[1], -beam_dir.real, -beam_dir.imag)
+    axes[3].arrow(fpos[0], fpos[1], beam_dir.real, -beam_dir.imag)
 
     # Draw the targets
     t_vec = None
