@@ -137,7 +137,7 @@ class SinglePulseBackground(Environment):
         # Antenna array definition
         dr = c0 / 9.6e9
         self.tx_locs = np.array([(0, -dr, 0), (0, dr, 0)]).T
-        self.rx_locs = np.array([(-dr * 2, 0, 0), (dr * 2, 0, 0), (0, 0, 0)]).T
+        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -235,6 +235,7 @@ class SinglePulseBackground(Environment):
         self.__log__(f'Simulation time: {self.tf[0]:.2f}-{self.tf[-1]:.2f}s')
 
         # Generate positions for the platform
+        '''
         cpos = self.env.plog[:, -1]
         bxsz = 1.414 * 4000 * 2
         box_accel_e = bxsz / np.linalg.norm(cpos[:2] - np.array([self.box[0], self.box[2]])) - \
@@ -242,7 +243,8 @@ class SinglePulseBackground(Environment):
         box_accel_n = bxsz / np.linalg.norm(cpos[:2] - np.array([self.box[1], self.box[3]])) - \
                       bxsz / np.linalg.norm(cpos[:2] - np.array([self.box[0], self.box[3]]))
         self.__log__(f'Acceleration is {box_accel_e:.2f}, {box_accel_n:.2f}')
-        self.env.genpos(self.tf, box_accel_e, box_accel_n)
+        '''
+        self.env.genpos(self.tf, 0, 0)
         for t in self.targets:
             t.genpos(self.tf)
 
@@ -272,16 +274,17 @@ class SinglePulseBackground(Environment):
         amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx)))
 
         # Check pulse detection quality
+        blocks = 50
         detb_sc = 0
         if self.det_model is not None:
-            id_data, blen, n_dets = self.genDetBlock(chirps, 20)
+            id_data, blen, n_dets = self.genDetBlock(chirps, blocks)
             tmp_lloss = log_loss(n_dets, self.det_model.predict(id_data.T).flatten(), sample_weight=n_dets + .1)
             n_close = tmp_lloss - 1
             self.__log__(f'Detection model loss is {tmp_lloss:.2f}')
             if self.mdl_feedback:
                 self.__log__('Updating detection model with generated waveforms.')
-                self.det_model.fit(id_data.T, n_dets, epochs=5,
-                                   class_weight={0: sum(n_dets) / 20, 1: 1 - sum(n_dets) / 20})
+                self.det_model.fit(id_data.T, n_dets, epochs=2,
+                                   class_weight={0: sum(n_dets) / blocks, 1: 1 - sum(n_dets) / blocks})
 
             if n_close < -.7:
                 self.__log__('Submarine detected pulse. Episode failed.')
@@ -307,7 +310,7 @@ class SinglePulseBackground(Environment):
         # PRF quality score
         prf_sc = abs(self.PRF - actions['radar'][0]) / 500.0
         doppPRF = 2 * np.linalg.norm(t_vel) * np.sin(self.az_bw / 2) * (max(self.fc) + max(self.bw) / 2) / c0
-        prf_sc += min(1, (doppPRF - abs(actions['radar'][0])) / 250)
+        prf_sc += min(1, (doppPRF - actions['radar'][0]) / 250) if doppPRF < actions['radar'][0] else -.25
 
         # MIMO beamforming using some CPI stuff
         ea = np.array([self.az_pt, self.el_pt + np.pi / 2])
@@ -354,17 +357,21 @@ class SinglePulseBackground(Environment):
         kernel = cupy.array(self.cfar_kernel, dtype=np.float64)
         bf = cupy.array(beamform, dtype=np.float64)
         tmp = cupyx.scipy.signal.fftconvolve(bf, kernel, mode='same')
+        tmp_std = cupyx.scipy.signal.fftconvolve(bf**2, kernel, mode='same')
         cupy.cuda.Device().synchronize()
         thresh = tmp.get()
+        thresh_std = tmp_std.get()
+        thresh_alpha = np.sqrt(thresh_std - thresh**2)
 
         # Free all the GPU memory
         del bf
         del kernel
         del tmp
+        del tmp_std
         cupy.get_default_memory_pool().free_all_blocks()
-        det_st = beamform > thresh + np.std(beamform) * 3
+        det_st = beamform > thresh + thresh_alpha * 2
 
-        ea_est = None
+        # ea_est = None
         # det_st = beamform > np.median(beamform) + np.std(beamform) * 3
         labels, ntargets = label(det_st)
         if ntargets > 0:
@@ -383,7 +390,7 @@ class SinglePulseBackground(Environment):
             self.__log__(f'Detection at {t_rng:.2f}, {t_dopp:.2f}m/s\n'
                          f'Target was located at {truth_rbin:.2f}, {np.linalg.norm(t_vel):.2f}m/s')
             if det_sc >= .7:
-                ea_est = music(beamform, 1, self.virtual_array, self.fc[0])
+                # ea_est = music(beamform, 1, self.virtual_array, self.fc[0])
                 self.succ_det += 1
                 self.__log__(f'Detection passed threshold.')
         else:
@@ -509,8 +516,8 @@ class SinglePulseBackground(Environment):
             posrx_gpu = cupy.array(np.ascontiguousarray(p_pos + rot_rxlocs[:, rx][:, None]),
                                    dtype=np.float64)
             for tx in range(self.n_tx):
-                data_r = cupy.array(np.random.normal(0, 1, self.data_block), dtype=np.float64)
-                data_i = cupy.array(np.random.normal(0, 1, self.data_block), dtype=np.float64)
+                data_r = cupy.array(np.random.normal(0, 1e-9, self.data_block), dtype=np.float64)
+                data_i = cupy.array(np.random.normal(0, 1e-9, self.data_block), dtype=np.float64)
                 p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc[tx],
                                              self.alt / np.sin(self.dep_ang + self.el_bw / 2) / c0,
                                              self.fs, self.dep_ang, self.bg_ext[0], self.bg_ext[1],

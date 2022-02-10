@@ -7,10 +7,11 @@ try to identify signal parameters and such
 import numpy as np
 from tqdm import tqdm
 import keras
+from tensorflow.signal import rfft
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.constraints import NonNeg
 from keras.layers import Input, Conv2D, Flatten, Dense, BatchNormalization, MaxPooling2D, AveragePooling2D, \
-    Dropout, GaussianNoise, Concatenate, LSTM, Embedding
+    Dropout, GaussianNoise, Concatenate, LSTM, Embedding, Conv1D, Lambda, MaxPooling1D
 from kapre import STFT, MagnitudeToDecibel, Magnitude, Phase
 from keras.callbacks import TerminateOnNaN, EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
 from keras.regularizers import l1_l2
@@ -45,12 +46,21 @@ def plotWeights(mdl, lnum=2, mdl_name=''):
         return
     if 'conv2d' in lnm:
         # It's a convolution layer
-        plt.figure(lnm.split('/')[1] + 'layer {} weights: '.format(lnum) + mdl_name)
-        grid_sz = int(np.ceil(np.sqrt(lw.shape[3])))
-        for n in range(lw.shape[3]):
-            plt.subplot(grid_sz, grid_sz, n + 1)
-            plt.imshow(lw[:, :, 0, n])
-            plt.title(f'{n}')
+        for m in range(lw.shape[2]):
+            plt.figure(lnm.split('/')[1] + ' layer {} channel {} weights: '.format(lnum, m) + mdl_name)
+            grid_sz = int(np.ceil(np.sqrt(lw.shape[3])))
+            for n in range(lw.shape[3]):
+                plt.subplot(grid_sz, grid_sz, n + 1)
+                plt.imshow(lw[:, :, m, n])
+                plt.title(f'{n}')
+    if 'conv1d' in lnm:
+        for m in range(lw.shape[1]):
+            plt.figure(lnm.split('/')[1] + ' layer {} channel {} weights: '.format(lnum, m) + mdl_name)
+            grid_sz = int(np.ceil(np.sqrt(lw.shape[2])))
+            for n in range(lw.shape[2]):
+                plt.subplot(grid_sz, grid_sz, n + 1)
+                plt.plot(lw[:, m, n])
+                plt.title(f'{n}')
 
 
 def plotActivations(classifier, inp):
@@ -63,20 +73,40 @@ def plotActivations(classifier, inp):
         layer_names.append(layer.name)  # Names of the layers, so you can have them as part of your plot
 
     for layer_name, layer_activation in zip(layer_names, activations):  # Displays the feature maps
-        if 'stft' in layer_name or 'conv' in layer_name or 'pooling' in layer_name:
+        if 'stft' in layer_name or '2d' in layer_name:
             n_features = layer_activation.shape[-1]  # Number of features in the feature map
             grid_sz = int(np.ceil(np.sqrt(n_features)))
-            plt.figure(layer_name)
-            plt.grid(False)
-            for n in range(n_features):
-                plt.subplot(grid_sz, grid_sz, n+1)
-                try:
-                    plt.imshow(layer_activation[0, :, :, n], aspect='auto', cmap='viridis')
-                except TypeError:
-                    plt.imshow(db(layer_activation[0, :, :, n]), aspect='auto', cmap='viridis')
+            for m in range(layer_activation.shape[0]):
+                plt.figure(layer_name + f' channel {m}')
+                plt.grid(False)
+                for n in range(n_features):
+                    plt.subplot(grid_sz, grid_sz, n+1)
+                    try:
+                        plt.imshow(layer_activation[m, :, :, n], aspect='auto', cmap='viridis')
+                    except TypeError:
+                        plt.imshow(db(layer_activation[m, :, :, n]), aspect='auto', cmap='viridis')
         elif 'dense' in layer_name:
+            for m in range(layer_activation.shape[0]):
+                plt.figure(layer_name + f' channel {m}')
+                if layer_activation.shape[-1] < 3:
+                    plt.scatter(np.arange(layer_activation.shape[-1]), layer_activation[m, ...])
+                else:
+                    plt.plot(layer_activation[m, ...])
+        elif '1d' in layer_name:
+            n_features = layer_activation.shape[-1]
+            grid_sz = int(np.ceil(np.sqrt(n_features)))
+            for m in range(layer_activation.shape[0]):
+                plt.figure(layer_name + f' channel {m}')
+                plt.grid(False)
+                for n in range(n_features):
+                    plt.subplot(grid_sz, grid_sz, n + 1)
+                    try:
+                        plt.plot(layer_activation[m, :, n])
+                    except TypeError:
+                        plt.plot(db(layer_activation[m, :, n]))
+        elif 'fft' in layer_name:
             plt.figure(layer_name)
-            plt.plot(layer_activation[0, ...])
+            plt.plot(db(layer_activation[0, :, 0]))
 
 
 # Base net params
@@ -84,11 +114,11 @@ dec_facs = [1]
 epoch_sz = 256
 batch_sz = 32
 neg_per_pos = 1
-minp_sz = 40000
+minp_sz = 16384
 stft_sz = 512
 band_limits = (10e6, fs / 2)
 base_pl = 6.468e-6
-train_runs = 10
+train_runs = 1500
 
 segment_base_samp = minp_sz * dec_facs[-1]
 segment_t0 = segment_base_samp / fs   # Segment time in secs
@@ -97,17 +127,17 @@ seg_sz = int(np.ceil(segment_t0 * fs))
 
 def genModel(nsam):
     inp = Input(shape=(nsam, 1))
-    lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100),
-               hop_length=stft_sz // 4, window_name='hann_window')(inp)
-    lay = Magnitude()(lay)
-    lay = MaxPooling2D((4, 4))(lay)
+    lay = Lambda(rfft, name='fft_1')(inp)
     lay = BatchNormalization()(lay)
-    lay = Conv2D(35, (16, 16))(lay)
-    lay = Conv2D(25, (16, 16))(lay)
+    l_mag = Magnitude()(lay)
+    l_phase = Phase()(lay)
+    lay = Concatenate()([l_mag, l_phase])
+    lay = Conv1D(5, 128)(lay)
+    lay = MaxPooling1D(10)(lay)
     lay = Flatten()(lay)
-    lay = Dense(1024, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
+    lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
-    lay = Embedding(input_dim=1024, output_dim=256)(lay)
+    lay = Embedding(input_dim=512, output_dim=256)(lay)
     lay = LSTM(256, activation='relu')(lay)
     outp = Dense(1, activation='sigmoid')(lay)
     return keras.Model(inputs=inp, outputs=outp)
@@ -232,6 +262,7 @@ for idx, l in enumerate(mdl.layers):
     plotWeights(mdl, idx, mdl_name=f'model')
 
 plotActivations(mdl, Xs[ys[:, 0] == 0, :][0, :])
+plotActivations(mdl, Xs[ys[:, 0] == 1, :][0, :])
 
 # Model analysis
 test_mdl = genModel(minp_sz)
@@ -278,11 +309,11 @@ for n in range(Xs.shape[0]):
         plt.axis('tight')
 
 # Save out the model for future use
-# mdl.save('./id_model')
-# par_mdl.save('./par_model')
+mdl.save('./id_model')
+par_mdl.save('./par_model')
 
-# plot_model(mdl, to_file='mdl.png', show_shapes=True)
-# plot_model(par_mdl, to_file='par_mdl.png', show_shapes=True)
+plot_model(mdl, to_file='mdl.png', show_shapes=True)
+plot_model(par_mdl, to_file='par_mdl.png', show_shapes=True)
 
 
 

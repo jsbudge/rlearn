@@ -42,10 +42,10 @@ def sliding_window(data, win_size, func=None):
 
 games = 1
 eval_games = 1
-max_timesteps = 256
+max_timesteps = 128
 batch_sz = 64
 ocean_debug = False
-feedback = True
+feedback = False
 
 # Parameters for the environment (and therefore the agents)
 cpi_len = 64
@@ -155,6 +155,7 @@ for episode in tqdm(range(games)):
     reward_track[episode] = sum_rewards
 
 # Testing loop
+env.mdl_feedback = False  # Reset model feedback to evaluate
 actions = None
 print('Evaluation...')
 for g in tqdm(range(eval_games)):
