@@ -45,7 +45,7 @@ eval_games = 1
 max_timesteps = 128
 batch_sz = 64
 ocean_debug = False
-feedback = False
+feedback = True
 
 # Parameters for the environment (and therefore the agents)
 cpi_len = 64
@@ -101,7 +101,7 @@ wave_state = dict(currwave=dict(type='float', shape=(100, env.n_tx), min_value=0
 motion_state = dict(point_angs=dict(type='float', shape=(2,), min_value=min([env.az_lims[0], env.el_lims[0]]),
                                     max_value=max([env.az_lims[1], env.el_lims[1]])),
                     platform_motion=dict(type='float', shape=(3,),
-                                         min_value=-200, max_value=200),
+                                         min_value=-30, max_value=30),
                     target_angs=dict(type='float', shape=(2,), min_value=-np.pi, max_value=np.pi))
 
 # Define actions for different agents
@@ -125,13 +125,13 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
                           actions=wave_action,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
                           learning_rate=1e-4,
-                          memory=max_timesteps, exploration=5.0, entropy_regularization=50.0)
+                          memory=max_timesteps, exploration=150.0, entropy_regularization=50.0)
 
 # Instantiate motion agent
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
                             state_preprocessing=state_prelayer + seq_layer,
-                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-3,
+                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-2,
                             memory=max_timesteps, exploration=30.0,
                             horizon=10)
 

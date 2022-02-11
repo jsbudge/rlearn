@@ -112,13 +112,13 @@ def plotActivations(classifier, inp):
 # Base net params
 dec_facs = [1]
 epoch_sz = 256
-batch_sz = 32
+batch_sz = 16
 neg_per_pos = 1
-minp_sz = 16384
+minp_sz = 40000
 stft_sz = 512
 band_limits = (10e6, fs / 2)
 base_pl = 6.468e-6
-train_runs = 1500
+train_runs = 5
 
 segment_base_samp = minp_sz * dec_facs[-1]
 segment_t0 = segment_base_samp / fs   # Segment time in secs
@@ -127,18 +127,18 @@ seg_sz = int(np.ceil(segment_t0 * fs))
 
 def genModel(nsam):
     inp = Input(shape=(nsam, 1))
-    lay = Lambda(rfft, name='fft_1')(inp)
-    lay = BatchNormalization()(lay)
+    lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100),
+               hop_length=stft_sz // 4, window_name='hann_window')(inp)
     l_mag = Magnitude()(lay)
     l_phase = Phase()(lay)
     lay = Concatenate()([l_mag, l_phase])
-    lay = Conv1D(5, 128)(lay)
-    lay = MaxPooling1D(10)(lay)
+    lay = MaxPooling2D((3, 3))(lay)
+    lay = BatchNormalization()(lay)
+    lay = Conv2D(16, (32, 32))(lay)
+    lay = Conv2D(32, (8, 8))(lay)
     lay = Flatten()(lay)
     lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
-    lay = Embedding(input_dim=512, output_dim=256)(lay)
-    lay = LSTM(256, activation='relu')(lay)
     outp = Dense(1, activation='sigmoid')(lay)
     return keras.Model(inputs=inp, outputs=outp)
 
@@ -154,6 +154,8 @@ def genParamModel(nsam):
     lay = Flatten()(lay)
     lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
+    lay = Embedding(input_dim=512, output_dim=256)(lay)
+    lay = LSTM(256)(lay)
     outp = Dense(2, kernel_constraint=NonNeg())(lay)
     return keras.Model(inputs=inp, outputs=outp)
 
@@ -262,7 +264,6 @@ for idx, l in enumerate(mdl.layers):
     plotWeights(mdl, idx, mdl_name=f'model')
 
 plotActivations(mdl, Xs[ys[:, 0] == 0, :][0, :])
-plotActivations(mdl, Xs[ys[:, 0] == 1, :][0, :])
 
 # Model analysis
 test_mdl = genModel(minp_sz)
@@ -312,8 +313,8 @@ for n in range(Xs.shape[0]):
 mdl.save('./id_model')
 par_mdl.save('./par_model')
 
-plot_model(mdl, to_file='mdl.png', show_shapes=True)
-plot_model(par_mdl, to_file='par_mdl.png', show_shapes=True)
+#plot_model(mdl, to_file='mdl.png', show_shapes=True)
+#plot_model(par_mdl, to_file='par_mdl.png', show_shapes=True)
 
 
 

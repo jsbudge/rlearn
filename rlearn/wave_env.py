@@ -305,12 +305,13 @@ class SinglePulseBackground(Environment):
 
         self.__log__(f'Target located at {np.linalg.norm(t_pos):.2f}m range, '
                      f'{ea[0] / DTR:.2f} az and {ea[1] / DTR:.2f} el from beamcenter.')
-        dist_sc = min(np.linalg.norm([(.001 / cpudiff(ea[1], self.az_pt)), (.001 / cpudiff(ea[0], self.el_pt))]), 1)
+        dist_sc = min(np.linalg.norm([(.001 / cpudiff(ea[1], self.az_pt)),
+                                      (.001 / cpudiff(ea[0], self.el_pt + np.pi / 2))]), 1)
 
         # PRF quality score
         prf_sc = abs(self.PRF - actions['radar'][0]) / 500.0
         doppPRF = 2 * np.linalg.norm(t_vel) * np.sin(self.az_bw / 2) * (max(self.fc) + max(self.bw) / 2) / c0
-        prf_sc += min(1, (doppPRF - actions['radar'][0]) / 250) if doppPRF < actions['radar'][0] else -.25
+        prf_sc += .01 if doppPRF < actions['radar'][0] else -.25
 
         # MIMO beamforming using some CPI stuff
         ea = np.array([self.az_pt, self.el_pt + np.pi / 2])
@@ -349,7 +350,7 @@ class SinglePulseBackground(Environment):
             beamform[:, tt] = curr_cpi[:, tt, :].dot(U)
 
         # Put data into Range-Doppler space and window it in Doppler
-        beamform = db(np.fft.fft(beamform * taylor(self.cpi_len)[None, :], axis=1))
+        beamform = db(np.fft.fft(beamform, axis=1))
 
         # Detection of targets score
         det_sc = 0
@@ -361,7 +362,6 @@ class SinglePulseBackground(Environment):
         cupy.cuda.Device().synchronize()
         thresh = tmp.get()
         thresh_std = tmp_std.get()
-        thresh_alpha = np.sqrt(thresh_std - thresh**2)
 
         # Free all the GPU memory
         del bf
@@ -369,17 +369,18 @@ class SinglePulseBackground(Environment):
         del tmp
         del tmp_std
         cupy.get_default_memory_pool().free_all_blocks()
+
+        thresh_alpha = np.sqrt(thresh_std - thresh ** 2)
         det_st = beamform > thresh + thresh_alpha * 2
 
-        # ea_est = None
-        # det_st = beamform > np.median(beamform) + np.std(beamform) * 3
+        det_st = binary_erosion(det_st, np.array([[0, 1., 0], [0, 1, 0], [0, 1, 0]]))
         labels, ntargets = label(det_st)
         if ntargets > 0:
             best_mu = -np.inf
             t_rng = 0
             t_dopp = 0
             for n_targ in range(1, ntargets):
-                mu = np.mean(beamform[labels[n_targ]])
+                mu = np.mean(beamform[labels == n_targ])
                 n_rng, n_dopp = np.where(labels == n_targ)
                 if mu > best_mu:
                     best_mu = mu
@@ -441,7 +442,7 @@ class SinglePulseBackground(Environment):
         self.log = []
 
         self.targets = []
-        self.targets.append(Sub(0, 100, 0, 100))
+        self.targets.append(Sub(-100, 500, -100, 500))
 
         for t in self.targets:
             t.genpos(self.tf)
@@ -801,8 +802,9 @@ class Sub(object):
         self.plog = np.array([[np.random.uniform(min_x, max_x), np.random.uniform(min_y, max_y)]]).T
         self.vlog = np.array([[np.random.rand() - .5, np.random.rand() - .5]]).T
         self.tlog = np.array([-1e-9])
-        self.avec = lambda t: np.array(
-            [np.random.normal(0, MAX_ALFA_ACCEL / 3, len(t)), np.random.normal(0, MAX_ALFA_ACCEL / 3, len(t))])
+        self.avec = lambda t, e, n: np.array(
+            [np.random.normal(e, MAX_ALFA_ACCEL / 3, len(t)), np.random.normal(n, MAX_ALFA_ACCEL / 3, len(t))])
+        self.aprev = (0., 0.)
 
         self.surf = lambda t: np.ones_like(t)
 
@@ -812,10 +814,11 @@ class Sub(object):
     def genpos(self, t):
         # This function assumes the times given are in the fuuuutuuuure
         dt = t[1] - t[0]
-        av = self.avec(t)
+        av = self.avec(t, self.aprev[0], self.aprev[1])
         av_norm = np.linalg.norm(av, axis=0)
         av[:, av_norm > MAX_ALFA_ACCEL] = \
             av[:, av_norm > MAX_ALFA_ACCEL] * MAX_ALFA_ACCEL / av_norm[av_norm > MAX_ALFA_ACCEL]
+        self.aprev = (av[0, -1], av[1, -1])
         nvs = self.vlog[:, -1][:, None] + np.cumsum(av * dt, axis=1)
         nvs_norm = np.linalg.norm(nvs, axis=0)
         nvs[:, nvs_norm > MAX_ALFA_SPEED] = \
