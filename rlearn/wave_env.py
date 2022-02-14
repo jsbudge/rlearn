@@ -19,13 +19,13 @@ from scipy.ndimage import binary_dilation, binary_erosion, label
 from DFJeff import MUSICSinglePoint as music
 import matplotlib.pyplot as plt
 from scipy.interpolate import UnivariateSpline, interp1d
-from sklearn.metrics import log_loss
+from sklearn.metrics import log_loss, balanced_accuracy_score, hamming_loss
 from numba import cuda, njit
 from tensorflow import keras
 import cmath
 import math
 import cupy as cupy
-from cuda_kernels import genSubProfile, genRangeProfile, getDetectionCheck
+from cuda_kernels import genSubProfile, genRangeProfile, getDetectionCheck, applyRadiationPatternCPU
 from numba.core.errors import NumbaPerformanceWarning
 import warnings
 from logging import debug, info, error, basicConfig
@@ -113,6 +113,8 @@ class SinglePulseBackground(Environment):
         self.PRFrange = (50, 1500)
         self.step = 0
         self.succ_det = 0
+        self.sub_det = 0
+        self.det_time = 0.
         self.v0 = initial_velocity
         self.p0 = initial_pos
         self.box = (-2000, 2000, -2000, 2000)
@@ -137,7 +139,7 @@ class SinglePulseBackground(Environment):
         # Antenna array definition
         dr = c0 / 9.6e9
         self.tx_locs = np.array([(0, -dr, 0), (0, dr, 0)]).T
-        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0)]).T
+        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (0, dr, 0), (-dr * 2, 0, 0), (dr * 2, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -274,19 +276,31 @@ class SinglePulseBackground(Environment):
         amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx)))
 
         # Check pulse detection quality
-        blocks = 50
+        blocks = 32
         detb_sc = 0
+        has_trained = False
         if self.det_model is not None:
-            id_data, blen, n_dets = self.genDetBlock(chirps, blocks)
-            tmp_lloss = log_loss(n_dets, self.det_model.predict(id_data.T).flatten(), sample_weight=n_dets + .1)
-            n_close = tmp_lloss - 1
+            total_dets = []
+            total_preds = []
+            while self.det_time < self.tf[-1]:
+                id_data, n_dets = self.genDetBlock(chirps, blocks)
+                total_dets = np.concatenate((total_dets, n_dets))
+                total_preds = np.concatenate((total_preds, self.det_model.predict(id_data.T).flatten()))
+                if not has_trained and self.mdl_feedback and sum(n_dets) > 0:
+                    self.__log__('Updating detection model with generated waveforms.')
+                    self.det_model.fit(id_data.T, n_dets, epochs=2,
+                                       class_weight={0: sum(n_dets) / blocks, 1: 1 - sum(n_dets) / blocks})
+                    has_trained = True
+            try:
+                tmp_lloss = hamming_loss(total_dets.astype(int), total_preds >= .5)
+            except AttributeError:
+                tmp_lloss = 0
+            n_close = .5 - tmp_lloss
             self.__log__(f'Detection model loss is {tmp_lloss:.2f}')
-            if self.mdl_feedback:
-                self.__log__('Updating detection model with generated waveforms.')
-                self.det_model.fit(id_data.T, n_dets, epochs=2,
-                                   class_weight={0: sum(n_dets) / blocks, 1: 1 - sum(n_dets) / blocks})
-
-            if n_close < -.7:
+            if n_close < -.2:
+                self.sub_det += 1
+                self.__log__(f'Submarine detection check {self.sub_det}')
+            if self.sub_det >= 4:
                 self.__log__('Submarine detected pulse. Episode failed.')
                 done = 1
                 reward -= 3
@@ -393,7 +407,7 @@ class SinglePulseBackground(Environment):
             if det_sc >= .7:
                 # ea_est = music(beamform, 1, self.virtual_array, self.fc[0])
                 self.succ_det += 1
-                self.__log__(f'Detection passed threshold.')
+                self.__log__(f'Detection check {self.succ_det}.')
         else:
             if 0 < truth_rbin < self.nsam:
                 det_sc = -.25
@@ -426,7 +440,7 @@ class SinglePulseBackground(Environment):
             done = 2
             self.__log__('Reached max timesteps.')
 
-        self.__log__(f'------------------------------------END STEP {self.step}--------------------------------------')
+        self.__log__(f'-------------------------------END STEP {self.step}---------------------------')
 
         return full_state, done, np.array([amb_sc + detb_sc + det_sc + reward, prf_sc + dist_sc + det_sc + reward])
 
@@ -434,6 +448,8 @@ class SinglePulseBackground(Environment):
         self.__log__('Reset environment.')
         self.step = 0
         self.succ_det = 0
+        self.sub_det = 0
+        self.det_time = 0
         self.tf = np.linspace(0, self.cpi_len / self.PRF, self.cpi_len)
 
         # Reset the platform
@@ -556,72 +572,55 @@ class SinglePulseBackground(Environment):
 
         return rd_cpu
 
-    def genDetBlock(self, chirp, n_dets, block_init=0):
-        mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 4
-        block_len = np.arange(self.cpi_len)[
-                        np.logical_and(self.tf[block_init] <= self.tf,
-                                       self.tf < self.tf[block_init] + n_dets * self.det_sz / self.fs)].max() + 1
-        threads_per_block = (16, 16)  # (cpi_threads, samp_threads)
-        thread_ratio = len(self.targets) / block_len
-        sub_blocks = (int(mx_threads / len(self.targets)),
-                      int(mx_threads / block_len))
-        sv = []
-        for sub in self.targets:
-            sv.append([sub(t) for t in self.tf[block_init:block_len + block_init]])
-        sub_pos = cupy.array(np.ascontiguousarray(sv), dtype=np.float64)
+    def genDetBlock(self, chirp, n_dets):
+        rd_cpu = np.zeros((self.det_sz, n_dets), dtype=np.complex128)
+        block_tf = np.arange(self.cpi_len)[
+                        np.logical_and(self.det_time <= self.tf,
+                                       self.tf < self.det_time + (n_dets - 1) * self.det_sz / self.fs)]
+        if len(block_tf) > 0:
+            sv = []
+            for sub in self.targets:
+                sv.append([sub(t) for t in self.tf[block_tf]])
 
-        # Get pan and tilt angles for fixed array
-        mot_pos = self.el_rot(self.dep_ang,
-                              self.az_rot(self.boresight_ang, self.env.vel(self.tf[block_init:block_len + block_init])))
-        pan = np.arctan2(mot_pos[1, :], mot_pos[0, :])
-        el = np.arcsin(mot_pos[2, :] / np.linalg.norm(mot_pos, axis=0))
-        pan_gpu = cupy.array(np.ascontiguousarray(pan), dtype=np.float64)
-        el_gpu = cupy.array(np.ascontiguousarray(el), dtype=np.float64)
+            # Get pan and tilt angles for fixed array
+            mot_pos = self.el_rot(self.dep_ang,
+                                  self.az_rot(self.boresight_ang, self.env.vel(self.tf[block_tf])))
+            pan = np.arctan2(mot_pos[1, :], mot_pos[0, :])
+            el = np.arcsin(mot_pos[2, :] / np.linalg.norm(mot_pos, axis=0))
 
-        # Calculate how much detection data we'll need
-        pt_s = n_dets
-        det_spread = cupy.zeros((n_dets,), dtype=int)
-        rd_cpu = np.random.randn(self.det_sz, pt_s) + 1j * np.random.randn(self.det_sz, pt_s)
-        fft_len = findPowerOf2(self.det_sz)
-        for tx in range(self.n_tx):
-            data_r = cupy.zeros((self.det_sz, pt_s), dtype=np.float64)
-            data_i = cupy.zeros((self.det_sz, pt_s), dtype=np.float64)
-            p_gpu = cupy.array(np.array([np.pi / self.el_bw, np.pi / self.az_bw, c0 / self.fc[tx],
-                                         self.alt / np.sin(self.dep_ang + self.el_bw / 2) / c0,
-                                         self.fs, self.dep_ang, block_init * self.fs / c0, self.det_sz,
-                                         self.boresight_ang, self.az_fac, self.el_fac]),
-                               dtype=np.float64)
-            chirp_gpu = cupy.array(np.tile(chirp[:, tx], (n_dets, 1)).T, dtype=np.complex128)
-            postx_gpu = cupy.array(
-                np.ascontiguousarray(
-                    self.env.pos(self.tf[block_init:block_len + block_init]) + self.tx_locs[:, tx][:, None]),
-                dtype=np.float64)
-            getDetectionCheck[sub_blocks, threads_per_block](postx_gpu, sub_pos,
-                                                             data_r, data_i, pan_gpu, el_gpu, det_spread, p_gpu)
-            cupy.cuda.Device().synchronize()
-            data = data_r + 1j * data_i
-            ret_data = cupy.fft.ifft(cupy.fft.fft(data, fft_len, axis=0) * cupy.fft.fft(chirp_gpu, fft_len, axis=0),
-                                     axis=0)[:self.det_sz, :]
-            cupy.cuda.Device().synchronize()
-            rd_cpu += ret_data.get()
-        n_pulses = det_spread.get()
+            # Calculate how much detection data we'll need
+            det_spread = np.zeros((n_dets,), dtype=int)
+            fft_len = findPowerOf2(self.det_sz)
+            for tx in range(self.n_tx):
+                tx_dets = cupy.zeros((self.det_sz, n_dets), dtype=np.complex128)
+                chirps = cupy.array(np.tile(chirp[:, tx], (n_dets, 1)).T, dtype=np.complex128)
+                postx = self.env.pos(self.tf[block_tf]) + self.tx_locs[:, tx][:, None]
+                for sub in sv:
+                    dr = np.array([*sub[0][1:], 1])[:, None] - postx
+                    rng = np.linalg.norm(dr, axis=0) + c0 / self.fs
+                    att = np.array([applyRadiationPatternCPU(*dr[:, n], rng[n], *dr[:, n], rng[n], pan[n], el[n],
+                                                             2 * np.pi / (c0 / self.fc[tx]), self.az_fac, self.el_fac)
+                                    for n in range(len(block_tf))]).flatten()
+                    ptt = ((self.tf[block_tf] + rng / c0 - self.det_time) * self.fs).astype(int)
+                    tx_dets[ptt % self.det_sz, ptt // self.det_sz] = \
+                        att * np.exp(1j * 2 * np.pi / (c0 / self.fc[tx]) * rng) * 1 / (rng**2)
+                    det_spread[ptt // self.det_sz] = 1
 
-        del ret_data
-        del p_gpu
-        del data_r
-        del data_i
-        del postx_gpu
-        del chirp_gpu
-        del sub_pos
-        del det_spread
-        del pan_gpu
-        del el_gpu
-        cupy.get_default_memory_pool().free_all_blocks()
+                ret_data = cupy.fft.ifft(cupy.fft.fft(tx_dets, fft_len, axis=0) * cupy.fft.fft(chirps, fft_len, axis=0),
+                                         axis=0)[:self.det_sz, :]
+                cupy.cuda.Device().synchronize()
+                rd_cpu += ret_data.get()
+                del tx_dets
+                del chirps
+                del ret_data
+            n_pulses = det_spread
+        else:
+            n_pulses = np.zeros((n_dets,), dtype=int)
 
-        self.__log__(f'GPU Memory after detection block generation: {cupy.get_default_memory_pool().used_bytes()} / '
-                     f'{cupy.get_default_memory_pool().total_bytes()}')
+        self.det_time += n_dets * self.det_sz / self.fs
+        rd_cpu += np.random.normal(0, .2, size=rd_cpu.shape) + 1j * np.random.normal(0, .2, size=rd_cpu.shape)
 
-        return rd_cpu, block_len + block_init, n_pulses
+        return rd_cpu, n_pulses
 
     def getBGFreqMap(self, t):
         zo = \

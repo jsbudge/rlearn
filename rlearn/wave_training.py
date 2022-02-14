@@ -40,17 +40,17 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 1
+games = 200
 eval_games = 1
 max_timesteps = 128
-batch_sz = 64
+batch_sz = 32
 ocean_debug = False
-feedback = True
+feedback = False
 
 # Parameters for the environment (and therefore the agents)
 cpi_len = 64
-az_bw = 50
-el_bw = 50
+az_bw = 45
+el_bw = 40
 dep_ang = 45
 boresight_ang = 90
 altitude = np.random.uniform(1000, 1600)
@@ -61,7 +61,7 @@ env_samples = 200000
 fs_decimation = 8
 az_lim = 90
 el_lim = 20
-beamform_type = 'mmse'
+beamform_type = 'phased'
 
 spd = np.sqrt(vel[0]**2 + vel[1]**2)
 if spd > 10.0:
@@ -124,15 +124,15 @@ print('Initializing agents...')
 wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=state_prelayer,
                           actions=wave_action,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
-                          learning_rate=1e-4,
-                          memory=max_timesteps, exploration=150.0, entropy_regularization=50.0)
+                          learning_rate=1e-3,
+                          memory=max_timesteps, exploration=550.0, entropy_regularization=50.0)
 
 # Instantiate motion agent
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
                             state_preprocessing=state_prelayer + seq_layer,
                             max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-2,
-                            memory=max_timesteps, exploration=30.0,
+                            memory=max_timesteps, exploration=300.0,
                             horizon=10)
 
 # Training regimen
@@ -191,7 +191,7 @@ print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} f
 '''
 
 logs = env.log
-log_num = 10
+log_num = min(10, len(logs) - 1)
 
 nr = int(((env.env.nrange * 2 / c0 - 1 / TAC) * .99 * env.plp) * env.fs)
 back_noise = np.random.rand(max(nr, 5000)) - .5 + 1j * (np.random.rand(max(nr, 5000)) - .5)

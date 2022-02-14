@@ -46,7 +46,7 @@ def plotWeights(mdl, lnum=2, mdl_name=''):
         return
     if 'conv2d' in lnm:
         # It's a convolution layer
-        for m in range(lw.shape[2]):
+        for m in range(1):
             plt.figure(lnm.split('/')[1] + ' layer {} channel {} weights: '.format(lnum, m) + mdl_name)
             grid_sz = int(np.ceil(np.sqrt(lw.shape[3])))
             for n in range(lw.shape[3]):
@@ -54,7 +54,7 @@ def plotWeights(mdl, lnum=2, mdl_name=''):
                 plt.imshow(lw[:, :, m, n])
                 plt.title(f'{n}')
     if 'conv1d' in lnm:
-        for m in range(lw.shape[1]):
+        for m in range(1):
             plt.figure(lnm.split('/')[1] + ' layer {} channel {} weights: '.format(lnum, m) + mdl_name)
             grid_sz = int(np.ceil(np.sqrt(lw.shape[2])))
             for n in range(lw.shape[2]):
@@ -114,11 +114,11 @@ dec_facs = [1]
 epoch_sz = 256
 batch_sz = 16
 neg_per_pos = 1
-minp_sz = 40000
+minp_sz = 16384
 stft_sz = 512
 band_limits = (10e6, fs / 2)
 base_pl = 6.468e-6
-train_runs = 5
+train_runs = 15
 
 segment_base_samp = minp_sz * dec_facs[-1]
 segment_t0 = segment_base_samp / fs   # Segment time in secs
@@ -134,8 +134,8 @@ def genModel(nsam):
     lay = Concatenate()([l_mag, l_phase])
     lay = MaxPooling2D((3, 3))(lay)
     lay = BatchNormalization()(lay)
-    lay = Conv2D(16, (32, 32))(lay)
-    lay = Conv2D(32, (8, 8))(lay)
+    lay = Conv2D(16, (16, 32))(lay)
+    lay = Conv2D(32, (4, 8))(lay)
     lay = Flatten()(lay)
     lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
                 kernel_regularizer=l1_l2(1e-3), bias_regularizer=l1_l2(1e-3))(lay)
