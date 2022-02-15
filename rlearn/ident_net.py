@@ -8,7 +8,7 @@ import numpy as np
 from tqdm import tqdm
 import keras
 from tensorflow.signal import rfft
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.optimizers import Adam, Adadelta
 from tensorflow.keras.constraints import NonNeg
 from keras.layers import Input, Conv2D, Flatten, Dense, BatchNormalization, MaxPooling2D, AveragePooling2D, \
     Dropout, GaussianNoise, Concatenate, LSTM, Embedding, Conv1D, Lambda, MaxPooling1D
@@ -162,10 +162,10 @@ def genParamModel(nsam):
 
 # Generate models for detection and estimation
 mdl = genModel(minp_sz)
-mdl_comp_opts = dict(optimizer=Adam(learning_rate=1e-6), loss='binary_crossentropy', metrics=['accuracy'])
+mdl_comp_opts = dict(optimizer=Adadelta(learning_rate=1.0), loss='binary_crossentropy', metrics=['accuracy'])
 mdl.compile(**mdl_comp_opts)
 par_mdl = genParamModel(seg_sz)
-par_comp_opts = dict(optimizer=Adam(learning_rate=1e-6), loss='huber_loss', metrics=['mean_squared_error'])
+par_comp_opts = dict(optimizer=Adadelta(learning_rate=1.0), loss='huber_loss', metrics=['mean_squared_error'])
 par_mdl.compile(**par_comp_opts)
 
 ramp = np.linspace(0, 1, 100)
@@ -208,7 +208,7 @@ for run in tqdm(range(train_runs)):
                 sig_t += 1 / prf
                 pcnt += 1
 
-        # Run each model data, using different decimation factors
+        # Append data to training set, keeping ratio of categories about even
         bgn = seg_data
         if len(yt) == 0:
             if np.any(seg_truth):

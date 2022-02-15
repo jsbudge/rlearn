@@ -139,7 +139,7 @@ class SinglePulseBackground(Environment):
         # Antenna array definition
         dr = c0 / 9.6e9
         self.tx_locs = np.array([(0, -dr, 0), (0, dr, 0)]).T
-        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (0, dr, 0), (-dr * 2, 0, 0), (dr * 2, 0, 0)]).T
+        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (0, dr * 2, 0), (0, -dr * 2, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -282,7 +282,8 @@ class SinglePulseBackground(Environment):
         if self.det_model is not None:
             total_dets = []
             total_preds = []
-            while self.det_time < self.tf[-1]:
+            its = 0
+            while self.det_time < self.tf[-1] and its < 15:
                 id_data, n_dets = self.genDetBlock(chirps, blocks)
                 total_dets = np.concatenate((total_dets, n_dets))
                 total_preds = np.concatenate((total_preds, self.det_model.predict(id_data.T).flatten()))
@@ -291,13 +292,16 @@ class SinglePulseBackground(Environment):
                     self.det_model.fit(id_data.T, n_dets, epochs=2,
                                        class_weight={0: sum(n_dets) / blocks, 1: 1 - sum(n_dets) / blocks})
                     has_trained = True
+                its += 1
+            while self.det_time < self.tf[-1]:
+                self.det_time += blocks * self.det_sz / self.fs
             try:
                 tmp_lloss = hamming_loss(total_dets.astype(int), total_preds >= .5)
             except AttributeError:
                 tmp_lloss = 0
-            n_close = .5 - tmp_lloss
+            n_close = tmp_lloss - .5
             self.__log__(f'Detection model loss is {tmp_lloss:.2f}')
-            if n_close < -.2:
+            if n_close < -.25:
                 self.sub_det += 1
                 self.__log__(f'Submarine detection check {self.sub_det}')
             if self.sub_det >= 4:
@@ -389,10 +393,10 @@ class SinglePulseBackground(Environment):
 
         det_st = binary_erosion(det_st, np.array([[0, 1., 0], [0, 1, 0], [0, 1, 0]]))
         labels, ntargets = label(det_st)
+        t_rng = 0
+        t_dopp = 0
         if ntargets > 0:
             best_mu = -np.inf
-            t_rng = 0
-            t_dopp = 0
             for n_targ in range(1, ntargets):
                 mu = np.mean(beamform[labels == n_targ])
                 n_rng, n_dopp = np.where(labels == n_targ)
@@ -434,7 +438,10 @@ class SinglePulseBackground(Environment):
                       'wave_corr': state_corr, 'clutter': np.array([clutter_cov.real, clutter_cov.imag]),
                       'currwave': actions['wave'], 'currfc': self.fc, 'currbw': self.bw,
                       'platform_motion': self.env.vel(self.tf[0]),
-                      'target_angs': np.array(ea)}
+                      'target_angs': np.array(ea),
+                      'target_det': np.array([self.succ_det > 0]),
+                      'target_rng': [t_rng],
+                      'target_vel': [t_dopp]}
 
         if self.step >= self.max_episode_timesteps():
             done = 2
@@ -472,7 +479,10 @@ class SinglePulseBackground(Environment):
                 'currwave': init_wave, 'currfc': [9.6e9 for _ in range(self.n_tx)],
                 'currbw': [self.fs / 2 - 10e6 for _ in range(self.n_tx)],
                 'platform_motion': self.env.vel(0),
-                'target_angs': np.array([0.0, 0.0])}
+                'target_angs': np.array([0.0, 0.0]),
+                'target_det': [False],
+                'target_rng': [0],
+                'target_vel': [0]}
 
     def genCPI(self, chirp):
         mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 2
@@ -592,8 +602,8 @@ class SinglePulseBackground(Environment):
             det_spread = np.zeros((n_dets,), dtype=int)
             fft_len = findPowerOf2(self.det_sz)
             for tx in range(self.n_tx):
-                tx_dets = cupy.zeros((self.det_sz, n_dets), dtype=np.complex128)
-                chirps = cupy.array(np.tile(chirp[:, tx], (n_dets, 1)).T, dtype=np.complex128)
+                tx_dets = cupy.zeros((self.det_sz * n_dets,), dtype=np.complex128)
+                chirps = cupy.array(chirp[:, tx], dtype=np.complex128)
                 postx = self.env.pos(self.tf[block_tf]) + self.tx_locs[:, tx][:, None]
                 for sub in sv:
                     dr = np.array([*sub[0][1:], 1])[:, None] - postx
@@ -602,14 +612,13 @@ class SinglePulseBackground(Environment):
                                                              2 * np.pi / (c0 / self.fc[tx]), self.az_fac, self.el_fac)
                                     for n in range(len(block_tf))]).flatten()
                     ptt = ((self.tf[block_tf] + rng / c0 - self.det_time) * self.fs).astype(int)
-                    tx_dets[ptt % self.det_sz, ptt // self.det_sz] = \
+                    tx_dets[ptt] = \
                         att * np.exp(1j * 2 * np.pi / (c0 / self.fc[tx]) * rng) * 1 / (rng**2)
                     det_spread[ptt // self.det_sz] = 1
 
-                ret_data = cupy.fft.ifft(cupy.fft.fft(tx_dets, fft_len, axis=0) * cupy.fft.fft(chirps, fft_len, axis=0),
-                                         axis=0)[:self.det_sz, :]
+                ret_data = cupy.convolve(tx_dets, chirps, mode='same')
                 cupy.cuda.Device().synchronize()
-                rd_cpu += ret_data.get()
+                rd_cpu += ret_data.get().reshape((self.det_sz, n_dets))
                 del tx_dets
                 del chirps
                 del ret_data

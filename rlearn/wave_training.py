@@ -40,7 +40,7 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 200
+games = 1
 eval_games = 1
 max_timesteps = 128
 batch_sz = 32
@@ -102,7 +102,10 @@ motion_state = dict(point_angs=dict(type='float', shape=(2,), min_value=min([env
                                     max_value=max([env.az_lims[1], env.el_lims[1]])),
                     platform_motion=dict(type='float', shape=(3,),
                                          min_value=-30, max_value=30),
-                    target_angs=dict(type='float', shape=(2,), min_value=-np.pi, max_value=np.pi))
+                    target_angs=dict(type='float', shape=(2,), min_value=-np.pi, max_value=np.pi),
+                    target_det=dict(type='float', shape=(1,), min_value=0, max_value=1),
+                    target_rng=dict(type='float', shape=(1,), min_value=0, max_value=env.nsam),
+                    target_vel=dict(type='float', shape=(1,), min_value=-20, max_value=20))
 
 # Define actions for different agents
 wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, max_value=1),
@@ -130,7 +133,7 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
 # Instantiate motion agent
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
-                            state_preprocessing=state_prelayer + seq_layer,
+                            state_preprocessing=seq_layer,
                             max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-2,
                             memory=max_timesteps, exploration=300.0,
                             horizon=10)
