@@ -253,8 +253,6 @@ class SinglePulseBackground(Environment):
         # Update radar parameters to given params
         self.fc = actions['fc']
         self.bw = actions['bw']
-        self.az_pt = actions['scan'][0]
-        self.el_pt = actions['elscan'][0]
         chirps = np.zeros((self.nr, self.n_tx), dtype=np.complex128)
         for n in range(self.n_tx):
             chirps[:, n] = self.genChirp(actions['wave'][:, n], self.bw[n]) * actions['power'][n]
@@ -283,15 +281,16 @@ class SinglePulseBackground(Environment):
             total_dets = []
             total_preds = []
             its = 0
-            while self.det_time < self.tf[-1] and its < 15:
+            while self.det_time < self.tf[-1] and its < 5:
                 id_data, n_dets = self.genDetBlock(chirps, blocks)
-                total_dets = np.concatenate((total_dets, n_dets))
-                total_preds = np.concatenate((total_preds, self.det_model.predict(id_data.T).flatten()))
-                if not has_trained and self.mdl_feedback and sum(n_dets) > 0:
-                    self.__log__('Updating detection model with generated waveforms.')
-                    self.det_model.fit(id_data.T, n_dets, epochs=2,
-                                       class_weight={0: sum(n_dets) / blocks, 1: 1 - sum(n_dets) / blocks})
-                    has_trained = True
+                if sum(n_dets) > 0:
+                    total_dets = np.concatenate((total_dets, n_dets))
+                    total_preds = np.concatenate((total_preds, self.det_model.predict(id_data.T).flatten()))
+                    if not has_trained and self.mdl_feedback:
+                        self.__log__('Updating detection model with generated waveforms.')
+                        self.det_model.fit(id_data.T, n_dets, epochs=2,
+                                           class_weight={0: sum(n_dets) / blocks, 1: 1 - sum(n_dets) / blocks})
+                        has_trained = True
                 its += 1
             while self.det_time < self.tf[-1]:
                 self.det_time += blocks * self.det_sz / self.fs
@@ -316,23 +315,32 @@ class SinglePulseBackground(Environment):
         t_vel = np.linalg.norm(
             t_pos - (np.array([*self.targets[0].pos(self.tf[0]), 1]) - self.env.pos(self.tf[0]))) \
                 * actions['radar'][0]
+        t_spd = np.linalg.norm(t_vel)
         truth_rbin = (2 * np.linalg.norm(t_pos) / c0 - 2 * (
                 self.alt / np.sin(self.dep_ang + self.el_bw / 2)) / c0) * self.fs
-        ea = [np.arctan2(t_pos[1], t_pos[0]) - self.boresight_ang,
+        truth_ea = [np.arctan2(t_pos[1], t_pos[0]) - self.boresight_ang,
               np.arcsin(-t_pos[2] / np.linalg.norm(t_pos)) - self.dep_ang]
 
         self.__log__(f'Target located at {np.linalg.norm(t_pos):.2f}m range, '
-                     f'{ea[0] / DTR:.2f} az and {ea[1] / DTR:.2f} el from beamcenter.')
-        dist_sc = min(np.linalg.norm([(.001 / cpudiff(ea[1], self.az_pt)),
-                                      (.001 / cpudiff(ea[0], self.el_pt + np.pi / 2))]), 1)
+                     f'{truth_ea[0] / DTR:.2f} az and {truth_ea[1] / DTR:.2f} el from beamcenter.')
 
         # PRF quality score
         prf_sc = abs(self.PRF - actions['radar'][0]) / 500.0
-        doppPRF = 2 * np.linalg.norm(t_vel) * np.sin(self.az_bw / 2) * (max(self.fc) + max(self.bw) / 2) / c0
+        doppPRF = 2 * t_spd * np.sin(self.az_bw / 2) * (max(self.fc) + max(self.bw) / 2) / c0
         prf_sc += .01 if doppPRF < actions['radar'][0] else -.25
 
         # MIMO beamforming using some CPI stuff
-        ea = np.array([self.az_pt, self.el_pt + np.pi / 2])
+        ea = np.array([0., 0])
+        for tx_num, sub_fc in enumerate(self.fc):
+            channels = np.array([a[1] == tx_num for a in self.apc])
+            ea += music(curr_cpi[:, 0, channels].T, 1, self.virtual_array[:, channels], c0 / sub_fc,
+                        a_azimuthRange=np.array([self.az_lims[0], self.az_lims[1]]),
+                        a_elevationRange=np.array([self.el_lims[0], self.el_lims[1]])).flatten()
+        ea /= self.n_tx
+        self.az_pt = ea[0]
+        self.el_pt = ea[1]
+        dist_sc = min(np.linalg.norm([(.001 / cpudiff(truth_ea[0], self.az_pt)),
+                                      (.001 / cpudiff(truth_ea[1], self.el_pt))]), 1)
         beamform = np.zeros((self.nsam, self.cpi_len), dtype=np.complex128)
 
         # Direction of beam to synthesize from data
@@ -405,9 +413,9 @@ class SinglePulseBackground(Environment):
                     t_rng = n_rng.mean()
                     t_dopp = (self.cpi_len / 2 - n_dopp.mean()) / \
                              (self.cpi_len * (self.tf[1] - self.tf[0])) / self.fc[0] * c0
-            det_sc = (min(1 / abs(t_rng - truth_rbin), 1) + min(1 / abs(t_dopp - np.linalg.norm(t_vel)), 1)) / 2
+            det_sc = min(1, 1 / mahalanobis(np.array([truth_rbin, t_spd]), np.array([t_rng, t_dopp]), np.array([[3, 0], [0, 1.8]])))
             self.__log__(f'Detection at {t_rng:.2f}, {t_dopp:.2f}m/s\n'
-                         f'Target was located at {truth_rbin:.2f}, {np.linalg.norm(t_vel):.2f}m/s')
+                         f'Target was located at {truth_rbin:.2f}, {t_spd:.2f}m/s')
             if det_sc >= .7:
                 # ea_est = music(beamform, 1, self.virtual_array, self.fc[0])
                 self.succ_det += 1
@@ -427,7 +435,7 @@ class SinglePulseBackground(Environment):
 
         # Append everything to the logs, for pretty pictures later
         self.log.append([beamform, [[amb_sc, detb_sc, det_sc], [prf_sc, dist_sc, det_sc]],
-                         self.tf, actions['scan'], actions['elscan'], actions['wave'], ea, U])
+                         self.tf, self.az_pt, self.el_pt, actions['wave'], truth_ea, U])
 
         # Remove anything longer than the allowed steps, for arbitrary length episodes
         if len(self.log) > self.max_steps:
@@ -438,10 +446,7 @@ class SinglePulseBackground(Environment):
                       'wave_corr': state_corr, 'clutter': np.array([clutter_cov.real, clutter_cov.imag]),
                       'currwave': actions['wave'], 'currfc': self.fc, 'currbw': self.bw,
                       'platform_motion': self.env.vel(self.tf[0]),
-                      'target_angs': np.array(ea),
-                      'target_det': np.array([self.succ_det > 0]),
-                      'target_rng': [t_rng],
-                      'target_vel': [t_dopp]}
+                      'target_angs': ea}
 
         if self.step >= self.max_episode_timesteps():
             done = 2
@@ -479,10 +484,7 @@ class SinglePulseBackground(Environment):
                 'currwave': init_wave, 'currfc': [9.6e9 for _ in range(self.n_tx)],
                 'currbw': [self.fs / 2 - 10e6 for _ in range(self.n_tx)],
                 'platform_motion': self.env.vel(0),
-                'target_angs': np.array([0.0, 0.0]),
-                'target_det': [False],
-                'target_rng': [0],
-                'target_vel': [0]}
+                'target_angs': np.array([0.0, 0.0])}
 
     def genCPI(self, chirp):
         mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 2

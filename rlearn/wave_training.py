@@ -46,6 +46,7 @@ max_timesteps = 128
 batch_sz = 32
 ocean_debug = False
 feedback = False
+save_logs = True
 
 # Parameters for the environment (and therefore the agents)
 cpi_len = 64
@@ -80,7 +81,7 @@ env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=cpi_len, az_bw=
                             altitude=altitude, plp=plp, env_samples=env_samples, fs_decimation=fs_decimation,
                             az_lim=az_lim, el_lim=el_lim,
                             beamform_type=beamform_type, initial_pos=pos, initial_velocity=vel, det_model=det_model,
-                            par_model=par_model, mdl_feedback=feedback, log=True)
+                            par_model=par_model, mdl_feedback=feedback, log=save_logs)
 
 # Define preprocessing layer (just a normalization)
 state_prelayer = [dict(type='linear_normalization'),
@@ -102,10 +103,7 @@ motion_state = dict(point_angs=dict(type='float', shape=(2,), min_value=min([env
                                     max_value=max([env.az_lims[1], env.el_lims[1]])),
                     platform_motion=dict(type='float', shape=(3,),
                                          min_value=-30, max_value=30),
-                    target_angs=dict(type='float', shape=(2,), min_value=-np.pi, max_value=np.pi),
-                    target_det=dict(type='float', shape=(1,), min_value=0, max_value=1),
-                    target_rng=dict(type='float', shape=(1,), min_value=0, max_value=env.nsam),
-                    target_vel=dict(type='float', shape=(1,), min_value=-20, max_value=20))
+                    target_angs=dict(type='float', shape=(2,), min_value=-2 * np.pi, max_value=2 * np.pi))
 
 # Define actions for different agents
 wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, max_value=1),
@@ -116,11 +114,7 @@ wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, m
                               max_value=5)
                    )
 
-motion_action = dict(radar=dict(type='float', shape=(1,), min_value=env.PRFrange[0], max_value=env.PRFrange[1]),
-                     scan=dict(type='float', shape=(1,), min_value=env.az_lims[0],
-                               max_value=env.az_lims[1]),
-                     elscan=dict(type='float', shape=(1,), min_value=env.el_lims[0],
-                                 max_value=env.el_lims[1]))
+motion_action = dict(radar=dict(type='float', shape=(1,), min_value=env.PRFrange[0], max_value=env.PRFrange[1]))
 
 # Instantiate wave agent
 print('Initializing agents...')
@@ -133,7 +127,7 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
 # Instantiate motion agent
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
-                            state_preprocessing=seq_layer,
+                            state_preprocessing=state_prelayer + seq_layer,
                             max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-2,
                             memory=max_timesteps, exploration=300.0,
                             horizon=10)
@@ -239,8 +233,8 @@ axes = [plt.subplot(gs[0, 0], projection='polar'), plt.subplot(gs[0, 1]), plt.su
 camera = Camera(fig)
 for l in logs:
     fpos = env.env.pos(l[2])[:, 0]
-    az_bm = (l[3][0] + env.boresight_ang)
-    el_bm = (l[4][0] + env.dep_ang)
+    az_bm = (l[3] + env.boresight_ang)
+    el_bm = (l[4] + env.dep_ang)
     dopp_freqs = np.fft.fftshift(np.fft.fftfreq(l[0].shape[1], (l[2][1] - l[2][0]))) / env.fc[0] * c0
 
     # Draw the beam direction and platform

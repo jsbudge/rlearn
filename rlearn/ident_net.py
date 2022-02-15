@@ -118,7 +118,7 @@ minp_sz = 16384
 stft_sz = 512
 band_limits = (10e6, fs / 2)
 base_pl = 6.468e-6
-train_runs = 15
+train_runs = 30
 
 segment_base_samp = minp_sz * dec_facs[-1]
 segment_t0 = segment_base_samp / fs   # Segment time in secs
