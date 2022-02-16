@@ -40,12 +40,12 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 1
+games = 50
 eval_games = 1
 max_timesteps = 128
 batch_sz = 32
 ocean_debug = False
-feedback = False
+feedback = True
 save_logs = True
 
 # Parameters for the environment (and therefore the agents)
@@ -62,7 +62,7 @@ env_samples = 200000
 fs_decimation = 8
 az_lim = 90
 el_lim = 20
-beamform_type = 'phased'
+beamform_type = 'mmse'
 
 spd = np.sqrt(vel[0]**2 + vel[1]**2)
 if spd > 10.0:
@@ -89,6 +89,10 @@ state_prelayer = [dict(type='linear_normalization'),
 
 # Give a sense of motion to the agent
 seq_layer = [dict(type='sequence', length=2)]
+
+# Optimization spec
+opt_spec = dict(optimizer='adadelta', learning_rate=1., multi_step=5, subsampling_fraction=64,
+                clipping_threshold=1e-2, linesearch_iterations=2)
 
 # Define states for different agents
 wave_state = dict(currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
@@ -121,14 +125,15 @@ print('Initializing agents...')
 wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=state_prelayer,
                           actions=wave_action,
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
-                          learning_rate=1e-3,
-                          memory=max_timesteps, exploration=550.0, entropy_regularization=50.0)
+                          critic_optimizer=opt_spec,
+                          memory=max_timesteps, exploration=5000.0, entropy_regularization=500.0, horizon=5)
 
 # Instantiate motion agent
 motion_agent = Agent.create(agent='ac', states=motion_state,
                             actions=motion_action,
                             state_preprocessing=state_prelayer + seq_layer,
-                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99, learning_rate=1e-2,
+                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
+                            critic_optimizer=opt_spec,
                             memory=max_timesteps, exploration=300.0,
                             horizon=10)
 
@@ -413,3 +418,7 @@ ax.scatter(rot_array[0, :],
            rot_array[2, :], marker='*')
 
 plt.show()
+
+if feedback:
+    det_model.save('./id_model')
+    par_model.save('./par_model')

@@ -118,6 +118,7 @@ class SinglePulseBackground(Environment):
         self.v0 = initial_velocity
         self.p0 = initial_pos
         self.box = (-2000, 2000, -2000, 2000)
+        self.mahal_vi = np.linalg.pinv(np.array([[10., 0], [0, 1.8]]))
 
         # Set up logger, if wanted
         if log:
@@ -138,8 +139,8 @@ class SinglePulseBackground(Environment):
 
         # Antenna array definition
         dr = c0 / 9.6e9
-        self.tx_locs = np.array([(0, -dr, 0), (0, dr, 0)]).T
-        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (0, dr * 2, 0), (0, -dr * 2, 0)]).T
+        self.tx_locs = np.array([(0, dr / 2, 0), (0, -dr / 2, 0)]).T
+        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (0, dr * 2, 0), (0, -dr * 2, 0), (0, 0, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -281,7 +282,7 @@ class SinglePulseBackground(Environment):
             total_dets = []
             total_preds = []
             its = 0
-            while self.det_time < self.tf[-1] and its < 5:
+            while self.det_time < self.tf[-1] and its < 2:
                 id_data, n_dets = self.genDetBlock(chirps, blocks)
                 if sum(n_dets) > 0:
                     total_dets = np.concatenate((total_dets, n_dets))
@@ -291,14 +292,15 @@ class SinglePulseBackground(Environment):
                         self.det_model.fit(id_data.T, n_dets, epochs=2,
                                            class_weight={0: sum(n_dets) / blocks, 1: 1 - sum(n_dets) / blocks})
                         has_trained = True
-                its += 1
+                    its += 1
             while self.det_time < self.tf[-1]:
                 self.det_time += blocks * self.det_sz / self.fs
             try:
-                tmp_lloss = hamming_loss(total_dets.astype(int), total_preds >= .5)
+                tmp_lloss = balanced_accuracy_score(total_dets.astype(int), total_preds >= .5,
+                                                    sample_weight=abs(.5 - total_preds))
             except AttributeError:
                 tmp_lloss = 0
-            n_close = tmp_lloss - .5
+            n_close = .5 - tmp_lloss
             self.__log__(f'Detection model loss is {tmp_lloss:.2f}')
             if n_close < -.25:
                 self.sub_det += 1
@@ -331,12 +333,18 @@ class SinglePulseBackground(Environment):
 
         # MIMO beamforming using some CPI stuff
         ea = np.array([0., 0])
-        for tx_num, sub_fc in enumerate(self.fc):
-            channels = np.array([a[1] == tx_num for a in self.apc])
-            ea += music(curr_cpi[:, 0, channels].T, 1, self.virtual_array[:, channels], c0 / sub_fc,
-                        a_azimuthRange=np.array([self.az_lims[0], self.az_lims[1]]),
-                        a_elevationRange=np.array([self.el_lims[0], self.el_lims[1]])).flatten()
-        ea /= self.n_tx
+        av_pts = 0
+        for cp in range(5):
+            for tx_num, sub_fc in enumerate(self.fc):
+                channels = np.array([a[1] == tx_num for a in self.apc])
+                try:
+                    ea += music(curr_cpi[:, cp, channels].T, 1, (self.virtual_array[:, channels].T + self.env.pos(self.tf[0])).T,
+                                c0 / sub_fc, a_azimuthRange=np.array([self.az_lims[0], self.az_lims[1]]),
+                                a_elevationRange=np.array([self.el_lims[0], self.el_lims[1]])).flatten()
+                    av_pts += 1
+                except ValueError:
+                    self.__log__(f'Could not fit MUSIC to channel {tx_num}')
+        ea /= av_pts
         self.az_pt = ea[0]
         self.el_pt = ea[1]
         dist_sc = min(np.linalg.norm([(.001 / cpudiff(truth_ea[0], self.az_pt)),
@@ -413,7 +421,7 @@ class SinglePulseBackground(Environment):
                     t_rng = n_rng.mean()
                     t_dopp = (self.cpi_len / 2 - n_dopp.mean()) / \
                              (self.cpi_len * (self.tf[1] - self.tf[0])) / self.fc[0] * c0
-            det_sc = min(1, 1 / mahalanobis(np.array([truth_rbin, t_spd]), np.array([t_rng, t_dopp]), np.array([[3, 0], [0, 1.8]])))
+            det_sc = min(1, 1 / mahalanobis(np.array([truth_rbin, t_spd]), np.array([t_rng, t_dopp]), self.mahal_vi))
             self.__log__(f'Detection at {t_rng:.2f}, {t_dopp:.2f}m/s\n'
                          f'Target was located at {truth_rbin:.2f}, {t_spd:.2f}m/s')
             if det_sc >= .7:
@@ -602,7 +610,6 @@ class SinglePulseBackground(Environment):
 
             # Calculate how much detection data we'll need
             det_spread = np.zeros((n_dets,), dtype=int)
-            fft_len = findPowerOf2(self.det_sz)
             for tx in range(self.n_tx):
                 tx_dets = cupy.zeros((self.det_sz * n_dets,), dtype=np.complex128)
                 chirps = cupy.array(chirp[:, tx], dtype=np.complex128)

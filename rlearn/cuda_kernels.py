@@ -146,7 +146,7 @@ def genSubProfile(pathrx, pathtx, subs, pan, el, bg, pd_r, pd_i, params):
 
         sub_x = subs[subnum, tt, 1]
         sub_y = subs[subnum, tt, 2]
-        spow = subs[subnum, tt, 0] * 100
+        spow = subs[subnum, tt, 0] * 500
 
         # Calc out wave height
         x_i = sub_x % params[6] / params[6] * bg.shape[1]

@@ -68,8 +68,7 @@ def MUSICSinglePoint(
 
     # Create the sample covariance from the data
     numberSamples = a_receivedSignals.shape[1]
-    sampleCovariance = (1 / numberSamples) * np.matmul(a_receivedSignals,
-                                                       np.transpose(np.conjugate(a_receivedSignals)))
+    sampleCovariance = np.cov(a_receivedSignals)
 
     # Find the Nullspace matrix
     eigenValues, eigenVectors = np.linalg.eig(sampleCovariance)
