@@ -227,13 +227,13 @@ def _runMUSICGPU(a_azimuthGrid, a_elevationGrid, a_spectrumMUSIC,
         d_nullMatrix, a_waveLength, a_antennaNumber,
         d_relativePositionBody, d_azimuthSin, d_azimuthCos,
         d_elevationSin, d_elevationCos, d_spectrumMUSIC)
-    cuda.synchronize()
+    cupy.cuda.Device().synchronize()
 
     # Peak Estimation on the GPU
     d_isPeak = cupy.array(np.zeros(np.shape(a_spectrumMUSIC), dtype=int), dtype=int)
     _estimatePeaksGPU[blocksPerGrid, threadsPerBlock](
         d_isPeak, d_spectrumMUSIC, a_targetNumber)
-    cuda.synchronize()
+    cupy.cuda.Device().synchronize()
 
     spectrumMUSIC = d_spectrumMUSIC.get()
     isPeak = d_isPeak.get()

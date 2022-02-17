@@ -334,21 +334,23 @@ class SinglePulseBackground(Environment):
         # MIMO beamforming using some CPI stuff
         ea = np.array([0., 0])
         av_pts = 0
-        for cp in range(5):
+        for cp in range(1):
             for tx_num, sub_fc in enumerate(self.fc):
                 channels = np.array([a[1] == tx_num for a in self.apc])
                 try:
-                    ea += music(curr_cpi[:, cp, channels].T, 1, (self.virtual_array[:, channels].T + self.env.pos(self.tf[0])).T,
+                    ea += music(curr_cpi[:, cp, channels].T, 1,
+                                self.virtual_array[:, channels].T,
                                 c0 / sub_fc, a_azimuthRange=np.array([self.az_lims[0], self.az_lims[1]]),
                                 a_elevationRange=np.array([self.el_lims[0], self.el_lims[1]])).flatten()
                     av_pts += 1
                 except ValueError:
                     self.__log__(f'Could not fit MUSIC to channel {tx_num}')
-        ea /= av_pts
+        if av_pts > 0:
+            ea /= av_pts
         self.az_pt = ea[0]
         self.el_pt = ea[1]
-        dist_sc = min(np.linalg.norm([(.001 / cpudiff(truth_ea[0], self.az_pt)),
-                                      (.001 / cpudiff(truth_ea[1], self.el_pt))]), 1)
+        dist_sc = min(np.linalg.norm([(.001 / cpudiff(truth_ea[0], self.az_pt + self.boresight_ang)),
+                                      (.001 / cpudiff(truth_ea[1], self.el_pt + self.dep_ang))]), 1)
         beamform = np.zeros((self.nsam, self.cpi_len), dtype=np.complex128)
 
         # Direction of beam to synthesize from data
@@ -390,24 +392,28 @@ class SinglePulseBackground(Environment):
         det_sc = 0
 
         kernel = cupy.array(self.cfar_kernel, dtype=np.float64)
+        erosion_struct = cupy.array(np.array([[0, 1., 0], [0, 1, 0], [0, 1, 0]]), dtype=np.float64)
         bf = cupy.array(beamform, dtype=np.float64)
         tmp = cupyx.scipy.signal.fftconvolve(bf, kernel, mode='same')
         tmp_std = cupyx.scipy.signal.fftconvolve(bf**2, kernel, mode='same')
         cupy.cuda.Device().synchronize()
-        thresh = tmp.get()
-        thresh_std = tmp_std.get()
+
+        thresh_alpha = np.sqrt(tmp_std - tmp * tmp)
+        det_gpu = bf > tmp + thresh_alpha * 2
+        det_gpu = cupyx.scipy.ndimage.binary_erosion(det_gpu, erosion_struct)
+        cupy.cuda.Device().synchronize()
+        det_st = det_gpu.get()
 
         # Free all the GPU memory
         del bf
         del kernel
         del tmp
         del tmp_std
+        del thresh_alpha
+        del det_gpu
+        del erosion_struct
         cupy.get_default_memory_pool().free_all_blocks()
 
-        thresh_alpha = np.sqrt(thresh_std - thresh ** 2)
-        det_st = beamform > thresh + thresh_alpha * 2
-
-        det_st = binary_erosion(det_st, np.array([[0, 1., 0], [0, 1, 0], [0, 1, 0]]))
         labels, ntargets = label(det_st)
         t_rng = 0
         t_dopp = 0
