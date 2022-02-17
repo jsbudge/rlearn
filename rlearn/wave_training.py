@@ -42,7 +42,7 @@ def sliding_window(data, win_size, func=None):
 
 games = 1
 eval_games = 1
-max_timesteps = 43
+max_timesteps = 64
 batch_sz = 32
 ocean_debug = False
 feedback = False
@@ -103,12 +103,9 @@ wave_state = dict(currwave=dict(type='float', shape=(100, env.n_tx), min_value=0
                               max_value=12e9),
                   currbw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
                               max_value=env.fs / 2 - 5e6),
-                  clutter=dict(type='float', shape=(2, env.v_ants, env.v_ants), min_value=-1, max_value=1))
-motion_state = dict(point_angs=dict(type='float', shape=(2,), min_value=min([env.az_lims[0], env.el_lims[0]]),
-                                    max_value=max([env.az_lims[1], env.el_lims[1]])),
-                    platform_motion=dict(type='float', shape=(3,),
-                                         min_value=-30, max_value=30),
-                    target_angs=dict(type='float', shape=(2,), min_value=-2 * np.pi, max_value=2 * np.pi))
+                  clutter=dict(type='float', shape=(2, env.v_ants, env.v_ants), min_value=-1, max_value=1),
+                  target_angs=dict(type='float', shape=(2,), min_value=-np.pi, max_value=np.pi),
+                  prf=dict(type='float', shape=(1,), min_value=0, max_value=5000.))
 
 # Define actions for different agents
 wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, max_value=1),
@@ -119,8 +116,6 @@ wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, m
                               max_value=5)
                    )
 
-motion_action = dict(radar=dict(type='float', shape=(1,), min_value=env.PRFrange[0], max_value=env.PRFrange[1]))
-
 # Instantiate wave agent
 print('Initializing agents...')
 wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=state_prelayer,
@@ -128,15 +123,6 @@ wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=st
                           max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
                           critic_optimizer=opt_spec,
                           memory=max_timesteps, exploration=5000.0, entropy_regularization=500.0, horizon=5)
-
-# Instantiate motion agent
-motion_agent = Agent.create(agent='ac', states=motion_state,
-                            actions=motion_action,
-                            state_preprocessing=state_prelayer + seq_layer,
-                            max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
-                            critic_optimizer=opt_spec,
-                            memory=max_timesteps, exploration=300.0,
-                            horizon=10)
 
 # Training regimen
 print('Beginning training...')
@@ -148,13 +134,10 @@ for episode in tqdm(range(games)):
     sum_rewards = 0.0
     num_updates = 0
     while not terminal:
-        wave_actions = wave_agent.act(states={key: states[key] for key in wave_state.keys()})
-        motion_actions = motion_agent.act(states={key: states[key] for key in motion_state.keys()})
-        actions = {**wave_actions, **motion_actions}
+        actions = wave_agent.act(states)
         states, terminal, reward = env.execute(actions=actions)
-        num_updates += wave_agent.observe(terminal=terminal, reward=reward[0])
-        num_updates += motion_agent.observe(terminal=terminal, reward=reward[1])
-        sum_rewards += sum(reward)
+        num_updates += wave_agent.observe(terminal=terminal, reward=reward)
+        sum_rewards += reward
     reward_track[episode] = sum_rewards
 
 # Testing loop
@@ -165,18 +148,14 @@ for g in tqdm(range(eval_games)):
     # Initialize episode
     states = env.reset()
     terminal = False
-    internals = [wave_agent.initial_internals(), motion_agent.initial_internals()]
+    internals = wave_agent.initial_internals()
     timestep = 0
 
     while not terminal:
         # Episode timestep
-        wa, internals[0] = wave_agent.act(states={key: states[key] for key in wave_state.keys()},
-                                          internals=internals[0],
+        actions, internals = wave_agent.act(states,
+                                          internals=internals,
                                           independent=True, deterministic=True)
-        ma, internals[1] = motion_agent.act(states={key: states[key] for key in motion_state.keys()},
-                                            internals=internals[1],
-                                            independent=True, deterministic=True)
-        actions = {**wa, **ma}
         states, terminal, reward = env.execute(actions=actions)
 
 env.close()
@@ -344,7 +323,7 @@ if plot_profiler:
         window_pulse = np.fft.ifft(np.fft.fft(pulse, findPowerOf2(nr)) * taylor(findPowerOf2(nr)))
         for y in range(env.n_tx):
             plt.subplot(env.n_tx, env.n_tx, x * env.n_tx + y + 1)
-            prf_plot = actions['radar'][0] * 2 if actions['radar'] is not None else prf_val
+            prf_plot = env.PRF * 2 if env.PRF is not None else prf_val
             amb = ambiguity(genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, y],
                                      env.nr, env.nr / env.fs, env.fc[y], env.bw[y]),
                             window_pulse, prf_plot, 150, mag=True, normalize=False)
@@ -357,21 +336,13 @@ if plot_profiler:
     plt.tight_layout()
 
     plt.figure('Rewards')
-    wave_scores = np.array([l[1][0] for l in logs])
-    motion_scores = np.array([l[1][1] for l in logs])
+    wave_scores = np.array([l[1] for l in logs])
     times = np.array([l[2][0] for l in logs])
-    plt.subplot(2, 1, 1)
     plt.title('Wave Agent')
     for sc_part in range(wave_scores.shape[1], 0, -1):
         plt.plot(times, np.sum(wave_scores[:, :sc_part], axis=1))
         plt.fill_between(times, np.sum(wave_scores[:, :sc_part], axis=1))
     plt.legend(['Detection', 'Detected', 'Ambiguity'])
-    plt.subplot(2, 1, 2)
-    plt.title('Motion Agent')
-    for sc_part in range(motion_scores.shape[1], 0, -1):
-        plt.plot(times, np.sum(motion_scores[:, :sc_part], axis=1))
-        plt.fill_between(times, np.sum(motion_scores[:, :sc_part], axis=1))
-    plt.legend(['Detection', 'Pointing', 'PRF Agility'])
 
     # Ocean waves, for pretty picture and debugging
     if ocean_debug:
