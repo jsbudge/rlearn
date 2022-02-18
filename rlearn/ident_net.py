@@ -37,6 +37,20 @@ def db(x):
     return 20 * np.log10(ret)
 
 
+def readTrainingDataGen(fnme, chunk):
+    with open(fnme + '_data.dat', 'rb') as f:
+        with open(fnme + '_labels.dat', 'rb') as f_l:
+            nsam = int(np.fromfile(f, 'float64', 1)[0])
+            run = True
+            while run:
+                ret = np.fromfile(f, 'complex128', chunk * nsam)
+                lab = np.fromfile(f_l, 'bool', chunk)
+                if len(ret) > 0:
+                    ret = ret.reshape((chunk, nsam))
+                    run = False
+                yield ret, lab
+
+
 def plotWeights(mdl, lnum=2, mdl_name=''):
     lw = mdl.layers[lnum].get_weights()
     if len(lw) > 0:
@@ -111,8 +125,8 @@ def plotActivations(classifier, inp):
 
 # Base net params
 dec_facs = [1]
-epoch_sz = 256
-batch_sz = 16
+epoch_sz = 64
+batch_sz = 32
 neg_per_pos = 1
 minp_sz = 16384
 stft_sz = 512
@@ -174,81 +188,25 @@ hist_val_loss = []
 hist_acc = []
 hist_val_acc = []
 
-sig_on = True
+for data, labels in tqdm(readTrainingDataGen('/home/jeff/repo/rlearn/mdl_data/2022218211216', epoch_sz)):
 
-genparams = lambda: (np.random.rand() * 400 + 100, int((np.random.rand() * (base_pl - 1e-6) + 1e-6) * fs),
-                     np.random.rand() * (band_limits[1] - band_limits[0]) + band_limits[0])
-
-for run in tqdm(range(train_runs)):
-    t0 = 0
-    sig_t = 0
-    count = 0
-    Xt = []
-    yt = []
-    p_yt = []
-    prf, nr, bw = genparams()
-    pcnt = 0
-    while len(Xt) < epoch_sz * 2:
-        # Generate the data for this segment
-        seg_data = np.random.normal(0, 1, seg_sz) + 1j * np.random.normal(0, 1, seg_sz)
-        seg_truth = np.zeros(seg_sz)
-        if pcnt > 10:
-            prf, nr, bw = genparams()
-            pcnt = 0
-        # First, get the signal we may or may not use here
-        if sig_on:
-            while sig_t < t0:
-                sig_t += 1 / prf
-            # Continue to pulse to the PRF during the segment length
-            while sig_t < t0 + segment_t0:
-                ns = int((sig_t - t0) * fs)
-                seg_data[ns:min(seg_sz, ns + nr)] += \
-                    genPulse(ramp, np.random.rand(len(ramp)), nr, nr / fs, 9.6e9, bw)[:min(seg_sz - ns, nr)]
-                seg_truth[ns:min(seg_sz, ns + nr)] = 1
-                sig_t += 1 / prf
-                pcnt += 1
-
-        # Append data to training set, keeping ratio of categories about even
-        bgn = seg_data
-        if len(yt) == 0:
-            if np.any(seg_truth):
-                yt.append([0])
-                p_yt.append([nr / fs * 1e6, bw * 2 / fs])
-            else:
-                yt.append([1])
-                count += 1
-            Xt.append(bgn)
-        else:
-            if np.any(seg_truth):
-                if count >= neg_per_pos:
-                    yt.append([0])
-                    p_yt.append([nr / fs * 1e6, bw * 2 / fs])
-                    Xt.append(bgn)
-                    count = 0
-            else:
-                if count < neg_per_pos:
-                    yt.append([1])
-                    Xt.append(bgn)
-                    count += 1
-        t0 += segment_t0
-    p_Xt = np.array(Xt)[(np.array(yt) == 0).flatten(), ...]
-    p_yt = np.array(p_yt)
-    Xs = np.array(Xt)[:batch_sz, ...]
-    ys = np.array(yt)[:batch_sz, ...]
-    Xt = np.array(Xt)[batch_sz:, ...]
-    yt = np.array(yt)[batch_sz:, ...]
+    Xs = data[:batch_sz, :]
+    Xt = data[batch_sz:, :]
+    ys = labels[:batch_sz]
+    yt = labels[batch_sz:]
     Xs, ys = shuffle(Xs, ys)
     Xt, yt = shuffle(Xt, yt)
-    p_Xt, p_yt = shuffle(p_Xt, p_yt)
 
     h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=5, batch_size=batch_sz,
-                callbacks=[ReduceLROnPlateau(), TerminateOnNaN()])
-    ph = par_mdl.fit(p_Xt, p_yt, epochs=5, batch_size=batch_sz,
-                callbacks=[TerminateOnNaN()])
+                callbacks=[ReduceLROnPlateau(), TerminateOnNaN()],
+                class_weight={0: sum(ys) / len(ys), 1: 1 - sum(ys) / len(ys)})
     hist_loss = np.concatenate((hist_loss, h.history['loss']))
     hist_val_loss = np.concatenate((hist_val_loss, h.history['val_loss']))
     hist_acc = np.concatenate((hist_acc, h.history['accuracy']))
     hist_val_acc = np.concatenate((hist_val_acc, h.history['val_accuracy']))
+
+#ph = par_mdl.fit(p_Xt, p_yt, epochs=5, batch_size=batch_sz,
+#                callbacks=[TerminateOnNaN()])
 
 plt.figure('Losses')
 plt.plot(np.array(hist_loss).T)
@@ -263,15 +221,15 @@ plt.legend([f'{d}_acc' for d in dec_facs] + [f'{d}_val_acc' for d in dec_facs])
 for idx, l in enumerate(mdl.layers):
     plotWeights(mdl, idx, mdl_name=f'model')
 
-plotActivations(mdl, Xs[ys[:, 0] == 0, :][0, :])
+plotActivations(mdl, Xs[ys == 1, :][0, :])
 
 # Model analysis
 test_mdl = genModel(minp_sz)
 test_mdl.compile(**mdl_comp_opts)
-sing_true = Xs[ys[:, 0] == 0, :][0, :].reshape((1, seg_sz))
-sing_false = Xs[ys[:, 0] == 1, :][0, :].reshape((1, seg_sz))
-sing_y = ys[ys[:, 0] == 0, :][0, :].reshape((1, 1))
-sing_fy = ys[ys[:, 0] == 1, :][0, :].reshape((1, 1))
+sing_true = Xs[ys == 1, :][0, :].reshape((1, seg_sz))
+sing_false = Xs[ys == 0, :][0, :].reshape((1, seg_sz))
+sing_y = ys[ys == 1]
+sing_fy = ys[ys == 0]
 
 ms = test_mdl.fit(sing_false, sing_fy, epochs=20, verbose=0, callbacks=[TerminateOnNaN()])
 
@@ -311,7 +269,7 @@ for n in range(Xs.shape[0]):
 
 # Save out the model for future use
 mdl.save('./id_model')
-par_mdl.save('./par_model')
+#par_mdl.save('./par_model')
 
 #plot_model(mdl, to_file='mdl.png', show_shapes=True)
 #plot_model(par_mdl, to_file='par_mdl.png', show_shapes=True)

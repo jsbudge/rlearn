@@ -30,6 +30,7 @@ from numba.core.errors import NumbaPerformanceWarning
 import warnings
 from logging import debug, info, error, basicConfig
 from celluloid import Camera
+from pathlib import Path
 
 warnings.simplefilter('ignore', category=NumbaPerformanceWarning)
 
@@ -91,7 +92,7 @@ class SinglePulseBackground(Environment):
     def __init__(self, max_timesteps=128, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90, altitude=1524,
                  plp=.5, env_samples=100000, fs_decimation=8, az_lim=90, el_lim=10, beamform_type='mmse',
                  initial_pos=(0, 0), initial_velocity=(0, 0), det_model=None, par_model=None, log=False,
-                 mdl_feedback=False):
+                 mdl_feedback=False, gen_train_data=False):
         super().__init__()
         self.cpi_len = cpi_len
         self.az_bw = az_bw * DTR
@@ -121,8 +122,11 @@ class SinglePulseBackground(Environment):
         self.mahal_vi = np.linalg.pinv(np.array([[10., 0], [0, 1.8]]))
 
         # Set up logger, if wanted
+        tm = time.gmtime()
+        self.feedback_nme = (f'./mdl_data/{tm.tm_year}{tm.tm_mon}{tm.tm_mday}{tm.tm_hour}{tm.tm_min}{tm.tm_sec}_data.dat',
+                             f'./mdl_data/{tm.tm_year}{tm.tm_mon}{tm.tm_mday}{tm.tm_hour}{tm.tm_min}{tm.tm_sec}_labels.dat')
+        self.gen_train_data = gen_train_data
         if log:
-            tm = time.gmtime()
             fnme = f'./logs/{tm.tm_year}{tm.tm_mon}{tm.tm_mday}{tm.tm_hour}{tm.tm_min}{tm.tm_sec}_run.log'
             basicConfig(filename=fnme, filemode='w', format='%(message)s', level=20)
         self.log = log
@@ -283,6 +287,11 @@ class SinglePulseBackground(Environment):
                 if sum(n_dets) > 0:
                     total_dets = np.concatenate((total_dets, n_dets))
                     total_preds = np.concatenate((total_preds, self.det_model.predict(id_data.T).flatten()))
+                    if self.gen_train_data:
+                        if not saveTrainingData(self.feedback_nme, id_data, n_dets):
+                            self.__log__('Training data NOT saved.')
+                        else:
+                            self.__log__(f'{blocks} blocks of training data saved.')
                     if not has_trained and self.mdl_feedback:
                         self.__log__('Updating detection model with generated waveforms.')
                         self.det_model.fit(id_data.T, n_dets, epochs=2,
@@ -293,13 +302,13 @@ class SinglePulseBackground(Environment):
                 self.det_time += blocks * self.det_sz / self.fs
             try:
                 conf_mat = confusion_matrix(total_dets.astype(int), total_preds >= .5)
-                n_close = conf_mat[1, 0] - conf_mat[1, 1]
-                tmp_lloss = balanced_accuracy_score(total_dets.astype(int), total_preds >= .5,
-                                                    sample_weight=abs(.5 - total_preds))
+                n_close = (conf_mat[1, 0] + conf_mat[0, 1] - conf_mat[1, 1]) / len(total_preds)
+                self.__log__(f'Detection accuracy: \n{conf_mat[0, 0]} correct vs. {conf_mat[0, 1]} misclass no pulse.'
+                             f'\n{conf_mat[1, 1]} correct vs. {conf_mat[1, 0]} misclass no pulse.')
             except AttributeError:
-                tmp_lloss = 0
+                self.__log__('Detection failed due to AttributeError.')
                 n_close = 0
-            self.__log__(f'Detection accuracy is {tmp_lloss:.2f}')
+
             if n_close < -.25:
                 self.sub_det += 1
                 self.__log__(f'Submarine detection check {self.sub_det}')
@@ -327,7 +336,7 @@ class SinglePulseBackground(Environment):
         # MIMO beamforming using some CPI stuff
         ea = np.array([0., 0])
         av_pts = 0
-        for cp in range(1):
+        for cp in range(3):
             for tx_num, sub_fc in enumerate(self.fc):
                 channels = np.array([a[1] == tx_num for a in self.apc])
                 try:
@@ -635,7 +644,7 @@ class SinglePulseBackground(Environment):
             n_pulses = np.zeros((n_dets,), dtype=int)
 
         self.det_time += n_dets * self.det_sz / self.fs
-        rd_cpu += np.random.normal(0, .2, size=rd_cpu.shape) + 1j * np.random.normal(0, .2, size=rd_cpu.shape)
+        rd_cpu += np.random.normal(0, 1e-9, size=rd_cpu.shape) + 1j * np.random.normal(0, 1e-9, size=rd_cpu.shape)
 
         return rd_cpu, n_pulses
 
@@ -953,3 +962,22 @@ def ambiguity(s1, s2, prf, dopp_bins, mag=True, normalize=True):
         return abs(A) ** 2, fdopp, np.linspace(-len(s1) / 2 / fs, len(s1) / 2 / fs, len(s1))
     else:
         return A, fdopp, np.linspace(-dopp_bins / 2 * fs / c0, dopp_bins / 2 * fs / c0, dopp_bins)
+
+
+def saveTrainingData(fnme, data, labels):
+    fid = Path(fnme[0])
+    try:
+        if fid.is_file():
+            with open(fnme[0], 'ab') as f:
+                data.astype('complex128').tofile(f)
+            with open(fnme[1], 'ab') as f:
+                labels.astype('bool').tofile(f)
+        else:
+            with open(fnme[0], 'wb') as f:
+                f.write(np.float64(data.shape[0]))
+                data.astype('complex128').tofile(f)
+            with open(fnme[1], 'wb') as f:
+                labels.astype('bool').tofile(f)
+        return True
+    except:
+        return False

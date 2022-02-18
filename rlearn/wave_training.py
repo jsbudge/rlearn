@@ -40,13 +40,14 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 1
+games = 1000
 eval_games = 1
 max_timesteps = 64
 batch_sz = 32
 ocean_debug = False
-feedback = False
-save_logs = False
+feedback = True
+gen_data = False
+save_logs = True
 plot_profiler = True
 
 # Parameters for the environment (and therefore the agents)
@@ -82,7 +83,7 @@ env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=cpi_len, az_bw=
                             altitude=altitude, plp=plp, env_samples=env_samples, fs_decimation=fs_decimation,
                             az_lim=az_lim, el_lim=el_lim,
                             beamform_type=beamform_type, initial_pos=pos, initial_velocity=vel, det_model=det_model,
-                            par_model=par_model, mdl_feedback=feedback, log=save_logs)
+                            par_model=par_model, mdl_feedback=feedback, log=save_logs, gen_train_data=gen_data)
 
 # Define preprocessing layer (just a normalization)
 state_prelayer = [dict(type='linear_normalization'),
@@ -112,8 +113,8 @@ wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, m
                    fc=dict(type='float', shape=(env.n_tx,), min_value=8e9, max_value=12e9),
                    bw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
                            max_value=env.fs / 2 - 5e6),
-                   power=dict(type='float', shape=(env.n_tx,), min_value=.1,
-                              max_value=5)
+                   power=dict(type='float', shape=(env.n_tx,), min_value=10,
+                              max_value=50)
                    )
 
 # Instantiate wave agent
@@ -129,34 +130,42 @@ print('Beginning training...')
 reward_track = np.zeros(games)
 for episode in tqdm(range(games)):
 
-    states = env.reset()
-    terminal = False
-    sum_rewards = 0.0
-    num_updates = 0
-    while not terminal:
-        actions = wave_agent.act(states)
-        states, terminal, reward = env.execute(actions=actions)
-        num_updates += wave_agent.observe(terminal=terminal, reward=reward)
-        sum_rewards += reward
-    reward_track[episode] = sum_rewards
+    try:
+        states = env.reset()
+        terminal = False
+        sum_rewards = 0.0
+        num_updates = 0
+        while not terminal:
+            actions = wave_agent.act(states)
+            states, terminal, reward = env.execute(actions=actions)
+            num_updates += wave_agent.observe(terminal=terminal, reward=reward)
+            sum_rewards += reward
+        reward_track[episode] = sum_rewards
+    except KeyboardInterrupt:
+        reward_track = reward_track[:episode]
+        break
 
 # Testing loop
 env.mdl_feedback = False  # Reset model feedback to evaluate
 actions = None
 print('Evaluation...')
 for g in tqdm(range(eval_games)):
-    # Initialize episode
-    states = env.reset()
-    terminal = False
-    internals = wave_agent.initial_internals()
-    timestep = 0
 
-    while not terminal:
-        # Episode timestep
-        actions, internals = wave_agent.act(states,
-                                          internals=internals,
-                                          independent=True, deterministic=True)
-        states, terminal, reward = env.execute(actions=actions)
+    # Initialize episode
+    try:
+        states = env.reset()
+        terminal = False
+        internals = wave_agent.initial_internals()
+        timestep = 0
+
+        while not terminal:
+            # Episode timestep
+            actions, internals = wave_agent.act(states,
+                                              internals=internals,
+                                              independent=True, deterministic=True)
+            states, terminal, reward = env.execute(actions=actions)
+    except KeyboardInterrupt:
+        break
 
 env.close()
 # wave_agent.close()
