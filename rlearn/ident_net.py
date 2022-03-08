@@ -45,10 +45,11 @@ def readTrainingDataGen(fnme, chunk):
             while run:
                 ret = np.fromfile(f, 'complex128', chunk * nsam)
                 lab = np.fromfile(f_l, 'bool', chunk)
-                if len(ret) > 0:
+                try:
                     ret = ret.reshape((chunk, nsam))
+                    yield ret, lab
+                except ValueError:
                     run = False
-                yield ret, lab
 
 
 def plotWeights(mdl, lnum=2, mdl_name=''):
@@ -125,7 +126,7 @@ def plotActivations(classifier, inp):
 
 # Base net params
 dec_facs = [1]
-epoch_sz = 64
+epoch_sz = 256
 batch_sz = 32
 neg_per_pos = 1
 minp_sz = 16384
@@ -133,6 +134,7 @@ stft_sz = 512
 band_limits = (10e6, fs / 2)
 base_pl = 6.468e-6
 train_runs = 30
+save_model = True
 
 segment_base_samp = minp_sz * dec_facs[-1]
 segment_t0 = segment_base_samp / fs   # Segment time in secs
@@ -148,7 +150,7 @@ def genModel(nsam):
     lay = Concatenate()([l_mag, l_phase])
     lay = MaxPooling2D((3, 3))(lay)
     lay = BatchNormalization()(lay)
-    lay = Conv2D(16, (16, 32))(lay)
+    lay = Conv2D(16, (16, 32), activation=keras.layers.LeakyReLU(alpha=.1))(lay)
     lay = Conv2D(32, (4, 8))(lay)
     lay = Flatten()(lay)
     lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.1), activity_regularizer=l1_l2(1e-4),
@@ -176,7 +178,7 @@ def genParamModel(nsam):
 
 # Generate models for detection and estimation
 mdl = genModel(minp_sz)
-mdl_comp_opts = dict(optimizer=Adadelta(learning_rate=1.0), loss='binary_crossentropy', metrics=['accuracy'])
+mdl_comp_opts = dict(optimizer=Adadelta(learning_rate=1.0), loss='hinge', metrics=['accuracy'])
 mdl.compile(**mdl_comp_opts)
 par_mdl = genParamModel(seg_sz)
 par_comp_opts = dict(optimizer=Adadelta(learning_rate=1.0), loss='huber_loss', metrics=['mean_squared_error'])
@@ -188,7 +190,7 @@ hist_val_loss = []
 hist_acc = []
 hist_val_acc = []
 
-for data, labels in tqdm(readTrainingDataGen('/home/jeff/repo/rlearn/mdl_data/2022218211216', epoch_sz)):
+for data, labels in tqdm(readTrainingDataGen('/home/jeff/repo/rlearn/mdl_data/train', epoch_sz)):
 
     Xs = data[:batch_sz, :]
     Xt = data[batch_sz:, :]
@@ -197,8 +199,8 @@ for data, labels in tqdm(readTrainingDataGen('/home/jeff/repo/rlearn/mdl_data/20
     Xs, ys = shuffle(Xs, ys)
     Xt, yt = shuffle(Xt, yt)
 
-    h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=5, batch_size=batch_sz,
-                callbacks=[ReduceLROnPlateau(), TerminateOnNaN()],
+    h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=15, batch_size=batch_sz,
+                callbacks=[EarlyStopping(patience=2), TerminateOnNaN()],
                 class_weight={0: sum(ys) / len(ys), 1: 1 - sum(ys) / len(ys)})
     hist_loss = np.concatenate((hist_loss, h.history['loss']))
     hist_val_loss = np.concatenate((hist_val_loss, h.history['val_loss']))
@@ -228,8 +230,8 @@ test_mdl = genModel(minp_sz)
 test_mdl.compile(**mdl_comp_opts)
 sing_true = Xs[ys == 1, :][0, :].reshape((1, seg_sz))
 sing_false = Xs[ys == 0, :][0, :].reshape((1, seg_sz))
-sing_y = ys[ys == 1]
-sing_fy = ys[ys == 0]
+sing_y = np.array([int(ys[ys == 1][0])])
+sing_fy = np.array([int(ys[ys == 0][0])])
 
 ms = test_mdl.fit(sing_false, sing_fy, epochs=20, verbose=0, callbacks=[TerminateOnNaN()])
 
@@ -268,8 +270,9 @@ for n in range(Xs.shape[0]):
         plt.axis('tight')
 
 # Save out the model for future use
-mdl.save('./id_model')
-#par_mdl.save('./par_model')
+if save_model:
+    mdl.save('./id_model')
+    #par_mdl.save('./par_model')
 
 #plot_model(mdl, to_file='mdl.png', show_shapes=True)
 #plot_model(par_mdl, to_file='par_mdl.png', show_shapes=True)

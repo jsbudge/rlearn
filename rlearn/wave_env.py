@@ -92,7 +92,7 @@ class SinglePulseBackground(Environment):
     def __init__(self, max_timesteps=128, cpi_len=64, az_bw=24, el_bw=18, dep_ang=45, boresight_ang=90, altitude=1524,
                  plp=.5, env_samples=100000, fs_decimation=8, az_lim=90, el_lim=10, beamform_type='mmse',
                  initial_pos=(0, 0), initial_velocity=(0, 0), det_model=None, par_model=None, log=False,
-                 mdl_feedback=False, gen_train_data=False):
+                 mdl_feedback=False, gen_train_data=False, randomize_startpoint=False):
         super().__init__()
         self.cpi_len = cpi_len
         self.az_bw = az_bw * DTR
@@ -123,8 +123,9 @@ class SinglePulseBackground(Environment):
 
         # Set up logger, if wanted
         tm = time.gmtime()
-        self.feedback_nme = (f'./mdl_data/{tm.tm_year}{tm.tm_mon}{tm.tm_mday}{tm.tm_hour}{tm.tm_min}{tm.tm_sec}_data.dat',
-                             f'./mdl_data/{tm.tm_year}{tm.tm_mon}{tm.tm_mday}{tm.tm_hour}{tm.tm_min}{tm.tm_sec}_labels.dat')
+        self.feedback_nme = \
+            (f'./mdl_data/train_data.dat',
+             f'./mdl_data/train_labels.dat')
         self.gen_train_data = gen_train_data
         if log:
             fnme = f'./logs/{tm.tm_year}{tm.tm_mon}{tm.tm_mday}{tm.tm_hour}{tm.tm_min}{tm.tm_sec}_run.log'
@@ -176,23 +177,17 @@ class SinglePulseBackground(Environment):
                 va[:, n * self.n_tx + m] = self.rx_locs[:, n] + self.tx_locs[:, m]
                 self.__log__(str(self.rx_locs[:, n] + self.tx_locs[:, m]))
                 apc.append([n, m])
-        self.virtual_array = self.el_rot(self.dep_ang, self.az_rot(self.boresight_ang - np.pi / 2, va))
+        self.virtual_array = va
         self.apc = apc
 
         self.clipping = [-100, 200]
         self.bg = wavefunction(self.bg_ext, npts=(32, 32))
         self.PRF = 500.
-        self.env = Platform(self.alt, self.az_bw, self.el_bw, self.dep_ang, p0=self.p0, v0=self.v0)
-
-        # Environment pulse info
-        max_pl = (self.env.nrange * 2 / c0 - 1 / TAC) * .99
-        self.nsam = int((np.ceil((2 * self.env.frange / c0 + max_pl * self.plp) * TAC) -
-                         np.floor(2 * self.env.nrange / c0 * TAC)) * self.fs / TAC)
-        self.nr = int(max_pl * self.plp * self.fs)
-        self.__log__(f'NSAM: {self.nsam}, NR: {self.nr}')
-        self.data_block = (self.nsam, self.cpi_len)
         self.MPP = c0 / 2 / self.fs
-        # doppPRF = 2 * self.env.spd * np.sin(self.az_bw / 2) * (max(self.fc) + max(self.bw) / 2) / c0
+
+        # Set up starting point stuff
+        self.randomize = randomize_startpoint
+        self.randomizeStartPoint()
 
         self.mdl_feedback = False
         if det_model is not None:
@@ -277,27 +272,40 @@ class SinglePulseBackground(Environment):
         # Check pulse detection quality
         blocks = 32
         detb_sc = 0
-        has_trained = False
+        max_its = 15 if self.mdl_feedback else 2
         if self.det_model is not None:
             total_dets = []
             total_preds = []
+            feedback_data = []
+            feedback_labels = []
             its = 0
-            while self.det_time < self.tf[-1] and its < 2:
+
+            # Iterate through all the detection blocks
+            while self.det_time < self.tf[-1] and its < max_its:
                 id_data, n_dets = self.genDetBlock(chirps, blocks)
+
+                # If there's any pulses in this time block, run data generation and model feedback
                 if sum(n_dets) > 0:
                     total_dets = np.concatenate((total_dets, n_dets))
                     total_preds = np.concatenate((total_preds, self.det_model.predict(id_data.T).flatten()))
-                    if self.gen_train_data:
-                        if not saveTrainingData(self.feedback_nme, id_data, n_dets):
-                            self.__log__('Training data NOT saved.')
-                        else:
-                            self.__log__(f'{blocks} blocks of training data saved.')
-                    if not has_trained and self.mdl_feedback:
-                        self.__log__('Updating detection model with generated waveforms.')
-                        self.det_model.fit(id_data.T, n_dets, epochs=2,
-                                           class_weight={0: sum(n_dets) / blocks, 1: 1 - sum(n_dets) / blocks})
-                        has_trained = True
+                    if self.mdl_feedback or self.gen_train_data:
+                        for n in range(blocks):
+                            if n_dets[n]:
+                                feedback_data.append(id_data[:, n].flatten())
+                                feedback_data.append(np.random.randn(id_data.shape[0], ) + 1j * np.random.randn(id_data.shape[0], ))
+                                feedback_labels.append([1])
+                                feedback_labels.append([0])
                     its += 1
+            feedback_data = np.array(feedback_data)
+            feedback_labels = np.array(feedback_labels)
+            if self.gen_train_data:
+                if not saveTrainingData(self.feedback_nme, feedback_data.T, feedback_labels):
+                    self.__log__('Training data NOT saved.')
+                else:
+                    self.__log__(f'{feedback_data.shape[0]} blocks of training data saved.')
+            if self.mdl_feedback:
+                self.__log__('Updating detection model with generated waveforms.')
+                self.det_model.fit(feedback_data, feedback_labels, epochs=5)
             while self.det_time < self.tf[-1]:
                 self.det_time += blocks * self.det_sz / self.fs
             try:
@@ -333,6 +341,12 @@ class SinglePulseBackground(Environment):
         self.__log__(f'Target located at {np.linalg.norm(t_pos):.2f}m range, '
                      f'{truth_ea[0] / DTR:.2f} az and {truth_ea[1] / DTR:.2f} el from beamcenter.')
 
+        mot_pos = self.el_rot(self.dep_ang, self.az_rot(self.boresight_ang, self.env.vel(self.tf)))
+        pan = np.arctan2(mot_pos[1, :], mot_pos[0, :]).mean()
+        el = np.arcsin(mot_pos[2, :] / np.linalg.norm(mot_pos, axis=0)).mean()
+
+        va = self.el_rot(el, self.az_rot(pan, self.virtual_array))
+
         # MIMO beamforming using some CPI stuff
         ea = np.array([0., 0])
         av_pts = 0
@@ -341,7 +355,7 @@ class SinglePulseBackground(Environment):
                 channels = np.array([a[1] == tx_num for a in self.apc])
                 try:
                     ea += music(curr_cpi[:, cp, channels].T, 1,
-                                self.virtual_array[:, channels].T,
+                                va[:, channels].T,
                                 c0 / sub_fc, a_azimuthRange=np.array([self.az_lims[0], self.az_lims[1]]),
                                 a_elevationRange=np.array([self.el_lims[0], self.el_lims[1]])).flatten()
                     av_pts += 1
@@ -354,9 +368,11 @@ class SinglePulseBackground(Environment):
         beamform = np.zeros((self.nsam, self.cpi_len), dtype=np.complex128)
 
         # Direction of beam to synthesize from data
+        # The 90 degree turn here is because in the spherical coordinate system,
+        # elevation of zero corresponds to straight up. Shifting here to make the math work.
         a = np.exp(1j * 2 * np.pi * np.array([self.fc[n[1]] for n in self.apc]) *
-                   self.virtual_array.T.dot(np.array([np.cos(ea[0]) * np.sin(ea[1]),
-                                                      np.sin(ea[0]) * np.sin(ea[1]), np.cos(ea[1])])) / c0)
+                   va.T.dot(np.array([np.cos(ea[0]) * np.sin(ea[1] + np.pi / 2),
+                            np.sin(ea[0]) * np.sin(ea[1] + np.pi / 2), np.cos(ea[1] + np.pi / 2)])) / c0)
 
         # Get clutter covariance for this CPI
         # This is used for waveform evaluation and MMSE beamforming, if selected
@@ -445,7 +461,7 @@ class SinglePulseBackground(Environment):
             reward += 3
 
         # Append everything to the logs, for pretty pictures later
-        self.log.append([beamform, [amb_sc, detb_sc, det_sc],
+        self.log.append([beamform, [amb_sc, detb_sc, det_sc * 3],
                          self.tf, self.az_pt, self.el_pt, actions['wave'], truth_ea, U])
 
         # Remove anything longer than the allowed steps, for arbitrary length episodes
@@ -476,8 +492,7 @@ class SinglePulseBackground(Environment):
         self.tf = np.linspace(0, self.cpi_len / self.PRF, self.cpi_len)
 
         # Reset the platform
-        self.env.reset()
-        self.env.genpos(self.tf, 0, 0)
+        self.randomizeStartPoint()
         self.log = []
 
         self.targets = []
@@ -647,6 +662,48 @@ class SinglePulseBackground(Environment):
         rd_cpu += np.random.normal(0, 1e-9, size=rd_cpu.shape) + 1j * np.random.normal(0, 1e-9, size=rd_cpu.shape)
 
         return rd_cpu, n_pulses
+
+    def randomizeStartPoint(self):
+        # Get a few random starting values, like altitude, position, direction, etc.
+        if self.randomize:
+            altitude = np.random.uniform(1000, 1600)
+        else:
+            altitude = self.alt
+        quadrant = np.random.rand()
+        if quadrant < .25:
+            pos = (np.random.randint(-350, 350), -altitude)
+            vel = (20, 0)
+        elif .5 > quadrant >= .25:
+            pos = (altitude, np.random.randint(-350, 350))
+            vel = (0, 20)
+        elif .75 > quadrant >= .5:
+            pos = (np.random.randint(-350, 350), altitude)
+            vel = (-20, 0)
+        else:
+            pos = (-altitude, np.random.randint(-350, 350))
+            vel = (0, -20)
+
+        # Make sure velocity stays below actual plane speeds
+        spd = np.sqrt(vel[0] ** 2 + vel[1] ** 2)
+        if spd > 10.0:
+            vel = (vel[0] * 10 / spd, vel[1] * 10 / spd)
+        self.alt = altitude
+        self.p0 = pos
+        self.v0 = vel
+
+        # Log all of the parameters
+        self.__log__('Changed parameters for this run:')
+        self.__log__(f'ALTITUDE: {altitude}')
+
+        self.env = Platform(altitude, self.az_bw, self.el_bw, self.dep_ang, p0=self.p0, v0=self.v0)
+
+        # Environment pulse info
+        max_pl = (self.env.nrange * 2 / c0 - 1 / TAC) * .99
+        self.nsam = int((np.ceil((2 * self.env.frange / c0 + max_pl * self.plp) * TAC) -
+                         np.floor(2 * self.env.nrange / c0 * TAC)) * self.fs / TAC)
+        self.nr = int(max_pl * self.plp * self.fs)
+        self.__log__(f'NSAM: {self.nsam}, NR: {self.nr}')
+        self.data_block = (self.nsam, self.cpi_len)
 
     def getBGFreqMap(self, t):
         zo = \

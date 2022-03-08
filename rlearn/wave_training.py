@@ -1,6 +1,7 @@
 import cupy
 import keras.models
 from tensorforce import Agent, Environment, Runner
+from tensorflow.keras.optimizers import Adam
 from wave_env import SinglePulseBackground, genPulse, ambiguity, ellipse
 import numpy as np
 from scipy.signal.windows import taylor
@@ -13,7 +14,7 @@ from tftb.processing import WignerVilleDistribution
 from cuda_kernels import applyRadiationPatternCPU
 
 # Set the heap memory allotment to 1 GB (this is way more than we need)
-cupy.get_default_memory_pool().set_limit(size=1024**3)
+cupy.get_default_memory_pool().set_limit(size=1024 ** 3)
 
 c0 = 299792458.0
 TAC = 125e6
@@ -40,7 +41,7 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 1000
+games = 50
 eval_games = 1
 max_timesteps = 64
 batch_sz = 32
@@ -48,6 +49,8 @@ ocean_debug = False
 feedback = True
 gen_data = False
 save_logs = True
+load_agent = True
+save_agent = True
 plot_profiler = True
 
 # Parameters for the environment (and therefore the agents)
@@ -57,8 +60,6 @@ el_bw = 40
 dep_ang = 45
 boresight_ang = 90
 altitude = np.random.uniform(1000, 1600)
-pos = (-350, -altitude)
-vel = (20, 0)
 plp = .5
 env_samples = 200000
 fs_decimation = 8
@@ -66,15 +67,13 @@ az_lim = 90
 el_lim = 20
 beamform_type = 'phased'
 
-spd = np.sqrt(vel[0]**2 + vel[1]**2)
-if spd > 10.0:
-    vel = (vel[0] * 10 / spd, vel[1] * 10 / spd)
-
 print('Initial memory on GPU:')
 print(f'Memory: {cupy.get_default_memory_pool().used_bytes()} / {cupy.get_default_memory_pool().total_bytes()}')
 print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} free blocks')
 
+# We want the learning rate to be *small* so that many different pulses will, on average, train the model correctly
 det_model = keras.models.load_model('./id_model')
+det_model.compile(optimizer=Adam(learning_rate=1e-7))
 par_model = keras.models.load_model('./par_model')
 
 # Pre-defined or custom environment
@@ -82,8 +81,9 @@ env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=cpi_len, az_bw=
                             boresight_ang=boresight_ang,
                             altitude=altitude, plp=plp, env_samples=env_samples, fs_decimation=fs_decimation,
                             az_lim=az_lim, el_lim=el_lim,
-                            beamform_type=beamform_type, initial_pos=pos, initial_velocity=vel, det_model=det_model,
-                            par_model=par_model, mdl_feedback=feedback, log=save_logs, gen_train_data=gen_data)
+                            beamform_type=beamform_type, det_model=det_model,
+                            par_model=par_model, mdl_feedback=feedback, log=save_logs, gen_train_data=gen_data,
+                            randomize_startpoint=False)
 
 # Define preprocessing layer (just a normalization)
 state_prelayer = [dict(type='linear_normalization'),
@@ -119,17 +119,21 @@ wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, m
 
 # Instantiate wave agent
 print('Initializing agents...')
-wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=state_prelayer,
-                          actions=wave_action,
-                          max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
-                          critic_optimizer=opt_spec,
-                          memory=max_timesteps, exploration=5000.0, entropy_regularization=500.0, horizon=5)
+if not load_agent:
+    print('Creating new Agent...')
+    wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=state_prelayer + seq_layer,
+                              actions=wave_action,
+                              max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
+                              critic_optimizer=opt_spec,
+                              memory=max_timesteps, exploration=5000.0, entropy_regularization=5000.0, horizon=2)
+else:
+    print('Loading agent from wave_agent')
+    wave_agent = Agent.load('./wave_agent')
 
 # Training regimen
 print('Beginning training...')
 reward_track = np.zeros(games)
 for episode in tqdm(range(games)):
-
     try:
         states = env.reset()
         terminal = False
@@ -161,8 +165,8 @@ for g in tqdm(range(eval_games)):
         while not terminal:
             # Episode timestep
             actions, internals = wave_agent.act(states,
-                                              internals=internals,
-                                              independent=True, deterministic=True)
+                                                internals=internals,
+                                                independent=True, deterministic=True)
             states, terminal, reward = env.execute(actions=actions)
     except KeyboardInterrupt:
         break
@@ -229,8 +233,11 @@ if plot_profiler:
     camera = Camera(fig)
     for l in logs:
         fpos = env.env.pos(l[2])[:, 0]
-        az_bm = (l[3] + env.boresight_ang)
-        el_bm = (l[4] + env.dep_ang)
+        mot_pos = env.el_rot(env.dep_ang, env.az_rot(env.boresight_ang, env.env.vel(l[2][0])))
+        pan = np.arctan2(mot_pos[1], mot_pos[0])
+        el = np.arcsin(mot_pos[2] / np.linalg.norm(mot_pos))
+        az_bm = (l[3] + pan)
+        el_bm = (l[4] + el)
         dopp_freqs = np.fft.fftshift(np.fft.fftfreq(l[0].shape[1], (l[2][1] - l[2][0]))) / env.fc[0] * c0
 
         # Draw the beam direction and platform
@@ -257,7 +264,7 @@ if plot_profiler:
                 t_vec = env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])
                 plt_vel = 2 * (np.linalg.norm(t_vec) -
                                np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
-                    (l[2][-1] - l[2][0])
+                          (l[2][-1] - l[2][0])
                 axes[3].text(pos[0, 0], pos[0, 1],
                              f'{-plt_vel:.2f}, '
                              f'{np.linalg.norm(t_vec):.2f}',
@@ -281,26 +288,31 @@ if plot_profiler:
                                                        np.sin(az_angs[az_a]) * np.sin(el_angs[el_a] + np.pi / 2),
                                                        np.cos(el_angs[el_a] + np.pi / 2)])
                 du = -np.array([np.cos(az_angs[az_a]) * np.sin(el_angs[el_a]),
-                                                       np.sin(az_angs[az_a]) * np.sin(el_angs[el_a]),
-                                                       np.cos(el_angs[el_a])])
-                va_u = np.exp(1j * env.virtual_array.T.dot(u))
+                                np.sin(az_angs[az_a]) * np.sin(el_angs[el_a]),
+                                np.cos(el_angs[el_a])])
+                va = env.el_rot(el, env.az_rot(pan, env.virtual_array))
+                va_u = np.exp(1j * va.T.dot(u))
                 E = 1
                 Y[az_a, el_a] = l[7].dot(va_u) * applyRadiationPatternCPU(*du, 1, *du, 1,
-                                                         1e-9, 1e-9,
-                                                         2 * np.pi * 9.6e9 / c0, env.az_fac, env.el_fac)
+                                                                          1e-9, 1e-9,
+                                                                          2 * np.pi * 9.6e9 / c0, env.az_fac,
+                                                                          env.el_fac)
         Y = db(Y)
         Y = Y - Y.max()
         # fig, axes = plt.subplots(3)
-        axes[1].imshow(Y, extent=[az_angs[0] / DTR, az_angs[-1] / DTR, el_angs[0] / DTR, el_angs[-1] / DTR], clim=[-20, 2])
+        axes[1].imshow(Y, extent=[az_angs[0] / DTR, az_angs[-1] / DTR, el_angs[0] / DTR, el_angs[-1] / DTR],
+                       clim=[-20, 2])
         axes[1].set_ylabel('Azimuth')
         axes[1].set_xlabel('Elevation')
 
         # Azimuth beam projection at target location
         az_to_target = np.arctan2(-t_vec[1], -t_vec[0]) - env.boresight_ang
         el_to_target = np.arcsin(t_vec[2] / np.linalg.norm(t_vec)) - env.dep_ang
-        axes[0].plot(az_angs, Y[abs(az_angs - az_to_target) == abs(az_angs - az_to_target).min(), :].flatten(), c='blue')
+        axes[0].plot(az_angs, Y[abs(az_angs - az_to_target) == abs(az_angs - az_to_target).min(), :].flatten(),
+                     c='blue')
         axes[0].scatter(az_to_target, 1, c='red')
-        axes[2].plot(el_angs, Y[:, abs(el_angs - el_to_target) == abs(el_angs - el_to_target).min()].flatten(), c='blue')
+        axes[2].plot(el_angs, Y[:, abs(el_angs - el_to_target) == abs(el_angs - el_to_target).min()].flatten(),
+                     c='blue')
         axes[2].scatter(el_to_target, 1, c='red')
         camera.snap()
     animation = camera.animate(interval=250)
@@ -383,7 +395,7 @@ if plot_profiler:
                     ax[0].scatter(pos[:, 0], pos[:, 1], s=amp, c=pcols)
                     plt_rng = 2 * (np.linalg.norm(env.env.pos(l[2])[:, -1] - np.array([pos[-1, 0], pos[-1, 1], 1])) -
                                    np.linalg.norm(env.env.pos(l[2])[:, 0] - np.array([pos[0, 0], pos[0, 1], 1]))) / \
-                        (l[2][-1] - l[2][0])
+                              (l[2][-1] - l[2][0])
                     ax[0].text(pos[0, 0], pos[0, 1], f'{-plt_rng:.2f}', c='black')
             ax[0].legend([f'{1 / (l[2][1] - l[2][0]):.2f}Hz: {l[2][-1]:.6f}'])
             ax[0].axis('off')
@@ -405,3 +417,6 @@ if plot_profiler:
     if feedback:
         det_model.save('./id_model')
         par_model.save('./par_model')
+
+    if save_agent:
+        wave_agent.save('./wave_agent')
