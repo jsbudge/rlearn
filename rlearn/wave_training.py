@@ -1,7 +1,7 @@
 import cupy
 import keras.models
 from tensorforce import Agent, Environment, Runner
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.optimizers import Adam, Adadelta
 from wave_env import SinglePulseBackground, genPulse, ambiguity, ellipse
 import numpy as np
 from scipy.signal.windows import taylor
@@ -41,7 +41,7 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 50
+games = 5
 eval_games = 1
 max_timesteps = 64
 batch_sz = 32
@@ -73,7 +73,7 @@ print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} f
 
 # We want the learning rate to be *small* so that many different pulses will, on average, train the model correctly
 det_model = keras.models.load_model('./id_model')
-det_model.compile(optimizer=Adam(learning_rate=1e-7))
+det_model.compile(optimizer=Adadelta(learning_rate=1.))
 par_model = keras.models.load_model('./par_model')
 
 # Pre-defined or custom environment

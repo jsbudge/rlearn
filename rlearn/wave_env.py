@@ -292,7 +292,8 @@ class SinglePulseBackground(Environment):
                         for n in range(blocks):
                             if n_dets[n]:
                                 feedback_data.append(id_data[:, n].flatten())
-                                feedback_data.append(np.random.randn(id_data.shape[0], ) + 1j * np.random.randn(id_data.shape[0], ))
+                                feedback_data.append(np.random.normal(0, 1e-9, (id_data.shape[0],)) +
+                                                     1j * np.random.normal(0, 1e-9, (id_data.shape[0],)))
                                 feedback_labels.append([1])
                                 feedback_labels.append([0])
                     its += 1
