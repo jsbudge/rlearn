@@ -41,16 +41,16 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 5
+games = 1
 eval_games = 1
-max_timesteps = 64
+max_timesteps = 128
 batch_sz = 32
 ocean_debug = False
-feedback = True
+feedback = False
 gen_data = False
 save_logs = True
 load_agent = True
-save_agent = True
+save_agent = False
 plot_profiler = True
 
 # Parameters for the environment (and therefore the agents)
@@ -65,7 +65,7 @@ env_samples = 200000
 fs_decimation = 8
 az_lim = 90
 el_lim = 20
-beamform_type = 'phased'
+beamform_type = 'mmse'
 
 print('Initial memory on GPU:')
 print(f'Memory: {cupy.get_default_memory_pool().used_bytes()} / {cupy.get_default_memory_pool().total_bytes()}')
@@ -73,7 +73,7 @@ print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} f
 
 # We want the learning rate to be *small* so that many different pulses will, on average, train the model correctly
 det_model = keras.models.load_model('./id_model')
-det_model.compile(optimizer=Adadelta(learning_rate=1.))
+det_model.compile(optimizer=Adam(learning_rate=1e-5), loss='binary_crossentropy', metrics=['accuracy'])
 par_model = keras.models.load_model('./par_model')
 
 # Pre-defined or custom environment
@@ -85,21 +85,14 @@ env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=cpi_len, az_bw=
                             par_model=par_model, mdl_feedback=feedback, log=save_logs, gen_train_data=gen_data,
                             randomize_startpoint=False)
 
-# Define preprocessing layer (just a normalization)
-state_prelayer = [dict(type='linear_normalization'),
-                  dict(type='exponential_normalization', decay=.5)]
-
-# Give a sense of motion to the agent
-seq_layer = [dict(type='sequence', length=2)]
-
 # Optimization spec
 opt_spec = dict(optimizer='adadelta', learning_rate=1., multi_step=5, subsampling_fraction=64,
                 clipping_threshold=1e-2, linesearch_iterations=2)
 
+delta_layer = [dict(type='linear_normalization'), dict(type='deltafier')]
+
 # Define states for different agents
-wave_state = dict(currwave=dict(type='float', shape=(100, env.n_tx), min_value=0,
-                                max_value=1),
-                  wave_corr=dict(type='float', shape=(env.fft_len, env.n_tx), min_value=-100, max_value=0),
+wave_state = dict(wave_corr=dict(type='float', shape=(env.fft_len, env.n_tx), min_value=-100, max_value=0),
                   currfc=dict(type='float', shape=(env.n_tx,), min_value=8e9,
                               max_value=12e9),
                   currbw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
@@ -121,11 +114,11 @@ wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, m
 print('Initializing agents...')
 if not load_agent:
     print('Creating new Agent...')
-    wave_agent = Agent.create(agent='a2c', states=wave_state, state_preprocessing=state_prelayer + seq_layer,
+    wave_agent = Agent.create(agent='a2c', states=wave_state,
                               actions=wave_action,
                               max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
-                              critic_optimizer=opt_spec,
-                              memory=max_timesteps, exploration=5000.0, entropy_regularization=5000.0, horizon=2)
+                              critic_optimizer=opt_spec, state_preprocessing=delta_layer,
+                              memory=max_timesteps, exploration=5000.0, entropy_regularization=5.0, variable_noise=5.)
 else:
     print('Loading agent from wave_agent')
     wave_agent = Agent.load('./wave_agent')
@@ -236,14 +229,14 @@ if plot_profiler:
         mot_pos = env.el_rot(env.dep_ang, env.az_rot(env.boresight_ang, env.env.vel(l[2][0])))
         pan = np.arctan2(mot_pos[1], mot_pos[0])
         el = np.arcsin(mot_pos[2] / np.linalg.norm(mot_pos))
-        az_bm = (l[3] + pan)
-        el_bm = (l[4] + el)
         dopp_freqs = np.fft.fftshift(np.fft.fftfreq(l[0].shape[1], (l[2][1] - l[2][0]))) / env.fc[0] * c0
 
         # Draw the beam direction and platform
         axes[3].scatter(fpos[0], fpos[1], marker='*', c='blue')
-        beam_dir = np.exp(-1j * az_bm) * fpos[2] / np.tan(el_bm)
+        beam_dir = np.exp(-1j * pan) * fpos[2] / np.tan(el)
+        beamform_dir = np.exp(-1j * (pan + l[3])) * fpos[2] / np.tan(el + l[4])
         axes[3].arrow(fpos[0], fpos[1], beam_dir.real, -beam_dir.imag)
+        axes[3].arrow(fpos[0], fpos[1], beamform_dir.real, -beamform_dir.imag)
 
         # Draw the targets
         t_vec = None

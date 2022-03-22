@@ -12,7 +12,7 @@ from tensorflow.keras.optimizers import Adam, Adadelta
 from tensorflow.keras.constraints import NonNeg
 from keras.layers import Input, Conv2D, Flatten, Dense, BatchNormalization, MaxPooling2D, AveragePooling2D, \
     Dropout, GaussianNoise, Concatenate, LSTM, Embedding, Conv1D, Lambda, MaxPooling1D, ActivityRegularization, \
-    LocallyConnected2D, Normalization
+    LocallyConnected2D, Normalization, LayerNormalization
 from kapre import STFT, MagnitudeToDecibel, Magnitude, Phase
 from keras.callbacks import TerminateOnNaN, EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
 from keras.regularizers import l1_l2
@@ -101,6 +101,8 @@ def plotActivations(classifier, inp):
                         plt.imshow(layer_activation[m, :, :, n], aspect='auto', cmap='viridis')
                     except TypeError:
                         plt.imshow(db(layer_activation[m, :, :, n]), aspect='auto', cmap='viridis')
+                        if 'stft' in layer_name:
+                            print(layer_name + f' mean is {np.mean(abs(layer_activation[m, :, :, n]))} and std is {np.std(abs(layer_activation[m, :, :, n]))}')
         elif 'dense' in layer_name:
             for m in range(layer_activation.shape[0]):
                 plt.figure(layer_name + f' channel {m}')
@@ -135,10 +137,11 @@ stft_sz = 512
 band_limits = (10e6, fs / 2)
 base_pl = 6.468e-6
 train_prf = 1000.
-train_runs = 10
+train_runs = 1
 load_model = False
 save_model = False
 tset_data_only = False
+noise_sigma = 1e-8
 
 segment_base_samp = minp_sz * dec_facs[-1]
 segment_t0 = segment_base_samp / fs   # Segment time in secs
@@ -150,12 +153,11 @@ def genModel(nsam):
     lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100),
                hop_length=stft_sz // 4, window_name='hann_window')(inp)
     lay = Magnitude()(lay)
-    lay = Normalization(mean=3.833752351183022e-09, variance=1.4697657090201354e-17)(lay)
+    lay = BatchNormalization(center=True, scale=True, axis=1)(lay)
     lay = MaxPooling2D((4, 4))(lay)
     lay = Conv2D(32, (16, 32))(lay)
-    lay = ActivityRegularization()(lay)
     lay = Flatten()(lay)
-    lay = Dense(512, activation=keras.layers.LeakyReLU(alpha=.2))(lay)
+    lay = Dense(512, activation='relu')(lay)
     outp = Dense(1, activation='sigmoid')(lay)
     return keras.Model(inputs=inp, outputs=outp)
 
@@ -182,7 +184,7 @@ if load_model:
     mdl = keras.models.load_model('./id_model')
 else:
     mdl = genModel(minp_sz)
-mdl_comp_opts = dict(optimizer=Adam(learning_rate=1e-3), loss='binary_crossentropy', metrics=['accuracy'])
+mdl_comp_opts = dict(optimizer=Adam(learning_rate=1e-4), loss='binary_crossentropy', metrics=['accuracy'])
 mdl.compile(**mdl_comp_opts)
 par_mdl = genParamModel(seg_sz)
 par_comp_opts = dict(optimizer=Adadelta(learning_rate=1.0), loss='huber_loss', metrics=['mean_squared_error'])
@@ -199,7 +201,7 @@ tpt = 0
 spt = 0
 npt = minp_sz / fs
 for tset in tqdm(range(train_runs)):
-    data = np.random.normal(0, 1e-8, (epoch_sz, minp_sz)) + 1j * np.random.normal(0, 1e-8, (epoch_sz, minp_sz))
+    data = np.random.normal(0, noise_sigma, (epoch_sz, minp_sz)) + 1j * np.random.normal(0, noise_sigma, (epoch_sz, minp_sz))
     labels = np.zeros((epoch_sz,))
     for n in np.arange(0, epoch_sz, 2):
         fc = np.random.uniform(8e9, 12e9)
@@ -232,7 +234,6 @@ for tset in tqdm(range(train_runs)):
 
 if not tset_data_only:
     for data, labels in tqdm(readTrainingDataGen('/home/jeff/repo/rlearn/mdl_data/train', epoch_sz)):
-
         Xs = data[:batch_sz, :]
         Xt = data[batch_sz:, :]
         ys = labels[:batch_sz]
@@ -247,9 +248,6 @@ if not tset_data_only:
         hist_val_loss = np.concatenate((hist_val_loss, h.history['val_loss']))
         hist_acc = np.concatenate((hist_acc, h.history['accuracy']))
         hist_val_acc = np.concatenate((hist_val_acc, h.history['val_accuracy']))
-
-#ph = par_mdl.fit(p_Xt, p_yt, epochs=5, batch_size=batch_sz,
-#                callbacks=[TerminateOnNaN()])
 
 plt.figure('Losses')
 plt.plot(np.array(hist_loss).T)

@@ -29,6 +29,7 @@ from cuda_kernels import genSubProfile, genRangeProfile, getDetectionCheck, appl
 from numba.core.errors import NumbaPerformanceWarning
 import warnings
 from logging import debug, info, error, basicConfig
+from keras.callbacks import TerminateOnNaN, EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
 from celluloid import Camera
 from pathlib import Path
 
@@ -189,6 +190,14 @@ class SinglePulseBackground(Environment):
         self.randomize = randomize_startpoint
         self.randomizeStartPoint()
 
+        # Get wavepoint differential for scoring
+        init_wave = np.ones((WAVEPOINTS, self.n_tx)) * .5
+        init_wave[0:3, :] = .01
+        init_wave[-3:, :] = .99
+        self.prev_wavep = init_wave
+        # Calculated as maximum possible shift in wavepoints
+        self.wavep_max = 14.142135623730951
+
         self.mdl_feedback = False
         if det_model is not None:
             self.det_model = det_model
@@ -267,7 +276,14 @@ class SinglePulseBackground(Environment):
         reward = 0
 
         # Ambiguity score
-        amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx)))
+        amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx))) * 2.
+
+        # Drop score for ambiguity if it's too close to the previous
+        red_sc = (1 - np.linalg.norm(actions['wave'] - self.prev_wavep) / self.wavep_max) / \
+                 max(self.max_steps / 2 - self.step, 1)
+        amb_sc -= red_sc
+        self.__log__(f'Ambiguity score reduced by {red_sc}')
+        self.prev_wavep = actions['wave'] + 0.
 
         # Check pulse detection quality
         blocks = 32
@@ -289,13 +305,16 @@ class SinglePulseBackground(Environment):
                     total_dets = np.concatenate((total_dets, n_dets))
                     total_preds = np.concatenate((total_preds, self.det_model.predict(id_data.T).flatten()))
                     if self.mdl_feedback or self.gen_train_data:
+                        added = [0, 0]
                         for n in range(blocks):
                             if n_dets[n]:
                                 feedback_data.append(id_data[:, n].flatten())
-                                feedback_data.append(np.random.normal(0, 1e-9, (id_data.shape[0],)) +
-                                                     1j * np.random.normal(0, 1e-9, (id_data.shape[0],)))
                                 feedback_labels.append([1])
+                                added[0] += 1
+                            elif added[1] <= added[0]:
+                                feedback_data.append(id_data[:, n].flatten())
                                 feedback_labels.append([0])
+                                added[1] += 1
                     its += 1
             feedback_data = np.array(feedback_data)
             feedback_labels = np.array(feedback_labels)
@@ -305,8 +324,11 @@ class SinglePulseBackground(Environment):
                 else:
                     self.__log__(f'{feedback_data.shape[0]} blocks of training data saved.')
             if self.mdl_feedback:
-                self.__log__('Updating detection model with generated waveforms.')
-                self.det_model.fit(feedback_data, feedback_labels, epochs=5)
+                acc_sc = balanced_accuracy_score(total_dets.astype(int), total_preds >= .5)
+                if acc_sc < .7:
+                    self.__log__(
+                        f'Balanced accuracy of {acc_sc * 100:.2f}%. Updating detection model with generated waveforms.')
+                    self.det_model.fit(feedback_data, feedback_labels, epochs=5, callbacks=[EarlyStopping(patience=1)])
             while self.det_time < self.tf[-1]:
                 self.det_time += blocks * self.det_sz / self.fs
             try:
@@ -409,15 +431,15 @@ class SinglePulseBackground(Environment):
         det_sc = 0
 
         kernel = cupy.array(self.cfar_kernel, dtype=np.float64)
-        erosion_struct = cupy.array(np.array([[0, 1., 0], [0, 1, 0], [0, 1, 0]]), dtype=np.float64)
+        # erosion_struct = cupy.array(np.array([[0, 1., 0], [0, 1, 0], [0, 1, 0]]), dtype=np.float64)
         bf = cupy.array(beamform, dtype=np.float64)
         tmp = cupyx.scipy.signal.fftconvolve(bf, kernel, mode='same')
         tmp_std = cupyx.scipy.signal.fftconvolve(bf**2, kernel, mode='same')
         cupy.cuda.Device().synchronize()
 
         thresh_alpha = np.sqrt(tmp_std - tmp * tmp)
-        det_gpu = bf > tmp + thresh_alpha * 2
-        det_gpu = cupyx.scipy.ndimage.binary_erosion(det_gpu, erosion_struct)
+        det_gpu = bf > tmp + thresh_alpha * 3
+        # det_gpu = cupyx.scipy.ndimage.binary_erosion(det_gpu, erosion_struct)
         cupy.cuda.Device().synchronize()
         det_st = det_gpu.get()
 
@@ -428,7 +450,7 @@ class SinglePulseBackground(Environment):
         del tmp_std
         del thresh_alpha
         del det_gpu
-        del erosion_struct
+        # del erosion_struct
         cupy.get_default_memory_pool().free_all_blocks()
 
         labels, ntargets = label(det_st)
@@ -455,6 +477,7 @@ class SinglePulseBackground(Environment):
                 det_sc = -.25
         if det_sc < .7 and self.succ_det > 0:
             self.succ_det = 0
+        det_sc *= 3
 
         if self.succ_det > 4:
             self.__log__('Target successfully recognized. Episode successful.')
@@ -462,7 +485,7 @@ class SinglePulseBackground(Environment):
             reward += 3
 
         # Append everything to the logs, for pretty pictures later
-        self.log.append([beamform, [amb_sc, detb_sc, det_sc * 3],
+        self.log.append([beamform, [amb_sc, detb_sc, det_sc],
                          self.tf, self.az_pt, self.el_pt, actions['wave'], truth_ea, U])
 
         # Remove anything longer than the allowed steps, for arbitrary length episodes
@@ -471,7 +494,7 @@ class SinglePulseBackground(Environment):
 
         # Whole state space to be split into the various agents
         full_state = {'wave_corr': state_corr, 'clutter': np.array([clutter_cov.real, clutter_cov.imag]),
-                      'currwave': actions['wave'], 'currfc': self.fc, 'currbw': self.bw,
+                      'currfc': self.fc, 'currbw': self.bw,
                       'prf': [self.PRF],
                       'target_angs': ea}
 
@@ -497,7 +520,7 @@ class SinglePulseBackground(Environment):
         self.log = []
 
         self.targets = []
-        self.targets.append(Sub(-100, 500, -100, 500))
+        self.targets.append(Sub(-100, 100, -100, 100))
 
         for t in self.targets:
             t.genpos(self.tf)
@@ -506,13 +529,14 @@ class SinglePulseBackground(Environment):
         init_wave = np.ones((WAVEPOINTS, self.n_tx)) * .5
         init_wave[0:3, :] = .01
         init_wave[-3:, :] = .99
+        self.prev_wavep = init_wave
 
         fft_chirp = np.fft.fft(init_wave, self.fft_len, axis=0)
         state_corr = np.fft.fftshift(db(np.fft.ifft(fft_chirp * fft_chirp.conj(), axis=0)), axes=0)
         state_corr = state_corr - np.max(state_corr, axis=0)[None, :]
         state_corr[state_corr < -100] = -100
         return {'clutter': np.array([np.eye(self.v_ants), np.zeros((self.v_ants, self.v_ants))]),
-                'currwave': init_wave, 'currfc': [9.6e9 for _ in range(self.n_tx)],
+                'currfc': [9.6e9 for _ in range(self.n_tx)],
                 'wave_corr': state_corr,
                 'currbw': [self.fs / 2 - 10e6 for _ in range(self.n_tx)],
                 'target_angs': np.array([0.0, 0.0]),
@@ -660,7 +684,7 @@ class SinglePulseBackground(Environment):
             n_pulses = np.zeros((n_dets,), dtype=int)
 
         self.det_time += n_dets * self.det_sz / self.fs
-        rd_cpu += np.random.normal(0, 1e-9, size=rd_cpu.shape) + 1j * np.random.normal(0, 1e-9, size=rd_cpu.shape)
+        rd_cpu += np.random.normal(0, 1e-8, size=rd_cpu.shape) + 1j * np.random.normal(0, 1e-8, size=rd_cpu.shape)
 
         return rd_cpu, n_pulses
 
