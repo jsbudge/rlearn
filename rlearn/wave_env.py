@@ -25,7 +25,7 @@ from tensorflow import keras
 import cmath
 import math
 import cupy as cupy
-from cuda_kernels import genSubProfile, genRangeProfile, getDetectionCheck, applyRadiationPatternCPU
+from cuda_kernels import genSubProfile, genRangeProfile, getDetectionCheck, applyRadiationPatternCPU, weighted_bce
 from numba.core.errors import NumbaPerformanceWarning
 import warnings
 from logging import debug, info, error, basicConfig
@@ -120,7 +120,8 @@ class SinglePulseBackground(Environment):
         self.v0 = initial_velocity
         self.p0 = initial_pos
         self.box = (-2000, 2000, -2000, 2000)
-        self.mahal_vi = np.linalg.pinv(np.array([[10., 0], [0, 1.8]]))
+        # Range, doppler standard deviations
+        self.mahal_vi = np.linalg.pinv(np.array([[10., 0], [0, 5.]]))
 
         # Set up logger, if wanted
         tm = time.gmtime()
@@ -256,6 +257,8 @@ class SinglePulseBackground(Environment):
             t.genpos(self.tf)
 
         # Update radar parameters to given params
+        prev_bw = self.bw
+        prev_fc = self.fc
         self.fc = actions['fc']
         self.bw = actions['bw']
         chirps = np.zeros((self.nr, self.n_tx), dtype=np.complex128)
@@ -309,11 +312,11 @@ class SinglePulseBackground(Environment):
                         for n in range(blocks):
                             if n_dets[n]:
                                 feedback_data.append(id_data[:, n].flatten())
-                                feedback_labels.append([1])
+                                feedback_labels.append([1.])
                                 added[0] += 1
-                            elif added[1] <= added[0]:
+                            elif added[1] < added[0]:
                                 feedback_data.append(id_data[:, n].flatten())
-                                feedback_labels.append([0])
+                                feedback_labels.append([0.])
                                 added[1] += 1
                     its += 1
             feedback_data = np.array(feedback_data)
@@ -328,14 +331,16 @@ class SinglePulseBackground(Environment):
                 if acc_sc < .7:
                     self.__log__(
                         f'Balanced accuracy of {acc_sc * 100:.2f}%. Updating detection model with generated waveforms.')
-                    self.det_model.fit(feedback_data, feedback_labels, epochs=5, callbacks=[EarlyStopping(patience=1)])
+                    self.det_model.fit(feedback_data, feedback_labels, validation_split=.2, epochs=5,
+                                       callbacks=[EarlyStopping(patience=1)])
             while self.det_time < self.tf[-1]:
                 self.det_time += blocks * self.det_sz / self.fs
             try:
                 conf_mat = confusion_matrix(total_dets.astype(int), total_preds >= .5)
-                n_close = (conf_mat[1, 0] + conf_mat[0, 1] - conf_mat[1, 1]) / len(total_preds)
-                self.__log__(f'Detection accuracy: \n{conf_mat[0, 0]} correct vs. {conf_mat[0, 1]} misclass no pulse.'
-                             f'\n{conf_mat[1, 1]} correct vs. {conf_mat[1, 0]} misclass no pulse.')
+                wloss = weighted_bce(total_dets, total_preds, balance=len(total_dets) - sum(total_dets)).numpy()
+                n_close = -(1 - wloss)
+                self.__log__(f'Detection accuracy: \n{conf_mat[0, 0]}/{conf_mat[0, 0] + conf_mat[0, 1]} no pulse - {conf_mat[1, 1]}/{conf_mat[1, 0] + conf_mat[1, 1]} pulse.'
+                             f'\nWeighted loss is {wloss:.2f}')
             except AttributeError:
                 self.__log__('Detection failed due to AttributeError.')
                 n_close = 0
@@ -383,7 +388,7 @@ class SinglePulseBackground(Environment):
                                 a_elevationRange=np.array([self.el_lims[0], self.el_lims[1]])).flatten()
                     av_pts += 1
                 except ValueError:
-                    self.__log__(f'Could not fit MUSIC to channel {tx_num}')
+                    self.__log__(f'Could not fit MUSIC to channel, pulse {tx_num}, {cp}')
         if av_pts > 0:
             ea /= av_pts
         self.az_pt = ea[0]

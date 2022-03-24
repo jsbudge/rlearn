@@ -11,7 +11,7 @@ from matplotlib.cm import ScalarMappable
 import matplotlib.gridspec as gridspec
 from celluloid import Camera
 from tftb.processing import WignerVilleDistribution
-from cuda_kernels import applyRadiationPatternCPU
+from cuda_kernels import applyRadiationPatternCPU, logloss_fp, weighted_bce
 
 # Set the heap memory allotment to 1 GB (this is way more than we need)
 cupy.get_default_memory_pool().set_limit(size=1024 ** 3)
@@ -41,16 +41,16 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 1
+games = 30
 eval_games = 1
-max_timesteps = 128
+max_timesteps = 64
 batch_sz = 32
 ocean_debug = False
-feedback = False
+feedback = True
 gen_data = False
 save_logs = True
-load_agent = True
-save_agent = False
+load_agent = False
+save_agent = True
 plot_profiler = True
 
 # Parameters for the environment (and therefore the agents)
@@ -73,7 +73,7 @@ print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} f
 
 # We want the learning rate to be *small* so that many different pulses will, on average, train the model correctly
 det_model = keras.models.load_model('./id_model')
-det_model.compile(optimizer=Adam(learning_rate=1e-5), loss='binary_crossentropy', metrics=['accuracy'])
+det_model.compile(optimizer=Adam(learning_rate=1e-4), loss='binary_crossentropy', metrics=['accuracy'])
 par_model = keras.models.load_model('./par_model')
 
 # Pre-defined or custom environment
@@ -89,7 +89,7 @@ env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=cpi_len, az_bw=
 opt_spec = dict(optimizer='adadelta', learning_rate=1., multi_step=5, subsampling_fraction=64,
                 clipping_threshold=1e-2, linesearch_iterations=2)
 
-delta_layer = [dict(type='linear_normalization'), dict(type='deltafier')]
+delta_layer = [dict(type='linear_normalization'), dict(type='deltafier', concatenate=0)]
 
 # Define states for different agents
 wave_state = dict(wave_corr=dict(type='float', shape=(env.fft_len, env.n_tx), min_value=-100, max_value=0),
@@ -118,7 +118,7 @@ if not load_agent:
                               actions=wave_action,
                               max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
                               critic_optimizer=opt_spec, state_preprocessing=delta_layer,
-                              memory=max_timesteps, exploration=5000.0, entropy_regularization=5.0, variable_noise=5.)
+                              memory=max_timesteps, exploration=5000.0, entropy_regularization=5.0, variable_noise=500.)
 else:
     print('Loading agent from wave_agent')
     wave_agent = Agent.load('./wave_agent')
@@ -195,17 +195,21 @@ if plot_profiler:
     else:
         print('Not enough training episodes for track display.')
 
-    plt.figure('RC Pulse Width')
-    for ant in range(env.n_tx):
-        pulse = genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, ant],
-                         env.nr, env.nr / env.fs, env.fc[ant], env.bw[ant])
-        fftpulse = np.fft.fft(pulse, findPowerOf2(nr) * 1)
-        rc_pulse = db(np.fft.ifft(fftpulse * (fftpulse * taylor(findPowerOf2(nr))).conj().T, findPowerOf2(nr) * 8))
-        plt.plot(np.arange(-len(rc_pulse) // 2, len(rc_pulse) // 2)[1:], np.fft.fftshift(rc_pulse)[1:])
-        back_noise[:nr] += pulse
-    plt.ylabel('dB')
-    plt.xlabel('Lag')
-    plt.legend(['Tx_{}'.format(n + 1) for n in range(env.n_tx)])
+    plt.figure('RC Pulse Width Over Time')
+    lgns = np.linspace(0, len(logs) - 1, 5).astype(int)
+    for t_idx, lgn in enumerate(lgns):
+        for ant in range(env.n_tx):
+            plt.subplot(1, env.n_tx, ant + 1)
+            pulse = genPulse(np.linspace(0, 1, len(logs[lgn][5][:, 0])), logs[lgn][5][:, ant],
+                             env.nr, env.nr / env.fs, env.fc[ant], env.bw[ant])
+            fftpulse = np.fft.fft(pulse, findPowerOf2(nr) * 1)
+            rc_pulse = db(np.fft.ifft(fftpulse * (fftpulse * taylor(findPowerOf2(nr))).conj().T, findPowerOf2(nr) * 8))
+            plt.plot(np.arange(-len(rc_pulse) // 2, len(rc_pulse) // 2)[1:], np.fft.fftshift(rc_pulse)[1:])
+            back_noise[:nr] += pulse
+            plt.title(f'Ant. {ant}')
+        plt.ylabel('dB')
+        plt.xlabel('Lag')
+    plt.legend([f'Step {lgn}' for lgn in lgns])
 
     try:
         wd = WignerVilleDistribution(back_noise)
@@ -328,25 +332,25 @@ if plot_profiler:
     wave_animation = wavecam.animate(interval=250)
 
     plt.figure('Ambiguity')
-    cmin = None
-    cmax = None
-    prf_val = 500.0
+    prf_plot = env.PRF * 2 if env.PRF is not None else 500.
+    ambigs = []
     for x in range(env.n_tx):
         pulse = genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, x],
                          env.nr, env.nr / env.fs, env.fc[x], env.bw[x])
         window_pulse = np.fft.ifft(np.fft.fft(pulse, findPowerOf2(nr)) * taylor(findPowerOf2(nr)))
         for y in range(env.n_tx):
-            plt.subplot(env.n_tx, env.n_tx, x * env.n_tx + y + 1)
-            prf_plot = env.PRF * 2 if env.PRF is not None else prf_val
-            amb = ambiguity(genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, y],
-                                     env.nr, env.nr / env.fs, env.fc[y], env.bw[y]),
-                            window_pulse, prf_plot, 150, mag=True, normalize=False)
-            cmin = np.min(amb[0]) if cmin is None else cmin
-            cmax = np.max(amb[0]) if cmax is None else cmax
-            if x == y:
-                plt.imshow(amb[0])
-            else:
-                plt.imshow(amb[0], clim=[cmin, cmax])
+            ambigs.append(ambiguity(genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, y],
+                                             env.nr, env.nr / env.fs, env.fc[y], env.bw[y]),
+                                    window_pulse, prf_plot, 150, mag=True, normalize=False)[0])
+    cmin = min([np.min(amb) for amb in ambigs])
+    cmax = max([np.max(amb) for amb in ambigs])
+    for x in range(env.n_tx):
+        for y in range(env.n_tx):
+            amb_sel = x * env.n_tx + y
+            plt.subplot(env.n_tx, env.n_tx, amb_sel + 1)
+            plt.imshow(ambigs[amb_sel] / cmax, clim=[0, 1.])
+            plt.axis('off')
+    plt.colorbar()
     plt.tight_layout()
 
     plt.figure('Rewards')

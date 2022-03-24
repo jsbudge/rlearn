@@ -2,6 +2,7 @@ import cmath
 import math
 from numba import cuda, njit
 import numpy as np
+from keras import backend as K
 
 c0 = 299792458.0
 TAC = 125e6
@@ -30,7 +31,7 @@ def interp(x, y, tt, bg):
     xdiff = x - x0
     ydiff = y - y0
     return bg[tt, x1, y1].real * xdiff * ydiff + bg[tt, x1, y0].real * xdiff * (1 - ydiff) + bg[tt, x0, y1].real * \
-         (1 - xdiff) * ydiff + bg[tt, x0, y0].real * (1 - xdiff) * (1 - ydiff)
+           (1 - xdiff) * ydiff + bg[tt, x0, y0].real * (1 - xdiff) * (1 - ydiff)
 
 
 @cuda.jit(device=True)
@@ -46,7 +47,7 @@ def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, 
                  math.sin(np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi)) /
                  (np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi))) * \
              math.sqrt(math.sin(eldiff) * math.sin(eldiff) * math.cos(azdiff) * math.cos(azdiff) +
-                     math.cos(eldiff) * math.cos(eldiff))
+                       math.cos(eldiff) * math.cos(eldiff))
     el_rx = math.asin(-s_rz / rngrx)
     az_rx = math.atan2(s_rx, s_ry)
     eldiff = diff(el_rx, el)
@@ -56,7 +57,7 @@ def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az, 
                  math.sin(np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi)) /
                  (np.pi * b * k * math.cos(eldiff) * math.sin(azdiff) / (2 * np.pi))) * \
              math.sqrt(math.sin(eldiff) * math.sin(eldiff) * math.cos(azdiff) * math.cos(azdiff) +
-                     math.cos(eldiff) * math.cos(eldiff))
+                       math.cos(eldiff) * math.cos(eldiff))
     return tx_pat * rx_pat
 
 
@@ -73,7 +74,7 @@ def applyRadiationPatternCPU(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, a
                  np.sin(np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi)) /
                  (np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi))) * \
              np.sqrt(np.sin(eldiff) * np.sin(eldiff) * np.cos(azdiff) * np.cos(azdiff) +
-                       np.cos(eldiff) * np.cos(eldiff))
+                     np.cos(eldiff) * np.cos(eldiff))
     el_rx = np.arcsin(-s_rz / rngrx)
     az_rx = np.arctan2(s_ry, s_rx)
     eldiff = cpudiff(el_rx, el) if el_rx != el else 1e-9
@@ -83,7 +84,7 @@ def applyRadiationPatternCPU(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, a
                  np.sin(np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi)) /
                  (np.pi * b * k * np.cos(eldiff) * np.sin(azdiff) / (2 * np.pi))) * \
              np.sqrt(np.sin(eldiff) * np.sin(eldiff) * np.cos(azdiff) * np.cos(azdiff) +
-                       np.cos(eldiff) * np.cos(eldiff))
+                     np.cos(eldiff) * np.cos(eldiff))
     return tx_pat * rx_pat
 
 
@@ -201,3 +202,34 @@ def getDetectionCheck(pathtx, subs, pd_r, pd_i, pan, el, det_spread, params):
         cuda.atomic.add(pd_r, (pt_f, pt_s), acc_val.real)
         cuda.atomic.add(pd_i, (pt_f, pt_s), acc_val.imag)
         det_spread[pt_s] = 1
+
+
+def weighted_bce(y_true, y_pred, balance=10.):
+    weights = (y_true * balance) + 1.
+    bce = K.binary_crossentropy(y_true, y_pred)
+    wbce = K.mean(bce * weights)
+    return wbce
+
+
+def logloss_fp(yt, yp):
+    '''Log loss that weights false positives or false negatives more.
+    Punish the false negatives if you care about making sure all the neurons
+    are found and don't mind some false positives. Vice versa for punishing
+    the false positives. Concept taken from the UNet paper where they
+    weighted boundary errors to get cleaner boundaries.'''
+
+    emphasis = 'fn'
+    assert emphasis in ['fn', 'fp']
+    m = 2
+
+    # Apply the multiplier to y_true.
+    if emphasis == 'fn':
+        # [0,1] -> [0,m].
+        w = yt * m
+    elif emphasis == 'fp':
+        # [0,1] -> [-1,0] -> [1,0] -> [m-1,0] -> [m,1]
+        w = ((yt - 1) * -1) * (m - 1) + 1
+
+    a = yt * K.log(yp + K.epsilon())
+    b = (1 - yt) * K.log(1 + K.epsilon() - yp)
+    return -1 * K.mean(w * (a + b))

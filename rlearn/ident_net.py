@@ -10,6 +10,7 @@ import keras
 from tensorflow.signal import rfft
 from tensorflow.keras.optimizers import Adam, Adadelta
 from tensorflow.keras.constraints import NonNeg
+from tensorflow.profiler import profile, ProfileOptionBuilder
 from keras.layers import Input, Conv2D, Flatten, Dense, BatchNormalization, MaxPooling2D, AveragePooling2D, \
     Dropout, GaussianNoise, Concatenate, LSTM, Embedding, Conv1D, Lambda, MaxPooling1D, ActivityRegularization, \
     LocallyConnected2D, Normalization, LayerNormalization
@@ -139,7 +140,7 @@ base_pl = 6.468e-6
 train_prf = 1000.
 train_runs = 1
 load_model = False
-save_model = False
+save_model = True
 tset_data_only = False
 noise_sigma = 1e-8
 
@@ -154,10 +155,11 @@ def genModel(nsam):
                hop_length=stft_sz // 4, window_name='hann_window')(inp)
     lay = Magnitude()(lay)
     lay = BatchNormalization(center=True, scale=True, axis=1)(lay)
-    lay = MaxPooling2D((4, 4))(lay)
-    lay = Conv2D(32, (16, 32))(lay)
+    lay = MaxPooling2D((2, 4))(lay)
+    lay = Conv2D(32, (16, 16))(lay)
+    lay = Conv2D(32, (16, 16))(lay)
     lay = Flatten()(lay)
-    lay = Dense(512, activation='relu')(lay)
+    lay = Dense(512, activation='tanh')(lay)
     outp = Dense(1, activation='sigmoid')(lay)
     return keras.Model(inputs=inp, outputs=outp)
 
@@ -184,7 +186,7 @@ if load_model:
     mdl = keras.models.load_model('./id_model')
 else:
     mdl = genModel(minp_sz)
-mdl_comp_opts = dict(optimizer=Adam(learning_rate=1e-4), loss='binary_crossentropy', metrics=['accuracy'])
+mdl_comp_opts = dict(optimizer=Adam(learning_rate=1e-6), loss='binary_crossentropy', metrics=['accuracy'])
 mdl.compile(**mdl_comp_opts)
 par_mdl = genParamModel(seg_sz)
 par_comp_opts = dict(optimizer=Adadelta(learning_rate=1.0), loss='huber_loss', metrics=['mean_squared_error'])
@@ -223,7 +225,7 @@ for tset in tqdm(range(train_runs)):
         data[n, :] += np.fft.ifft(np.fft.fft(ndata) * pulse)
         labels[n] = 1
     h = mdl.fit(data, labels, validation_split=.2, epochs=5, batch_size=batch_sz,
-            callbacks=[EarlyStopping(patience=2), TerminateOnNaN()])
+            callbacks=[EarlyStopping(patience=2), TerminateOnNaN(), ReduceLROnPlateau(patience=2)])
     hist_loss = np.concatenate((hist_loss, h.history['loss']))
     hist_val_loss = np.concatenate((hist_val_loss, h.history['val_loss']))
     hist_acc = np.concatenate((hist_acc, h.history['accuracy']))
@@ -242,7 +244,7 @@ if not tset_data_only:
         Xt, yt = shuffle(Xt, yt)
 
         h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=15, batch_size=batch_sz,
-                    callbacks=[EarlyStopping(patience=5), TerminateOnNaN()],
+                    callbacks=[EarlyStopping(patience=5), TerminateOnNaN(), ReduceLROnPlateau(patience=3)],
                     class_weight={0: sum(ys) / len(ys), 1: 1 - sum(ys) / len(ys)})
         hist_loss = np.concatenate((hist_loss, h.history['loss']))
         hist_val_loss = np.concatenate((hist_val_loss, h.history['val_loss']))
@@ -313,7 +315,10 @@ if save_model:
     mdl.save('./id_model')
     #par_mdl.save('./par_model')
 
-#plot_model(mdl, to_file='mdl.png', show_shapes=True)
+plot_model(mdl, to_file='mdl.png', show_shapes=True)
+
+num_flops = profile(mdl, options=ProfileOptionBuilder.float_operation())
+print(f'FLOPs of model: {flops.total_float_ops}')
 #plot_model(par_mdl, to_file='par_mdl.png', show_shapes=True)
 
 
