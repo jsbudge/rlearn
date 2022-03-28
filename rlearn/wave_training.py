@@ -41,16 +41,16 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 30
+games = 1
 eval_games = 1
-max_timesteps = 64
+max_timesteps = 128
 batch_sz = 32
 ocean_debug = False
-feedback = True
+feedback = False
 gen_data = False
-save_logs = True
+save_logs = False
 load_agent = False
-save_agent = True
+save_agent = False
 plot_profiler = True
 
 # Parameters for the environment (and therefore the agents)
@@ -73,7 +73,7 @@ print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} f
 
 # We want the learning rate to be *small* so that many different pulses will, on average, train the model correctly
 det_model = keras.models.load_model('./id_model')
-det_model.compile(optimizer=Adam(learning_rate=1e-4), loss='binary_crossentropy', metrics=['accuracy'])
+det_model.compile(optimizer=Adadelta(learning_rate=1e-4), loss='binary_crossentropy', metrics=['accuracy'])
 par_model = keras.models.load_model('./par_model')
 
 # Pre-defined or custom environment
@@ -107,7 +107,7 @@ wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, m
                    bw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
                            max_value=env.fs / 2 - 5e6),
                    power=dict(type='float', shape=(env.n_tx,), min_value=10,
-                              max_value=50)
+                              max_value=150)
                    )
 
 # Instantiate wave agent
@@ -118,7 +118,7 @@ if not load_agent:
                               actions=wave_action,
                               max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
                               critic_optimizer=opt_spec, state_preprocessing=delta_layer,
-                              memory=max_timesteps, exploration=5000.0, entropy_regularization=5.0, variable_noise=500.)
+                              memory=max_timesteps, exploration=5e9, entropy_regularization=1e3, variable_noise=.1)
 else:
     print('Loading agent from wave_agent')
     wave_agent = Agent.load('./wave_agent')
@@ -145,6 +145,7 @@ for episode in tqdm(range(games)):
 # Testing loop
 env.mdl_feedback = False  # Reset model feedback to evaluate
 actions = None
+end_pulses = []
 print('Evaluation...')
 for g in tqdm(range(eval_games)):
 
@@ -163,6 +164,7 @@ for g in tqdm(range(eval_games)):
             states, terminal, reward = env.execute(actions=actions)
     except KeyboardInterrupt:
         break
+    end_pulses.append(env.log[-1])
 
 env.close()
 # wave_agent.close()
@@ -184,7 +186,7 @@ if plot_profiler:
     log_num = min(10, len(logs) - 1)
 
     nr = int(((env.env.nrange * 2 / c0 - 1 / TAC) * .99 * env.plp) * env.fs)
-    back_noise = np.random.rand(max(nr, 5000)) - .5 + 1j * (np.random.rand(max(nr, 5000)) - .5)
+    back_noise = np.random.normal(0, 1e-8, size=(5000,)) + 1j * np.random.normal(0, 1e-8, size=(5000,))
 
     if len(reward_track) >= 5:
         plt.figure('Training Reward Track')
@@ -205,11 +207,24 @@ if plot_profiler:
             fftpulse = np.fft.fft(pulse, findPowerOf2(nr) * 1)
             rc_pulse = db(np.fft.ifft(fftpulse * (fftpulse * taylor(findPowerOf2(nr))).conj().T, findPowerOf2(nr) * 8))
             plt.plot(np.arange(-len(rc_pulse) // 2, len(rc_pulse) // 2)[1:], np.fft.fftshift(rc_pulse)[1:])
-            back_noise[:nr] += pulse
             plt.title(f'Ant. {ant}')
         plt.ylabel('dB')
         plt.xlabel('Lag')
     plt.legend([f'Step {lgn}' for lgn in lgns])
+
+    plt.figure('Evaluation Ending Pulse Widths')
+    for end_log in end_pulses:
+        for ant in range(env.n_tx):
+            plt.subplot(1, env.n_tx, ant + 1)
+            pulse = genPulse(np.linspace(0, 1, len(end_log[5][:, 0])), end_log[5][:, ant],
+                             env.nr, env.nr / env.fs, env.fc[ant], env.bw[ant])
+            fftpulse = np.fft.fft(pulse, findPowerOf2(nr) * 1)
+            rc_pulse = db(np.fft.ifft(fftpulse * (fftpulse * taylor(findPowerOf2(nr))).conj().T, findPowerOf2(nr) * 8))
+            plt.plot(np.arange(-len(rc_pulse) // 2, len(rc_pulse) // 2)[1:], np.fft.fftshift(rc_pulse)[1:])
+            back_noise[len(back_noise) // 2:len(back_noise) // 2 + nr] += pulse
+            plt.title(f'Ant. {ant}')
+        plt.ylabel('dB')
+        plt.xlabel('Lag')
 
     try:
         wd = WignerVilleDistribution(back_noise)
@@ -360,7 +375,7 @@ if plot_profiler:
     for sc_part in range(wave_scores.shape[1], 0, -1):
         plt.plot(times, np.sum(wave_scores[:, :sc_part], axis=1))
         plt.fill_between(times, np.sum(wave_scores[:, :sc_part], axis=1))
-    plt.legend(['Detection', 'Detected', 'Ambiguity'])
+    plt.legend(['Detection', 'Detected', 'Ambiguity', 'Diversity'])
 
     # Ocean waves, for pretty picture and debugging
     if ocean_debug:

@@ -216,8 +216,8 @@ class SinglePulseBackground(Environment):
             self.__log__('No parameter model found')
 
         # CFAR kernel
-        # Trying an inverted gaussian
-        cfk = 1 - gaus_2d((self.cpi_len // 10, self.nsam // 20), (.05, .5), height=1000)
+        cfk = np.ones((self.cpi_len // 4, self.nsam // 10))
+        cfk[cfk.shape[0] // 2 - 2:cfk.shape[0] // 2 + 2, cfk.shape[1] // 2 - 10:cfk.shape[1] // 2 + 10] = 0
         self.cfar_kernel = cfk / np.sum(cfk)
 
     def max_episode_timesteps(self):
@@ -279,13 +279,11 @@ class SinglePulseBackground(Environment):
         reward = 0
 
         # Ambiguity score
-        amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx))) * 2.
+        amb_sc = 1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx))
 
-        # Drop score for ambiguity if it's too close to the previous
-        red_sc = (1 - np.linalg.norm(actions['wave'] - self.prev_wavep) / self.wavep_max) / \
-                 max(self.max_steps / 2 - self.step, 1)
-        amb_sc -= red_sc
-        self.__log__(f'Ambiguity score reduced by {red_sc}')
+        # Diversity score - for if it's too close to the previous
+        div_sc = np.linalg.norm(actions['wave'] - self.prev_wavep) / self.wavep_max
+        amb_sc += div_sc
         self.prev_wavep = actions['wave'] + 0.
 
         # Check pulse detection quality
@@ -331,7 +329,7 @@ class SinglePulseBackground(Environment):
                 if acc_sc < .7:
                     self.__log__(
                         f'Balanced accuracy of {acc_sc * 100:.2f}%. Updating detection model with generated waveforms.')
-                    self.det_model.fit(feedback_data, feedback_labels, validation_split=.2, epochs=5,
+                    self.det_model.fit(feedback_data, feedback_labels, validation_split=.2, epochs=50,
                                        callbacks=[EarlyStopping(patience=1)])
             while self.det_time < self.tf[-1]:
                 self.det_time += blocks * self.det_sz / self.fs
@@ -490,7 +488,7 @@ class SinglePulseBackground(Environment):
             reward += 3
 
         # Append everything to the logs, for pretty pictures later
-        self.log.append([beamform, [amb_sc, detb_sc, det_sc],
+        self.log.append([beamform, [amb_sc, detb_sc, det_sc, div_sc],
                          self.tf, self.az_pt, self.el_pt, actions['wave'], truth_ea, U])
 
         # Remove anything longer than the allowed steps, for arbitrary length episodes

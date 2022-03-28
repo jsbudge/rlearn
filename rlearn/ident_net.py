@@ -10,7 +10,8 @@ import keras
 from tensorflow.signal import rfft
 from tensorflow.keras.optimizers import Adam, Adadelta
 from tensorflow.keras.constraints import NonNeg
-from tensorflow.profiler import profile, ProfileOptionBuilder
+import tensorflow as tf
+# from tensorflow.profiler import profile, ProfileOptionBuilder
 from keras.layers import Input, Conv2D, Flatten, Dense, BatchNormalization, MaxPooling2D, AveragePooling2D, \
     Dropout, GaussianNoise, Concatenate, LSTM, Embedding, Conv1D, Lambda, MaxPooling1D, ActivityRegularization, \
     LocallyConnected2D, Normalization, LayerNormalization
@@ -26,6 +27,7 @@ from scipy.signal.windows import taylor
 from scipy.signal import stft
 from tftb.processing import WignerVilleDistribution
 import matplotlib.pyplot as plt
+from datetime import datetime
 
 c0 = 299792458.0
 TAC = 125e6
@@ -83,7 +85,7 @@ def plotWeights(mdl, lnum=2, mdl_name=''):
 def plotActivations(classifier, inp):
     layer_outputs = [layer.output for layer in classifier.layers]  # Extracts the outputs of the top 12 layers
     activation_model = keras.Model(inputs=classifier.input,
-        outputs=layer_outputs)  # Creates a model that will return these outputs, given the model input
+                                   outputs=layer_outputs)  # Creates a model that will return these outputs, given the model input
     activations = activation_model.predict(inp.reshape((1, len(inp), 1)))
     layer_names = []
     for layer in classifier.layers:
@@ -97,13 +99,14 @@ def plotActivations(classifier, inp):
                 plt.figure(layer_name + f' channel {m}')
                 plt.grid(False)
                 for n in range(n_features):
-                    plt.subplot(grid_sz, grid_sz, n+1)
+                    plt.subplot(grid_sz, grid_sz, n + 1)
                     try:
                         plt.imshow(layer_activation[m, :, :, n], aspect='auto', cmap='viridis')
                     except TypeError:
                         plt.imshow(db(layer_activation[m, :, :, n]), aspect='auto', cmap='viridis')
                         if 'stft' in layer_name:
-                            print(layer_name + f' mean is {np.mean(abs(layer_activation[m, :, :, n]))} and std is {np.std(abs(layer_activation[m, :, :, n]))}')
+                            print(layer_name + f' mean is {np.mean(abs(layer_activation[m, :, :, n])):.2f} '
+                                               f'and variance is {np.std(abs(layer_activation[m, :, :, n])) ** 2:.2f}')
         elif 'dense' in layer_name:
             for m in range(layer_activation.shape[0]):
                 plt.figure(layer_name + f' channel {m}')
@@ -134,32 +137,37 @@ epoch_sz = 256
 batch_sz = 32
 neg_per_pos = 1
 minp_sz = 16384
-stft_sz = 512
+stft_sz = 256
 band_limits = (10e6, fs / 2)
 base_pl = 6.468e-6
 train_prf = 1000.
-train_runs = 1
+train_runs = 0
 load_model = False
-save_model = True
+save_model = False
 tset_data_only = False
 noise_sigma = 1e-8
 
 segment_base_samp = minp_sz * dec_facs[-1]
-segment_t0 = segment_base_samp / fs   # Segment time in secs
+segment_t0 = segment_base_samp / fs  # Segment time in secs
 seg_sz = int(np.ceil(segment_t0 * fs))
+
+# Tensorboard stuff
+log_dir = "logs/fit/" + datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 def genModel(nsam):
     inp = Input(shape=(nsam, 1))
-    lay = STFT(n_fft=stft_sz, win_length=stft_sz - (stft_sz % 100),
-               hop_length=stft_sz // 4, window_name='hann_window')(inp)
+    lay = STFT(n_fft=stft_sz,
+               hop_length=stft_sz // 2, window_name='hann_window')(inp)
     lay = Magnitude()(lay)
     lay = BatchNormalization(center=True, scale=True, axis=1)(lay)
-    lay = MaxPooling2D((2, 4))(lay)
-    lay = Conv2D(32, (16, 16))(lay)
-    lay = Conv2D(32, (16, 16))(lay)
+    lay = Conv2D(32, (32, 32), padding='same')(lay)
+    lay = MaxPooling2D((2, 2))(lay)
+    lay = Conv2D(32, (32, 32), padding='same')(lay)
+    lay = MaxPooling2D((2, 2))(lay)
+    lay = Conv2D(32, (32, 32), padding='same')(lay)
     lay = Flatten()(lay)
-    lay = Dense(512, activation='tanh')(lay)
+    lay = Dense(128, activation='relu')(lay)
     outp = Dense(1, activation='sigmoid')(lay)
     return keras.Model(inputs=inp, outputs=outp)
 
@@ -186,7 +194,10 @@ if load_model:
     mdl = keras.models.load_model('./id_model')
 else:
     mdl = genModel(minp_sz)
-mdl_comp_opts = dict(optimizer=Adam(learning_rate=1e-6), loss='binary_crossentropy', metrics=['accuracy'])
+mdl_comp_opts = dict(optimizer=Adadelta(learning_rate=1.), loss='binary_crossentropy', metrics=['accuracy'])
+mdl_callbacks = [EarlyStopping(patience=3), TerminateOnNaN(),
+                 ReduceLROnPlateau(patience=10, factor=.9, min_lr=1e-9),
+                 tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)]
 mdl.compile(**mdl_comp_opts)
 par_mdl = genParamModel(seg_sz)
 par_comp_opts = dict(optimizer=Adadelta(learning_rate=1.0), loss='huber_loss', metrics=['mean_squared_error'])
@@ -203,8 +214,9 @@ tpt = 0
 spt = 0
 npt = minp_sz / fs
 for tset in tqdm(range(train_runs)):
-    data = np.random.normal(0, noise_sigma, (epoch_sz, minp_sz)) + 1j * np.random.normal(0, noise_sigma, (epoch_sz, minp_sz))
-    labels = np.zeros((epoch_sz,))
+    data = np.random.normal(0, noise_sigma, (epoch_sz, minp_sz)) + 1j * np.random.normal(0, noise_sigma,
+                                                                                         (epoch_sz, minp_sz))
+    labels = np.ones((epoch_sz,))
     for n in np.arange(0, epoch_sz, 2):
         fc = np.random.uniform(8e9, 12e9)
         bw = np.random.uniform(*band_limits)
@@ -220,12 +232,12 @@ for tset in tqdm(range(train_runs)):
         while spt <= tpt < npt:
             times = np.arange(spt, npt, 1 / fs)[:minp_sz]
             tdist = abs(times - tpt)
-            ndata[tdist == tdist.min()] += np.exp(1j * 2 * np.pi * c0 / fc * rngtx) * 1 / (rngtx * rngtx)
+            ndata[tdist == tdist.min()] += 10 * np.exp(1j * 2 * np.pi * c0 / fc * rngtx) * 1 / (rngtx * rngtx)
             tpt += 1 / train_prf
         data[n, :] += np.fft.ifft(np.fft.fft(ndata) * pulse)
-        labels[n] = 1
-    h = mdl.fit(data, labels, validation_split=.2, epochs=5, batch_size=batch_sz,
-            callbacks=[EarlyStopping(patience=2), TerminateOnNaN(), ReduceLROnPlateau(patience=2)])
+        labels[n] = 0.
+    h = mdl.fit(data, labels, validation_split=.2, epochs=15, batch_size=batch_sz,
+                callbacks=mdl_callbacks)
     hist_loss = np.concatenate((hist_loss, h.history['loss']))
     hist_val_loss = np.concatenate((hist_val_loss, h.history['val_loss']))
     hist_acc = np.concatenate((hist_acc, h.history['accuracy']))
@@ -244,7 +256,7 @@ if not tset_data_only:
         Xt, yt = shuffle(Xt, yt)
 
         h = mdl.fit(Xt, yt, validation_data=(Xs, ys), epochs=15, batch_size=batch_sz,
-                    callbacks=[EarlyStopping(patience=5), TerminateOnNaN(), ReduceLROnPlateau(patience=3)],
+                    callbacks=mdl_callbacks,
                     class_weight={0: sum(ys) / len(ys), 1: 1 - sum(ys) / len(ys)})
         hist_loss = np.concatenate((hist_loss, h.history['loss']))
         hist_val_loss = np.concatenate((hist_val_loss, h.history['val_loss']))
@@ -264,7 +276,7 @@ plt.legend([f'{d}_acc' for d in dec_facs] + [f'{d}_val_acc' for d in dec_facs])
 for idx, l in enumerate(mdl.layers):
     plotWeights(mdl, idx, mdl_name=f'model')
 
-plotActivations(mdl, Xs[ys == 1, :][0, :])
+plotActivations(mdl, Xs[3, :])
 
 # Model analysis
 test_mdl = genModel(minp_sz)
@@ -313,15 +325,10 @@ for n in range(Xs.shape[0]):
 # Save out the model for future use
 if save_model:
     mdl.save('./id_model')
-    #par_mdl.save('./par_model')
+    plot_model(mdl, to_file='mdl.png', show_shapes=True)
+    # par_mdl.save('./par_model')
 
-plot_model(mdl, to_file='mdl.png', show_shapes=True)
+mdl_graph = tf.profiler.experimental.Profile(mdl)
 
-num_flops = profile(mdl, options=ProfileOptionBuilder.float_operation())
-print(f'FLOPs of model: {flops.total_float_ops}')
-#plot_model(par_mdl, to_file='par_mdl.png', show_shapes=True)
-
-
-
-
-
+# num_flops = profile(mdl, options=ProfileOptionBuilder.float_operation())
+# print(f'FLOPs of model: {flops.total_float_ops}')

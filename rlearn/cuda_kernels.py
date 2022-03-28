@@ -204,7 +204,7 @@ def getDetectionCheck(pathtx, subs, pd_r, pd_i, pan, el, det_spread, params):
         det_spread[pt_s] = 1
 
 
-def weighted_bce(y_true, y_pred, balance=10.):
+def weighted_bce(y_true, y_pred, balance=5.):
     weights = (y_true * balance) + 1.
     bce = K.binary_crossentropy(y_true, y_pred)
     wbce = K.mean(bce * weights)
