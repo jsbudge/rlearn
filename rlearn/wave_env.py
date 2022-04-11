@@ -54,6 +54,10 @@ DTR = np.pi / 180
 MAX_ALFA_ACCEL = 0.35185185185185186
 MAX_ALFA_SPEED = 2.577
 WAVEPOINTS = 100
+NOISE_SIGMA = 1e-6
+X_BAND_MIN = 8e9
+X_BAND_SIZE = 4e9
+MIN_BANDWIDTH = 10e6
 
 
 def gaus_2d(size, sigma, angle=0, height=1):
@@ -147,7 +151,7 @@ class SinglePulseBackground(Environment):
         # Antenna array definition
         dr = c0 / 9.6e9
         self.tx_locs = np.array([(dr / 2, 0, 0), (-dr / 2, 0, 0)]).T
-        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (0, dr * 2, 0), (0, -dr * 2, 0), (0, 0, 0)]).T
+        self.rx_locs = np.array([(-dr, 0, 0), (dr, 0, 0), (0, dr * 2, 0), (0, -dr * 2, 0)]).T
         self.el_rot = lambda el, loc: np.array([[1, 0, 0],
                                                 [0, np.cos(el), -np.sin(el)],
                                                 [0, np.sin(el), np.cos(el)]]).dot(loc)
@@ -193,8 +197,8 @@ class SinglePulseBackground(Environment):
 
         # Get wavepoint differential for scoring
         init_wave = np.ones((WAVEPOINTS, self.n_tx)) * .5
-        init_wave[0:3, :] = .01
-        init_wave[-3:, :] = .99
+        #init_wave[0:3, :] = .01
+        #init_wave[-3:, :] = .99
         self.prev_wavep = init_wave
         # Calculated as maximum possible shift in wavepoints
         self.wavep_max = 14.142135623730951
@@ -256,14 +260,23 @@ class SinglePulseBackground(Environment):
         for t in self.targets:
             t.genpos(self.tf)
 
+        # Diversity score - for if it's too close to the previous
+        wavep_delta = actions['wave'] - self.prev_wavep
+        div_sc = np.linalg.norm(wavep_delta) / self.wavep_max * 4 + \
+                 np.linalg.norm(actions['fc'] - (np.array(self.fc) - X_BAND_MIN) / X_BAND_SIZE) * 4 + \
+                 np.linalg.norm(actions['bw'] - (np.array(self.bw) - MIN_BANDWIDTH) / (self.fs / 2 - MIN_BANDWIDTH)) * 4
+        # div_sc *= self.step / self.max_steps
+        self.prev_wavep = actions['wave'] + 0.
+
         # Update radar parameters to given params
-        prev_bw = self.bw
-        prev_fc = self.fc
-        self.fc = actions['fc']
-        self.bw = actions['bw']
+        self.fc = actions['fc'] * X_BAND_SIZE + X_BAND_MIN
+        self.bw = actions['bw'] * (self.fs / 2 - MIN_BANDWIDTH) + MIN_BANDWIDTH
+        self.__log__('Bandwidths and center frequencies for channels are')
+        for n in range(self.n_tx):
+            self.__log__(f'Channel {n}:\t{self.fc[n]:.2f}\t{self.bw[n]:.2f}')
         chirps = np.zeros((self.nr, self.n_tx), dtype=np.complex128)
         for n in range(self.n_tx):
-            chirps[:, n] = self.genChirp(actions['wave'][:, n], self.bw[n]) * actions['power'][n]
+            chirps[:, n] = self.genChirp(actions['wave'][:, n], self.bw[n]) * (actions['power'][n] * 100. + 1)
         fft_chirp = np.fft.fft(chirps, self.fft_len, axis=0)
         state_corr = np.fft.fftshift(db(np.fft.ifft(fft_chirp * fft_chirp.conj(), axis=0)), axes=0)
         state_corr = state_corr - np.max(state_corr, axis=0)[None, :]
@@ -279,12 +292,7 @@ class SinglePulseBackground(Environment):
         reward = 0
 
         # Ambiguity score
-        amb_sc = 1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx))
-
-        # Diversity score - for if it's too close to the previous
-        div_sc = np.linalg.norm(actions['wave'] - self.prev_wavep) / self.wavep_max
-        amb_sc += div_sc
-        self.prev_wavep = actions['wave'] + 0.
+        amb_sc = (1 - np.linalg.norm(np.corrcoef(chirps.T) - np.eye(self.n_tx))) / 100
 
         # Check pulse detection quality
         blocks = 32
@@ -304,53 +312,57 @@ class SinglePulseBackground(Environment):
                 # If there's any pulses in this time block, run data generation and model feedback
                 if sum(n_dets) > 0:
                     total_dets = np.concatenate((total_dets, n_dets))
-                    total_preds = np.concatenate((total_preds, self.det_model.predict(id_data.T).flatten()))
+                    total_preds = np.concatenate((total_preds, self.det_model.predict(id_data).flatten()))
                     if self.mdl_feedback or self.gen_train_data:
                         added = [0, 0]
                         for n in range(blocks):
                             if n_dets[n]:
-                                feedback_data.append(id_data[:, n].flatten())
+                                feedback_data.append(id_data[n, :].flatten())
                                 feedback_labels.append([1.])
                                 added[0] += 1
                             elif added[1] < added[0]:
-                                feedback_data.append(id_data[:, n].flatten())
+                                feedback_data.append(id_data[n, :].flatten())
                                 feedback_labels.append([0.])
                                 added[1] += 1
                     its += 1
             feedback_data = np.array(feedback_data)
             feedback_labels = np.array(feedback_labels)
+            acc_sc = balanced_accuracy_score(total_dets.astype(int), total_preds >= .5)
             if self.gen_train_data:
-                if not saveTrainingData(self.feedback_nme, feedback_data.T, feedback_labels):
+                if not saveTrainingData(self.feedback_nme, feedback_data, feedback_labels):
                     self.__log__('Training data NOT saved.')
                 else:
                     self.__log__(f'{feedback_data.shape[0]} blocks of training data saved.')
             if self.mdl_feedback:
-                acc_sc = balanced_accuracy_score(total_dets.astype(int), total_preds >= .5)
                 if acc_sc < .7:
                     self.__log__(
                         f'Balanced accuracy of {acc_sc * 100:.2f}%. Updating detection model with generated waveforms.')
-                    self.det_model.fit(feedback_data, feedback_labels, validation_split=.2, epochs=50,
+                    self.det_model.fit(feedback_data, feedback_labels, validation_split=.2, epochs=5,
                                        callbacks=[EarlyStopping(patience=1)])
             while self.det_time < self.tf[-1]:
                 self.det_time += blocks * self.det_sz / self.fs
             try:
                 conf_mat = confusion_matrix(total_dets.astype(int), total_preds >= .5)
-                wloss = weighted_bce(total_dets, total_preds, balance=len(total_dets) - sum(total_dets)).numpy()
-                n_close = -(1 - wloss)
-                self.__log__(f'Detection accuracy: \n{conf_mat[0, 0]}/{conf_mat[0, 0] + conf_mat[0, 1]} no pulse - {conf_mat[1, 1]}/{conf_mat[1, 0] + conf_mat[1, 1]} pulse.'
+                wloss = weighted_bce(total_dets, total_preds, balance=50).numpy()
+                n_close = .75 - acc_sc
+                self.__log__(f'Detection accuracy: \n{conf_mat[0, 0]}/{conf_mat[0, 0] + conf_mat[0, 1]} no pulse - '
+                             f'{conf_mat[1, 1]}/{conf_mat[1, 0] + conf_mat[1, 1]} pulse.'
                              f'\nWeighted loss is {wloss:.2f}')
             except AttributeError:
                 self.__log__('Detection failed due to AttributeError.')
                 n_close = 0
+                wloss = 0
 
-            if n_close < -.25:
+            if n_close < -.20:
                 self.sub_det += 1
                 self.__log__(f'Submarine detection check {self.sub_det}')
-            if self.sub_det >= 4:
+            else:
+                self.sub_det = 0
+            if self.sub_det >= 7:
                 self.__log__('Submarine detected pulse. Episode failed.')
                 done = 1
                 reward -= 3
-            detb_sc += n_close
+            detb_sc += (wloss - 1.) / 100
 
         # Truth target distance score
         # Grab truth target location
@@ -386,7 +398,7 @@ class SinglePulseBackground(Environment):
                                 a_elevationRange=np.array([self.el_lims[0], self.el_lims[1]])).flatten()
                     av_pts += 1
                 except ValueError:
-                    self.__log__(f'Could not fit MUSIC to channel, pulse {tx_num}, {cp}')
+                    self.__log__(f'Could not fit MUSIC to channel {cp}, pulse {tx_num}')
         if av_pts > 0:
             ea /= av_pts
         self.az_pt = ea[0]
@@ -480,9 +492,9 @@ class SinglePulseBackground(Environment):
                 det_sc = -.25
         if det_sc < .7 and self.succ_det > 0:
             self.succ_det = 0
-        det_sc *= 3
+        det_sc /= 100
 
-        if self.succ_det > 4:
+        if self.succ_det >= 4:
             self.__log__('Target successfully recognized. Episode successful.')
             done = 1
             reward += 3
@@ -495,11 +507,13 @@ class SinglePulseBackground(Environment):
         if len(self.log) > self.max_steps:
             self.log.pop(0)
 
+        # Modify the angle estimates to be within 0 and 1
+        ea = (ea + np.pi) / (2 * np.pi)
+
         # Whole state space to be split into the various agents
         full_state = {'wave_corr': state_corr, 'clutter': np.array([clutter_cov.real, clutter_cov.imag]),
-                      'currfc': self.fc, 'currbw': self.bw,
-                      'prf': [self.PRF],
-                      'target_angs': ea}
+                      'wave_freqs': np.array([actions['fc'], actions['bw']]),
+                      'wave_params': [self.PRF / 5000., np.linalg.norm(wavep_delta) / self.wavep_max, *ea]}
 
         if self.step >= self.max_episode_timesteps():
             done = 2
@@ -507,7 +521,7 @@ class SinglePulseBackground(Environment):
 
         self.__log__(f'-------------------------------END STEP {self.step}---------------------------')
 
-        return full_state, done, amb_sc + detb_sc + det_sc + reward
+        return full_state, done, amb_sc + detb_sc + det_sc + reward + div_sc
 
     def reset(self, num_parallel=None):
         self.__log__('Reset environment.')
@@ -530,8 +544,8 @@ class SinglePulseBackground(Environment):
 
         # Initial wave is pretty much a single tone at center frequency
         init_wave = np.ones((WAVEPOINTS, self.n_tx)) * .5
-        init_wave[0:3, :] = .01
-        init_wave[-3:, :] = .99
+        # init_wave[0:3, :] = .01
+        # init_wave[-3:, :] = .99
         self.prev_wavep = init_wave
 
         fft_chirp = np.fft.fft(init_wave, self.fft_len, axis=0)
@@ -539,11 +553,10 @@ class SinglePulseBackground(Environment):
         state_corr = state_corr - np.max(state_corr, axis=0)[None, :]
         state_corr[state_corr < -100] = -100
         return {'clutter': np.array([np.eye(self.v_ants), np.zeros((self.v_ants, self.v_ants))]),
-                'currfc': [9.6e9 for _ in range(self.n_tx)],
                 'wave_corr': state_corr,
-                'currbw': [self.fs / 2 - 10e6 for _ in range(self.n_tx)],
-                'target_angs': np.array([0.0, 0.0]),
-                'prf': [self.PRF]}
+                'wave_freqs': np.array([[.5 for _ in range(self.n_tx)],
+                                        [.99 for _ in range(self.n_tx)]]),
+                'wave_params': [self.PRF / 5000., 0., 0., 0.]}
 
     def genCPI(self, chirp):
         mx_threads = cuda.get_current_device().MAX_THREADS_PER_BLOCK // 2
@@ -644,10 +657,11 @@ class SinglePulseBackground(Environment):
         return rd_cpu
 
     def genDetBlock(self, chirp, n_dets):
-        rd_cpu = np.zeros((self.det_sz, n_dets), dtype=np.complex128)
+        rd_cpu = np.zeros((n_dets, self.det_sz), dtype=np.complex128)
         block_tf = np.arange(self.cpi_len)[
                         np.logical_and(self.det_time <= self.tf,
                                        self.tf < self.det_time + (n_dets - 1) * self.det_sz / self.fs)]
+        sigma_noise = getNoisePower(self.bw, True)
         if len(block_tf) > 0:
             sv = []
             for sub in self.targets:
@@ -660,7 +674,7 @@ class SinglePulseBackground(Environment):
             el = np.arcsin(mot_pos[2, :] / np.linalg.norm(mot_pos, axis=0))
 
             # Calculate how much detection data we'll need
-            det_spread = np.zeros((n_dets,), dtype=int)
+            det_spread = np.zeros(rd_cpu.shape, dtype=int)
             for tx in range(self.n_tx):
                 tx_dets = cupy.zeros((self.det_sz * n_dets,), dtype=np.complex128)
                 chirps = cupy.array(chirp[:, tx], dtype=np.complex128)
@@ -674,20 +688,21 @@ class SinglePulseBackground(Environment):
                     ptt = ((self.tf[block_tf] + rng / c0 - self.det_time) * self.fs).astype(int)
                     tx_dets[ptt] = \
                         att * np.exp(1j * 2 * np.pi / (c0 / self.fc[tx]) * rng) * 1 / (rng**2)
-                    det_spread[ptt // self.det_sz] = 1
 
                 ret_data = cupy.convolve(tx_dets, chirps, mode='same')
                 cupy.cuda.Device().synchronize()
-                rd_cpu += ret_data.get().reshape((self.det_sz, n_dets))
+                ret_cpu = ret_data.get().reshape((n_dets, self.det_sz))
+                det_spread[abs(ret_cpu) > 1e-12] = 1
+                rd_cpu += ret_cpu + np.random.normal(0, sigma_noise[tx], size=rd_cpu.shape) + \
+                  1j * np.random.normal(0, sigma_noise[tx], size=rd_cpu.shape)
                 del tx_dets
                 del chirps
                 del ret_data
-            n_pulses = det_spread
+            n_pulses = (np.sum(det_spread, axis=1) > 0).astype(int)
         else:
             n_pulses = np.zeros((n_dets,), dtype=int)
 
         self.det_time += n_dets * self.det_sz / self.fs
-        rd_cpu += np.random.normal(0, 1e-8, size=rd_cpu.shape) + 1j * np.random.normal(0, 1e-8, size=rd_cpu.shape)
 
         return rd_cpu, n_pulses
 
@@ -799,15 +814,19 @@ class SinglePulseBackground(Environment):
 
 def genRD(cpi, chirp, nsam):
     # Gets a range compressed Range Map
-    twin = taylor(cpi.shape[0])
-    win_gpu = cupy.array(np.tile(twin, (cpi.shape[1], 1)).T, dtype=np.complex128)
+    # taywin = taylor(cpi.shape[0])
+    # twin = np.zeros(taywin.shape)
+    # twin[:len(twin) // 2] = taywin[len(twin) // 2:]
+    # twin[len(twin) // 2:] = taywin[:len(twin) // 2]
+    # win_gpu = cupy.array(np.tile(twin, (cpi.shape[1], 1)).T, dtype=np.complex128)
     chirp_gpu = cupy.array(np.tile(chirp, (cpi.shape[1], 1)).T, dtype=np.complex128)
     cpi_gpu = cupy.array(cpi, dtype=np.complex128)
-    rda_gpu = cupy.fft.ifft(cpi_gpu * (chirp_gpu * win_gpu).conj(), axis=0)[:nsam, :]
+    # rda_gpu = cupy.fft.ifft(cpi_gpu * (chirp_gpu * win_gpu).conj(), axis=0)[:nsam, :]
+    rda_gpu = cupy.fft.ifft(cpi_gpu * chirp_gpu.conj(), axis=0)[:nsam, :]
     cupy.cuda.Device().synchronize()
     rda = rda_gpu.get()
 
-    del win_gpu
+    # del win_gpu
     del chirp_gpu
     del rda_gpu
     del cpi_gpu
@@ -1059,10 +1078,23 @@ def saveTrainingData(fnme, data, labels):
                 labels.astype('bool').tofile(f)
         else:
             with open(fnme[0], 'wb') as f:
-                f.write(np.float64(data.shape[0]))
+                f.write(np.float64(data.shape[1]))
                 data.astype('complex128').tofile(f)
             with open(fnme[1], 'wb') as f:
                 labels.astype('bool').tofile(f)
         return True
     except:
         return False
+
+
+def getNoisePower(BW, is_mult_channel=False):
+    # Boltzmans constant
+    kb = 1.3806503e-23
+    # the reference temperature (in Kelvin)
+    T0 = 290.0
+    # Noise figure of 3dB
+    F = 10.0 ** (3.0 / 10.0)
+    N0 = kb * T0 * F
+    sigma_n = np.sqrt(N0 * BW)
+    # Note: for multiple channels use the sqrt of this
+    return sigma_n if is_mult_channel else sigma_n**2

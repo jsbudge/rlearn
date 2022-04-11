@@ -10,8 +10,9 @@ import matplotlib.pyplot as plt
 from matplotlib.cm import ScalarMappable
 import matplotlib.gridspec as gridspec
 from celluloid import Camera
-from tftb.processing import WignerVilleDistribution
+from tftb.processing import WignerVilleDistribution, ambiguity
 from cuda_kernels import applyRadiationPatternCPU, logloss_fp, weighted_bce
+from cambiguity import amb_surf, narrow_band, wide_band
 
 # Set the heap memory allotment to 1 GB (this is way more than we need)
 cupy.get_default_memory_pool().set_limit(size=1024 ** 3)
@@ -43,12 +44,12 @@ def sliding_window(data, win_size, func=None):
 
 games = 1
 eval_games = 1
-max_timesteps = 128
+max_timesteps = 64
 batch_sz = 32
 ocean_debug = False
 feedback = False
 gen_data = False
-save_logs = False
+save_logs = True
 load_agent = False
 save_agent = False
 plot_profiler = True
@@ -65,7 +66,7 @@ env_samples = 200000
 fs_decimation = 8
 az_lim = 90
 el_lim = 20
-beamform_type = 'mmse'
+beamform_type = 'phased'
 
 print('Initial memory on GPU:')
 print(f'Memory: {cupy.get_default_memory_pool().used_bytes()} / {cupy.get_default_memory_pool().total_bytes()}')
@@ -73,7 +74,7 @@ print(f'Pinned Memory: {cupy.get_default_pinned_memory_pool().n_free_blocks()} f
 
 # We want the learning rate to be *small* so that many different pulses will, on average, train the model correctly
 det_model = keras.models.load_model('./id_model')
-det_model.compile(optimizer=Adadelta(learning_rate=1e-4), loss='binary_crossentropy', metrics=['accuracy'])
+det_model.compile(optimizer=Adam(learning_rate=1e-5), loss='binary_crossentropy', metrics=['accuracy'])
 par_model = keras.models.load_model('./par_model')
 
 # Pre-defined or custom environment
@@ -86,28 +87,53 @@ env = SinglePulseBackground(max_timesteps=max_timesteps, cpi_len=cpi_len, az_bw=
                             randomize_startpoint=False)
 
 # Optimization spec
-opt_spec = dict(optimizer='adadelta', learning_rate=1., multi_step=5, subsampling_fraction=64,
-                clipping_threshold=1e-2, linesearch_iterations=2)
+opt_spec = dict(optimizer='adadelta', learning_rate=1e-2)
+# opt_spec = dict(optimizer='evolutionary', learning_rate=1e-2)
+# opt_spec = dict(optimizer='adadelta', learning_rate=1., multi_step=15, subsampling_fraction=64,
+#                 clipping_threshold=1e-2, linesearch_iterations=2)
+
+# net_spec = dict(type='auto', size=128, depth=6, rnn=1)
+net_spec = dict(type='layered', layers=[[dict(type='retrieve', tensors=['wave_corr']),
+                                         dict(type='conv1d', size=128),
+                                         dict(type='conv1d', size=128),
+                                         dict(type='conv1d', size=128),
+                                         dict(type='flatten'),
+                                         dict(type='dense', size=128),
+                                         dict(type='register', tensor='corr_embedding')],
+                                        [dict(type='retrieve', tensors=['wave_freqs']),
+                                         dict(type='flatten'),
+                                         dict(type='dense', size=32),
+                                         dict(type='register', tensor='freq_embedding')],
+                                        [dict(type='retrieve', tensors=['wave_params']),
+                                         dict(type='dense', size=32),
+                                         dict(type='register', tensor='param_embedding')],
+                                        [dict(type='retrieve', tensors=['clutter']),
+                                         dict(type='conv2d', size=16),
+                                         dict(type='conv2d', size=16),
+                                         dict(type='flatten'),
+                                         dict(type='dense', size=128),
+                                         dict(type='register', tensor='clutter_embedding')],
+                                        [dict(type='retrieve', aggregation='concat',
+                                              tensors=['corr_embedding', 'freq_embedding',
+                                                       'param_embedding', 'clutter_embedding']),
+                                         dict(type='dense', size=128),
+                                         dict(type='lstm', size=128, horizon=3)]])
 
 delta_layer = [dict(type='linear_normalization'), dict(type='deltafier', concatenate=0)]
 
 # Define states for different agents
 wave_state = dict(wave_corr=dict(type='float', shape=(env.fft_len, env.n_tx), min_value=-100, max_value=0),
-                  currfc=dict(type='float', shape=(env.n_tx,), min_value=8e9,
-                              max_value=12e9),
-                  currbw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
-                              max_value=env.fs / 2 - 5e6),
-                  clutter=dict(type='float', shape=(2, env.v_ants, env.v_ants), min_value=-1, max_value=1),
-                  target_angs=dict(type='float', shape=(2,), min_value=-np.pi, max_value=np.pi),
-                  prf=dict(type='float', shape=(1,), min_value=0, max_value=5000.))
+                  wave_freqs=dict(type='float', shape=(env.n_tx, 2), min_value=0, max_value=1),
+                  wave_params=dict(type='float', shape=(4,), min_value=0, max_value=1),
+                  clutter=dict(type='float', shape=(2, env.v_ants, env.v_ants), min_value=-1, max_value=1))
 
 # Define actions for different agents
 wave_action = dict(wave=dict(type='float', shape=(100, env.n_tx), min_value=0, max_value=1),
-                   fc=dict(type='float', shape=(env.n_tx,), min_value=8e9, max_value=12e9),
-                   bw=dict(type='float', shape=(env.n_tx,), min_value=10e6,
-                           max_value=env.fs / 2 - 5e6),
-                   power=dict(type='float', shape=(env.n_tx,), min_value=10,
-                              max_value=150)
+                   fc=dict(type='float', shape=(env.n_tx,), min_value=0, max_value=1),
+                   bw=dict(type='float', shape=(env.n_tx,), min_value=0,
+                           max_value=1),
+                   power=dict(type='float', shape=(env.n_tx,), min_value=0,
+                              max_value=1)
                    )
 
 # Instantiate wave agent
@@ -115,10 +141,12 @@ print('Initializing agents...')
 if not load_agent:
     print('Creating new Agent...')
     wave_agent = Agent.create(agent='a2c', states=wave_state,
-                              actions=wave_action,
-                              max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.99,
-                              critic_optimizer=opt_spec, state_preprocessing=delta_layer,
-                              memory=max_timesteps, exploration=5e9, entropy_regularization=1e3, variable_noise=.1)
+                              actions=wave_action, network=net_spec,
+                              max_episode_timesteps=max_timesteps, batch_size=batch_sz, discount=.9,
+                              critic_optimizer=opt_spec, learning_rate=1e-2, l2_regularization=1e-1,
+                              memory=max_timesteps, exploration=5e9, entropy_regularization=1e9,
+                              recorder=dict(directory='./recorder', frequency=1),
+                              summarizer=dict(directory='./tb', summaries='all'))
 else:
     print('Loading agent from wave_agent')
     wave_agent = Agent.load('./wave_agent')
@@ -186,7 +214,9 @@ if plot_profiler:
     log_num = min(10, len(logs) - 1)
 
     nr = int(((env.env.nrange * 2 / c0 - 1 / TAC) * .99 * env.plp) * env.fs)
-    back_noise = np.random.normal(0, 1e-8, size=(5000,)) + 1j * np.random.normal(0, 1e-8, size=(5000,))
+    nr_p2 = findPowerOf2(nr)
+    taywin = taylor(nr_p2)
+    back_noise = np.random.normal(0, 1., size=(5000,)) + 1j * np.random.normal(0, 1., size=(5000,))
 
     if len(reward_track) >= 5:
         plt.figure('Training Reward Track')
@@ -204,8 +234,10 @@ if plot_profiler:
             plt.subplot(1, env.n_tx, ant + 1)
             pulse = genPulse(np.linspace(0, 1, len(logs[lgn][5][:, 0])), logs[lgn][5][:, ant],
                              env.nr, env.nr / env.fs, env.fc[ant], env.bw[ant])
-            fftpulse = np.fft.fft(pulse, findPowerOf2(nr) * 1)
-            rc_pulse = db(np.fft.ifft(fftpulse * (fftpulse * taylor(findPowerOf2(nr))).conj().T, findPowerOf2(nr) * 8))
+            fftpulse = np.fft.fft(pulse, nr_p2 * 1)
+            fftpulse[:nr_p2 // 2] *= taywin[nr_p2 // 2:]
+            fftpulse[nr_p2 // 2:] *= taywin[:nr_p2 // 2]
+            rc_pulse = db(np.fft.ifft(fftpulse * fftpulse.conj().T, nr_p2 * 8))
             plt.plot(np.arange(-len(rc_pulse) // 2, len(rc_pulse) // 2)[1:], np.fft.fftshift(rc_pulse)[1:])
             plt.title(f'Ant. {ant}')
         plt.ylabel('dB')
@@ -218,8 +250,10 @@ if plot_profiler:
             plt.subplot(1, env.n_tx, ant + 1)
             pulse = genPulse(np.linspace(0, 1, len(end_log[5][:, 0])), end_log[5][:, ant],
                              env.nr, env.nr / env.fs, env.fc[ant], env.bw[ant])
-            fftpulse = np.fft.fft(pulse, findPowerOf2(nr) * 1)
-            rc_pulse = db(np.fft.ifft(fftpulse * (fftpulse * taylor(findPowerOf2(nr))).conj().T, findPowerOf2(nr) * 8))
+            fftpulse = np.fft.fft(pulse, nr_p2 * 1)
+            # fftpulse[:nr_p2 // 2] *= taywin[nr_p2 // 2:]
+            # fftpulse[nr_p2 // 2:] *= taywin[:nr_p2 // 2]
+            rc_pulse = db(np.fft.ifft(fftpulse * fftpulse.conj().T, nr_p2 * 8))
             plt.plot(np.arange(-len(rc_pulse) // 2, len(rc_pulse) // 2)[1:], np.fft.fftshift(rc_pulse)[1:])
             back_noise[len(back_noise) // 2:len(back_noise) // 2 + nr] += pulse
             plt.title(f'Ant. {ant}')
@@ -329,20 +363,22 @@ if plot_profiler:
         camera.snap()
     animation = camera.animate(interval=250)
 
-    wave_fig, wave_ax = plt.subplots(2)
+    wave_fig, wave_ax = plt.subplots(3)
     wavecam = Camera(wave_fig)
-    wave_ax[0].set_ylim([-30, 1])
-    freqs = np.fft.fftshift(np.fft.fftfreq(env.fft_len, 1 / env.fs))
-    for l in logs:
+    # wave_ax[0].set_ylim([-30, 1])
+    # wave_ax[0].set_ylim([-1, 1])
+    freqs = np.fft.fftshift(np.fft.fftfreq(env.fft_len * 4, 1 / env.fs))
+    for idx, l in enumerate(logs):
+        cov_mat = np.zeros((env.nr, env.n_tx), dtype=np.complex128)
         for ant in range(env.n_tx):
-            spect = np.fft.fftshift(db(
-                np.fft.fft(
-                    genPulse(np.linspace(0, 1, len(l[5][:, ant])), l[5][:, ant], env.nr, env.nr / env.fs,
-                             env.fc[ant], env.bw[ant]),
-                    env.fft_len)))
-            spect = spect - spect.max()
-            wave_ax[0].plot(freqs, spect, c=cols[ant])
+            gen_pulse = genPulse(np.linspace(0, 1, len(l[5][:, ant])), l[5][:, ant], env.nr, env.nr / env.fs,
+                                 env.fc[ant], env.bw[ant])
+            plt_spect = np.fft.fftshift(db(np.fft.fft(gen_pulse, env.fft_len * 4)))
+            plt_spect = plt_spect - plt_spect.max()
+            cov_mat[:, ant] = gen_pulse
             wave_ax[1].plot(l[5][:, ant], c=cols[ant])
+            wave_ax[2].plot(freqs, plt_spect, c=cols[ant])
+        wave_ax[0].imshow(abs(np.corrcoef(cov_mat.T)))
         wavecam.snap()
     wave_animation = wavecam.animate(interval=250)
 
@@ -352,11 +388,16 @@ if plot_profiler:
     for x in range(env.n_tx):
         pulse = genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, x],
                          env.nr, env.nr / env.fs, env.fc[x], env.bw[x])
-        window_pulse = np.fft.ifft(np.fft.fft(pulse, findPowerOf2(nr)) * taylor(findPowerOf2(nr)))
+        taywin = taylor(nr_p2)
+        window_pulse = np.fft.fft(pulse, nr_p2)
+        # window_pulse[:nr_p2 // 2] *= taywin[nr_p2 // 2:]
+        # window_pulse[nr_p2 // 2:] *= taywin[:nr_p2 // 2]
+        window_pulse = np.fft.ifft(window_pulse)
         for y in range(env.n_tx):
-            ambigs.append(ambiguity(genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, y],
-                                             env.nr, env.nr / env.fs, env.fc[y], env.bw[y]),
-                                    window_pulse, prf_plot, 150, mag=True, normalize=False)[0])
+            gpp = genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), logs[log_num][5][:, y],
+                           env.nr, env.nr / env.fs, env.fc[y], env.bw[y])
+            gpp = np.fft.ifft(np.fft.fft(gpp, len(window_pulse)))
+            ambigs.append(db(wide_band(gpp, window_pulse)[0]))
     cmin = min([np.min(amb) for amb in ambigs])
     cmax = max([np.max(amb) for amb in ambigs])
     for x in range(env.n_tx):
@@ -375,7 +416,7 @@ if plot_profiler:
     for sc_part in range(wave_scores.shape[1], 0, -1):
         plt.plot(times, np.sum(wave_scores[:, :sc_part], axis=1))
         plt.fill_between(times, np.sum(wave_scores[:, :sc_part], axis=1))
-    plt.legend(['Detection', 'Detected', 'Ambiguity', 'Diversity'])
+    plt.legend(['Diversity', 'Detection', 'Detected', 'Ambiguity'])  # Reverse order from the logs
 
     # Ocean waves, for pretty picture and debugging
     if ocean_debug:
@@ -432,3 +473,19 @@ if plot_profiler:
 
     if save_agent:
         wave_agent.save('./wave_agent')
+
+'''
+pulse = genPulse(np.linspace(0, 1, len(logs[log_num][5][:, 0])), np.linspace(0, 1, len(logs[log_num][5][:, 0])),
+                         env.nr, env.nr / env.fs, env.fc[0], env.bw[0])
+window_pulse[:nr_p2 // 2] *= taywin[nr_p2 // 2:]
+window_pulse[nr_p2 // 2:] *= taywin[:nr_p2 // 2]
+window_pulse = np.fft.ifft(window_pulse)[:env.nr]
+
+ambs, lags, freqs = narrow_band(pulse, window_pulse, lag=np.arange(1, env.nr // 2))
+xx, yy = np.meshgrid(np.arange(ambs.shape[1]), np.arange(ambs.shape[0]))
+
+plt.figure()
+ax = plt.subplot(111, projection='3d')
+ax.plot_surface(xx, yy, db(ambs), rstride=15, cstride=15)
+plt.show()
+'''
