@@ -42,16 +42,16 @@ def sliding_window(data, win_size, func=None):
     return thresh
 
 
-games = 1
+games = 50
 eval_games = 1
-max_timesteps = 64
+max_timesteps = 128
 batch_sz = 32
 ocean_debug = False
-feedback = False
+feedback = True
 gen_data = False
 save_logs = True
 load_agent = False
-save_agent = False
+save_agent = True
 plot_profiler = True
 
 # Parameters for the environment (and therefore the agents)
