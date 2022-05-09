@@ -1,0 +1,256 @@
+import numpy as np
+from osgeo import gdal
+from scipy.interpolate import RectBivariateSpline
+import open3d as o3d
+
+WGS_A = 6378137.0
+WGS_F = 1 / 298.257223563
+WGS_B = 6356752.314245179
+WGS_E2 = 6.69437999014e-3
+
+
+def getDTEDName(lat, lon):
+    """Return the path and name of the dted to load for the given lat/lon"""
+    tmplat = int(np.floor(lat))
+    tmplon = int(np.floor(lon))
+    direw = 'w' if tmplon < 0 else 'e'
+    dirns = 's' if tmplat < 0 else 'n'
+    return '/data5/dted/%s%03d/%s%02d.dt2' % (direw, abs(tmplon), dirns, abs(tmplat))
+
+
+def undulationEGM96(lat, lon):
+    with open("/data5/dted/EGM96.DAT", "rb") as f:
+        emg96 = np.fromfile(f, 'double', 1441 * 721, '')
+        eg_n = np.ceil(lat / .25) * .25
+        eg_s = np.floor(lat / .25) * .25
+        eg_e = np.ceil(lon / .25) * .25
+        eg_w = np.floor(lon / .25) * .25
+        eg1 = emg96[((eg_w + 180 + .25) / .25).astype(int) - 1 + 1441 * ((eg_n + 90 + .25) / .25 - 1).astype(int)]
+        eg2 = emg96[((eg_w + 180 + .25) / .25).astype(int) - 1 + 1441 * ((eg_s + 90 + .25) / .25 - 1).astype(int)]
+        eg3 = emg96[((eg_e + 180 + .25) / .25).astype(int) - 1 + 1441 * ((eg_n + 90 + .25) / .25 - 1).astype(int)]
+        eg4 = emg96[((eg_e + 180 + .25) / .25).astype(int) - 1 + 1441 * ((eg_s + 90 + .25) / .25 - 1).astype(int)]
+        egc = (eg2 / ((eg_e - eg_w) * (eg_n - eg_s))) * (eg_e - lon) * (eg_n - lat) + \
+              (eg4 / ((eg_e - eg_w) * (eg_n - eg_s))) * (lon - eg_w) * (eg_n - lat) + \
+              (eg1 / ((eg_e - eg_w) * (eg_n - eg_s))) * (eg_e - lon) * (lat - eg_s) + \
+              (eg3 / ((eg_e - eg_w) * (eg_n - eg_s))) * (lon - eg_w) * (lat - eg_s)
+    return egc
+
+
+def getElevationMap(lats, lons):
+    """Returns the digital elevation for a latitude and longitude"""
+    dtedName = getDTEDName(lats[0], lons[0])
+
+    # open DTED file for reading
+    ds = gdal.Open(dtedName)
+
+    # grab geo transform with resolutions
+    gt = ds.GetGeoTransform()
+    x_res = gt[1]
+    y_res = gt[-1]
+
+    # Find the maximum and minimum lat/lon
+    maxLat = lats.max()
+    minLat = lats.min()
+    maxLon = lons.max()
+    minLon = lons.min()
+
+    # If it's too small for the interpolation, increase grid size
+    while abs((maxLat - minLat) / x_res) < 3:
+        maxLat += x_res / 2
+        minLat -= x_res / 2
+    while abs((maxLon - minLon) / y_res) < 3:
+        if y_res < 0:
+            maxLon -= y_res / 2
+            minLon += y_res / 2
+        else:
+            maxLon += y_res / 2
+            minLon -= y_res / 2
+
+    # Resample the DTED so it's only 15 m/degree instead of the usual 30
+    options = gdal.WarpOptions(xRes=x_res, yRes=y_res, polynomialOrder=1,
+                               outputBounds=[minLon, minLat, maxLon, maxLat])
+
+    # Save out the new, cropped, resampled DTED (find a way to do this in memory)
+    newfile = gdal.Warp('./workingfile', ds, options=options)
+    band = newfile.GetRasterBand(1)
+
+    # Read out the data as a 2D array
+    dtedData = band.ReadAsArray().T
+    lat_rev = np.linspace(minLat, maxLat, dtedData.shape[0])
+    lon_rev = np.linspace(minLon, maxLon, dtedData.shape[1])
+
+    # Interpolate to a spline function so we can sample it anywhere
+    elev_func = RectBivariateSpline(lat_rev, lon_rev, dtedData, kx=2, ky=2)
+
+    return elev_func(lats, lons, grid=False) + undulationEGM96(lats, lons)
+
+
+def getElevation(pt):
+    lat = pt[0]
+    lon = pt[1]
+    """Returns the digital elevation for a latitude and longitude"""
+    dtedName = getDTEDName(lat, lon)
+    gdal.UseExceptions()
+    # open DTED file for reading
+    ds = gdal.Open(dtedName)
+
+    # get the geo transform info for the dted
+    # ulx is upper left corner longitude
+    # xres is the resolution in the x-direction (in degrees/sample)
+    # xskew is useless (0.0)
+    # uly is the upper left corner latitude
+    # yskew is useless (0.0)
+    # yres is the resolution in the y-direction (in degrees/sample)
+    ulx, xres, xskew, uly, yskew, yres = ds.GetGeoTransform()
+    # pre-compute 1/elevation_grid_spacing
+    elevSpacInv = 1.0 / abs(xres * yres)
+    # calculate the x and y indices into the DTED data for the lat/lon
+    px = int(np.round((lon - ulx) / xres))
+    py = int(np.round((lat - uly) / yres))
+
+    # only if these x and y indices are within the bounds of the DTED, get the
+    # raster band and try to read in the DTED values
+    elevation = -1e20
+    if (0 <= px < ds.RasterXSize) and (0 <= py < ds.RasterYSize):
+        rasterBand = ds.GetRasterBand(1)
+        dtedData = rasterBand.ReadAsArray(px, py, 2, 2)
+
+        # use bilinear interpolation to get the elevation for the lat/lon
+        leftLon = px * xres + ulx
+        upLat = py * yres + uly
+
+        # pre compute the differences for the bilinear interpolation
+        rightLonDiff = (leftLon + xres) - lon
+        upLatDiff = upLat - lat
+        # lowLatDiff = lat - lowLat
+        leftLonDiff = lon - leftLon
+        lowLatDiff = lat - (upLat + yres)
+        # upLatDiff = (lowLat + yres) - lat
+
+        elevation = elevSpacInv * (dtedData[0, 0] * rightLonDiff * lowLatDiff
+                                   + dtedData[0, 1] * leftLonDiff * lowLatDiff
+                                   + dtedData[1, 0] * rightLonDiff * upLatDiff
+                                   + dtedData[1, 1] * leftLonDiff * upLatDiff)
+
+    return elevation + undulationEGM96(lat, lon)
+
+
+def llh2enu(lat, lon, h, refllh):
+    ecef = llh2ecef(lat, lon, h)
+    return ecef2enu(*ecef, refllh)
+
+
+def enu2llh(e, n, u, refllh):
+    ecef = enu2ecef(e, n, u, refllh)
+    return ecef2llh(*ecef)
+
+
+def llh2ecef(lat, lon, h):
+    """
+    Compute the Geocentric (Cartesian) Coordinates X, Y, Z
+    given the Geodetic Coordinates lat, lon + Ellipsoid Height h
+    """
+    lat_rad = lat * np.pi / 180
+    lon_rad = lon * np.pi / 180
+    N = WGS_A / np.sqrt(1 - WGS_E2 * np.sin(lat_rad) ** 2)
+    X = (N + h) * np.cos(lat_rad) * np.cos(lon_rad)
+    Y = (N + h) * np.cos(lat_rad) * np.sin(lon_rad)
+    Z = (WGS_B ** 2 / WGS_A ** 2 * N + h) * np.sin(lat_rad)
+    return X, Y, Z
+
+
+def ecef2llh(x, y, z):
+    # This is the Heikkinen application of the Ferrari solution to Bowring's irrational
+    # geodetic-latitude equation to get a geodetic latitude and height.
+    # Longitude remains the same between the two.
+    r = np.sqrt(x ** 2 + y ** 2)
+    ep2 = (WGS_A ** 2 - WGS_B ** 2) / WGS_B ** 2
+    F = 54 * WGS_B ** 2 * z ** 2
+    G = r ** 2 + (1 - WGS_E2) * z ** 2 - WGS_E2 * (WGS_A ** 2 - WGS_B ** 2)
+    c = WGS_E2 ** 2 * F * r ** 2 / G ** 3
+    s = (1 + c + np.sqrt(c ** 2 + 2 * c)) ** (1 / 3)
+    P = F / (3 * (s + 1 / s + 1) ** 2 * G ** 2)
+    Q = np.sqrt(1 + 2 * WGS_E2 ** 2 * P)
+    r0 = -P * WGS_E2 * r / (1 + Q) + np.sqrt(
+        1 / 2 * WGS_A ** 2 * (1 + 1 / Q) - P * (1 - WGS_E2) * z ** 2 / (Q * (1 + Q)) - 1 / 2 * P * r ** 2)
+    U = np.sqrt((r - WGS_E2 * r0) ** 2 + z ** 2)
+    V = np.sqrt((r - WGS_E2 * r0) ** 2 + (1 - WGS_E2) * z ** 2)
+    z0 = WGS_B ** 2 * z / (WGS_A * V)
+    h = U * (1 - WGS_B ** 2 / (WGS_A * V))
+    lat = np.arctan((z + ep2 * z0) / r) * 180 / np.pi
+    lon = np.arctan2(y, x) * 180 / np.pi
+    return lat, lon, h
+
+
+def ecef2enu(x, y, z, refllh):
+    latr = refllh[0] * np.pi / 180
+    lonr = refllh[1] * np.pi / 180
+    rx, ry, rz = llh2ecef(*refllh)
+    rot = np.array([[-np.sin(lonr), np.cos(lonr), 0],
+                    [-np.sin(latr) * np.cos(lonr), -np.sin(latr) * np.sin(lonr), np.cos(latr)],
+                    [np.cos(latr) * np.cos(lonr), np.cos(latr) * np.sin(lonr), np.sin(latr)]])
+    enu = rot.dot(np.array([x - rx, y - ry, z - rz]))
+    return enu[0], enu[1], enu[2]
+
+
+def getLivingRoom(voxel_downsample=.05):
+    pcd = o3d.io.read_point_cloud("./livingroom.ply")
+
+    # Stupid thing has walls, need to crop them out
+    cube_ext = 3
+    cube_hght = 2.5
+    cube_hght_below = .1
+    cube_points = np.array([
+        # Vertices Polygon1
+        [(cube_ext / 2), cube_hght, (cube_ext / 2)],  # face-topright
+        [-(cube_ext / 2), cube_hght, (cube_ext / 2)],  # face-topleft
+        [-(cube_ext / 2), cube_hght, -(cube_ext / 2)],  # rear-topleft
+        [(cube_ext / 2), cube_hght, -(cube_ext / 2)],  # rear-topright
+        # Vertices Polygon 2
+        [(cube_ext / 2), cube_hght_below, (cube_ext / 2)],
+        [-(cube_ext / 2), cube_hght_below, (cube_ext / 2)],
+        [-(cube_ext / 2), cube_hght_below, -(cube_ext / 2)],
+        [-(cube_ext / 2), cube_hght_below, -(cube_ext / 2)],
+    ]).astype("float64")
+    v3dv = o3d.utility.Vector3dVector(cube_points)
+    oriented_bounding_box = o3d.geometry.AxisAlignedBoundingBox.create_from_points(v3dv)
+    pcd = pcd.crop(oriented_bounding_box)
+
+    # This is not needed after the walls are removed
+    pcd = pcd.voxel_down_sample(voxel_size=voxel_downsample)
+    return pcd
+
+
+def getMapLocation(p1, p2, init_llh, npts_background=500, resample=True):
+    lats = np.linspace(p2[0], p1[0], npts_background)
+    lons = np.linspace(p2[1], p1[1], npts_background)
+    lt, ln = np.meshgrid(lats, lons)
+    ltp = lt.flatten()
+    lnp = ln.flatten()
+    e, n, u = llh2enu(ltp, lnp, getElevationMap(ltp, lnp), init_llh)
+    if resample:
+        nlat, nlon, nh = resampleGrid(u.reshape(lt.shape), lats, np.flip(lons), int(len(u) * .8))
+        e, n, u = llh2enu(nlat, nlon, nh + init_llh[2], init_llh)
+    else:
+        n = np.fliplr(n.reshape(lt.shape)).flatten()
+    point_cloud = np.array([e, n, u]).T
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(point_cloud)
+    return pcd
+
+
+def resampleGrid(grid, x, y, npts):
+    gxx, gyy = np.gradient(grid / grid.max())
+    gx = RectBivariateSpline(np.arange(len(x)), np.arange(len(y)), gxx)
+    gy = RectBivariateSpline(np.arange(len(x)), np.arange(len(y)), gyy)
+    ptx = np.random.uniform(0, len(x) - 1, npts)
+    pty = np.random.uniform(0, len(y) - 1, npts)
+    for _ in range(4):
+        dx = gx(ptx, pty, grid=False)
+        dy = gy(ptx, pty, grid=False)
+        ptx += dx
+        pty += dy
+        ptx[ptx > len(x) - 1] = np.random.uniform(0, len(x) - 1, sum(ptx > len(x) - 1))
+        pty[pty > len(y) - 1] = np.random.uniform(0, len(y) - 1, sum(pty > len(y) - 1))
+    finalgrid = RectBivariateSpline(np.arange(len(x)), np.arange(len(y)), grid)
+    return np.interp(ptx, np.arange(len(x)), x), np.interp(pty, np.arange(len(y)), y), finalgrid(ptx, pty, grid=False)
