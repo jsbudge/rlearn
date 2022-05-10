@@ -1,6 +1,7 @@
 import numpy as np
 from osgeo import gdal
 from scipy.interpolate import RectBivariateSpline
+from scipy.spatial.transform import Rotation as rot
 import open3d as o3d
 
 WGS_A = 6378137.0
@@ -221,9 +222,10 @@ def getLivingRoom(voxel_downsample=.05):
     return pcd
 
 
-def getMapLocation(p1, p2, init_llh, npts_background=500, resample=True):
-    lats = np.linspace(p2[0], p1[0], npts_background)
-    lons = np.linspace(p2[1], p1[1], npts_background)
+def getMapLocation(p1, extent, init_llh, npts_background=500, resample=True):
+    pt_enu = llh2enu(*p1, init_llh)
+    lats = np.linspace(p1[0] - extent[0] / 2 / 111111, p1[0] + extent[0] / 2 / 111111, npts_background)
+    lons = np.linspace(p1[1] - extent[1] / 2 / 111111, p1[1] + extent[1] / 2 / 111111, npts_background)
     lt, ln = np.meshgrid(lats, lons)
     ltp = lt.flatten()
     lnp = ln.flatten()
@@ -236,6 +238,7 @@ def getMapLocation(p1, p2, init_llh, npts_background=500, resample=True):
     point_cloud = np.array([e, n, u]).T
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(point_cloud)
+    pcd = pcd.translate(pt_enu)
     return pcd
 
 
@@ -254,3 +257,37 @@ def resampleGrid(grid, x, y, npts):
         pty[pty > len(y) - 1] = np.random.uniform(0, len(y) - 1, sum(pty > len(y) - 1))
     finalgrid = RectBivariateSpline(np.arange(len(x)), np.arange(len(y)), grid)
     return np.interp(ptx, np.arange(len(x)), x), np.interp(pty, np.arange(len(y)), y), finalgrid(ptx, pty, grid=False)
+
+
+def createMeshFromPoints(pcd):
+    distances = pcd.compute_nearest_neighbor_distance()
+    avg_dist = np.mean(distances)
+    radius = 3 * avg_dist
+    radii = [radius, radius * 2]
+    pcd.estimate_normals()
+    try:
+        pcd.orient_normals_consistent_tangent_plane(100)
+    except RuntimeError:
+        pass
+
+    rec_mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+        pcd, o3d.utility.DoubleVector(radii))
+
+    rec_mesh.remove_duplicated_vertices()
+    rec_mesh.remove_duplicated_triangles()
+    rec_mesh.remove_degenerate_triangles()
+    rec_mesh.remove_unreferenced_vertices()
+    return rec_mesh
+
+
+def genPulse(phase_x, phase_y, nnr, t0, nfc, bandw):
+    phase = nfc - bandw // 2 + bandw * np.interp(np.linspace(0, 1, nnr), phase_x, phase_y)
+    return np.exp(1j * 2 * np.pi * np.cumsum(phase * t0 / nnr))
+
+
+def rotate(az, nel, rot_mat):
+    return rot.from_euler('zxy', [-az, 0, 0]).apply(rot.from_euler('zxy', [0, nel - np.pi / 2, 0]).apply(rot_mat))
+
+
+def azelToVec(az, el):
+    return np.array([np.sin(az) * np.sin(el), np.cos(az) * np.sin(el), np.cos(el)])
