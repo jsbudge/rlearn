@@ -324,9 +324,9 @@ def genRangeProfileFromMesh(ret_xyz, bounce_xyz, receive_xyz, return_pow, is_blo
             
             
 @cuda.jit
-def genRangeWithoutIntersection(rng_states, tri_vert_indices, vert_xyz, vert_norms, vert_reflectivity,
-                                source_xyz, receive_xyz, panrx, elrx, pantx, eltx, pd_r, pd_i, 
-                                wavelength, near_range_s, source_fs, bw_az, bw_el, pts_per_tri):
+def genRangeWithoutIntersection(rng_states, tri_vert_indices, vert_xyz, vert_norms, vert_scattering, vert_reflectivity,
+                                source_xyz, receive_xyz, panrx, elrx, pantx, eltx, pd_r, pd_i, calc_pts, calc_angs,
+                                wavelength, near_range_s, source_fs, bw_az, bw_el, pts_per_tri, debug_flag):
     # sourcery no-metrics
     tri, tt = cuda.grid(ndim=2)
     
@@ -360,6 +360,12 @@ def genRangeWithoutIntersection(rng_states, tri_vert_indices, vert_xyz, vert_nor
             ty = bar_y - source_xyz[1, tt]
             tz = bar_z - source_xyz[2, tt]
             rng = math.sqrt(tx * tx + ty * ty + tz * tz)
+            if debug_flag and tt == 0:
+                calc_pts[tri, 0] = tx
+                calc_pts[tri, 1] = ty
+                calc_pts[tri, 2] = tz
+                calc_angs[tri, 0] = math.acos(tz / rng)
+                calc_angs[tri, 1] = math.atan2(tx, ty)
 
             # Calculate out the bounce angles
             rnorm = norm_x * tx / rng + norm_y * ty / rng + norm_z * tz / rng
@@ -368,7 +374,8 @@ def genRangeWithoutIntersection(rng_states, tri_vert_indices, vert_xyz, vert_nor
             b_z = -(2 * rnorm * norm_z - tz / rng)
 
             # Calc power multiplier based on range, reflectivity
-            P = vert_reflectivity[tv1] * u + vert_reflectivity[tv2] * v + vert_reflectivity[tv3] * w
+            scat_ref = vert_reflectivity[tv1] * u + vert_reflectivity[tv2] * v + vert_reflectivity[tv3] * w
+            scat_pow = vert_scattering[tv1] * u + vert_scattering[tv2] * v + vert_scattering[tv3] * w
 
             rx = tx - receive_xyz[0, tt]
             ry = ty - receive_xyz[1, tt]
@@ -382,11 +389,11 @@ def genRangeWithoutIntersection(rng_states, tri_vert_indices, vert_xyz, vert_nor
             if n_samples > but > 0:
                 a = b_x * rx / r_rng + b_y * ry / r_rng + \
                     b_z * rz / r_rng
-                sigma = .04 * P
-                reflectivity = math.exp(-math.pow((a * a / (2 * sigma)), P))
+                sigma = .04 * scat_ref
+                reflectivity = math.exp(-math.pow((a * a / (2 * sigma)), scat_ref))
                 att = applyRadiationPattern(r_el, r_az, panrx[tt], elrx[tt], pantx[tt], eltx[tt], bw_az, bw_el) * \
                       1 / (two_way_rng * two_way_rng) * reflectivity
-                acc_val = att * cmath.exp(-1j * wavenumber * two_way_rng) * 1e1
+                acc_val = att * cmath.exp(-1j * wavenumber * two_way_rng) * 1e1 * scat_pow
                 cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
                 cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 

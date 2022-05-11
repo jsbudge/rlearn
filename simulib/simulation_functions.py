@@ -46,44 +46,28 @@ def getElevationMap(lats, lons):
 
     # grab geo transform with resolutions
     gt = ds.GetGeoTransform()
-    x_res = gt[1]
-    y_res = gt[-1]
 
-    # Find the maximum and minimum lat/lon
-    maxLat = lats.max()
-    minLat = lats.min()
-    maxLon = lons.max()
-    minLon = lons.min()
+    # read in raster data
+    raster = ds.GetRasterBand(1).ReadAsArray()
 
-    # If it's too small for the interpolation, increase grid size
-    while abs((maxLat - minLat) / x_res) < 3:
-        maxLat += x_res / 2
-        minLat -= x_res / 2
-    while abs((maxLon - minLon) / y_res) < 3:
-        if y_res < 0:
-            maxLon -= y_res / 2
-            minLon += y_res / 2
-        else:
-            maxLon += y_res / 2
-            minLon -= y_res / 2
+    # Get lats and lons as bins into raster
+    bin_lat = (lats - gt[3]) / gt[-1]
+    bin_lon = (lons - gt[0]) / gt[1]
 
-    # Resample the DTED so it's only 15 m/degree instead of the usual 30
-    options = gdal.WarpOptions(xRes=x_res, yRes=y_res, polynomialOrder=1,
-                               outputBounds=[minLon, minLat, maxLon, maxLat])
+    # Linear interpolation using bins
+    blatmin = bin_lat.astype(int)
+    lowLatDiff = bin_lat - blatmin
+    blatmax = (bin_lat + 1).astype(int)
+    upLatDiff = blatmax - bin_lat
+    blonmin = bin_lon.astype(int)
+    leftLonDiff = bin_lon - blonmin
+    blonmax = (bin_lon + 1).astype(int)
+    rightLonDiff = blonmax - bin_lon
 
-    # Save out the new, cropped, resampled DTED (find a way to do this in memory)
-    newfile = gdal.Warp('./workingfile', ds, options=options)
-    band = newfile.GetRasterBand(1)
-
-    # Read out the data as a 2D array
-    dtedData = band.ReadAsArray().T
-    lat_rev = np.linspace(minLat, maxLat, dtedData.shape[0])
-    lon_rev = np.linspace(minLon, maxLon, dtedData.shape[1])
-
-    # Interpolate to a spline function so we can sample it anywhere
-    elev_func = RectBivariateSpline(lat_rev, lon_rev, dtedData, kx=2, ky=2)
-
-    return elev_func(lats, lons, grid=False) + undulationEGM96(lats, lons)
+    return (raster[blatmin, blonmin] * rightLonDiff * lowLatDiff
+            + raster[blatmin, blonmax] * leftLonDiff * lowLatDiff
+            + raster[blatmax, blonmin] * rightLonDiff * upLatDiff
+            + raster[blatmax, blonmax] * leftLonDiff * upLatDiff)
 
 
 def getElevation(pt):
@@ -231,10 +215,8 @@ def getMapLocation(p1, extent, init_llh, npts_background=500, resample=True):
     lnp = ln.flatten()
     e, n, u = llh2enu(ltp, lnp, getElevationMap(ltp, lnp), init_llh)
     if resample:
-        nlat, nlon, nh = resampleGrid(u.reshape(lt.shape), lats, np.flip(lons), int(len(u) * .8))
+        nlat, nlon, nh = resampleGrid(u.reshape(lt.shape), lats, lons, int(len(u) * .8))
         e, n, u = llh2enu(nlat, nlon, nh + init_llh[2], init_llh)
-    else:
-        n = np.fliplr(n.reshape(lt.shape)).flatten()
     point_cloud = np.array([e, n, u]).T
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(point_cloud)
@@ -248,9 +230,9 @@ def resampleGrid(grid, x, y, npts):
     gy = RectBivariateSpline(np.arange(len(x)), np.arange(len(y)), gyy)
     ptx = np.random.uniform(0, len(x) - 1, npts)
     pty = np.random.uniform(0, len(y) - 1, npts)
-    for _ in range(4):
-        dx = gx(ptx, pty, grid=False)
-        dy = gy(ptx, pty, grid=False)
+    for n in range(4):
+        dx = gx(ptx, pty, grid=False) * 1e3 / (n + 1)
+        dy = gy(ptx, pty, grid=False) * 1e3 / (n + 1)
         ptx += dx
         pty += dy
         ptx[ptx > len(x) - 1] = np.random.uniform(0, len(x) - 1, sum(ptx > len(x) - 1))
@@ -260,8 +242,14 @@ def resampleGrid(grid, x, y, npts):
 
 
 def createMeshFromPoints(pcd):
-    distances = pcd.compute_nearest_neighbor_distance()
-    avg_dist = np.mean(distances)
+    pcd = pcd.voxel_down_sample(voxel_size=np.mean(pcd.compute_nearest_neighbor_distance()) / 1.5)
+    its = 0
+    while np.std(pcd.compute_nearest_neighbor_distance()) > 2. and its < 30:
+        dists = pcd.compute_nearest_neighbor_distance()
+        pcd = pcd.voxel_down_sample(voxel_size=np.mean(dists) / 1.5)
+        its += 1
+
+    avg_dist = np.mean(pcd.compute_nearest_neighbor_distance())
     radius = 3 * avg_dist
     radii = [radius, radius * 2]
     pcd.estimate_normals()
@@ -272,6 +260,7 @@ def createMeshFromPoints(pcd):
 
     rec_mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
         pcd, o3d.utility.DoubleVector(radii))
+    # rec_mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
 
     rec_mesh.remove_duplicated_vertices()
     rec_mesh.remove_duplicated_triangles()
