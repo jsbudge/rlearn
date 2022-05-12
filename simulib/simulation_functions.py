@@ -19,6 +19,16 @@ def getDTEDName(lat, lon):
     return '/data5/dted/%s%03d/%s%02d.dt2' % (direw, abs(tmplon), dirns, abs(tmplat))
 
 
+def db(x):
+    ret = abs(x)
+    ret[ret < 1e-15] = 1e-15
+    return 20 * np.log10(ret)
+
+
+def findPowerOf2(x):
+    return int(2 ** (np.ceil(np.log2(x))))
+
+
 def undulationEGM96(lat, lon):
     with open("/data5/dted/EGM96.DAT", "rb") as f:
         emg96 = np.fromfile(f, 'double', 1441 * 721, '')
@@ -275,7 +285,7 @@ def genPulse(phase_x, phase_y, nnr, t0, nfc, bandw):
 
 
 def rotate(az, nel, rot_mat):
-    return rot.from_euler('zxy', [-az, 0, 0]).apply(rot.from_euler('zxy', [0, nel - np.pi / 2, 0]).apply(rot_mat))
+    return rot.from_euler('xz', [nel - np.pi / 2, -az]).apply(rot_mat)
 
 
 def azelToVec(az, el):

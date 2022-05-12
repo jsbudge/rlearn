@@ -392,8 +392,8 @@ def genRangeWithoutIntersection(rng_states, tri_vert_indices, vert_xyz, vert_nor
                 sigma = .04 * scat_ref
                 reflectivity = math.exp(-math.pow((a * a / (2 * sigma)), scat_ref))
                 att = applyRadiationPattern(r_el, r_az, panrx[tt], elrx[tt], pantx[tt], eltx[tt], bw_az, bw_el) * \
-                      1 / (two_way_rng * two_way_rng) * reflectivity
-                acc_val = att * cmath.exp(-1j * wavenumber * two_way_rng) * 1e1 * scat_pow
+                      1 / (two_way_rng * two_way_rng) * reflectivity * 1e2
+                acc_val = att * cmath.exp(-1j * wavenumber * two_way_rng) * scat_pow
                 cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
                 cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
 
@@ -426,11 +426,10 @@ def ambiguity(s1, s2, prf, dopp_bins, mag=True, normalize=True):
         return A, fdopp, np.linspace(-dopp_bins / 2 * fs / c0, dopp_bins / 2 * fs / c0, dopp_bins)
 
 
-def db(x):
-    ret = abs(x)
-    ret[ret < 1e-15] = 1e-15
-    return 20 * np.log10(ret)
+def getMaxThreads():
+    gpuDevice = cuda.get_current_device()
+    maxThreads = gpuDevice.MAX_THREADS_PER_BLOCK // 3
+    sqrtMaxThreads = int(np.sqrt(maxThreads))
+    return (sqrtMaxThreads, sqrtMaxThreads)
 
 
-def findPowerOf2(x):
-    return int(2 ** (np.ceil(np.log2(x))))
