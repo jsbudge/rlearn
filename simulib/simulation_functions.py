@@ -279,9 +279,9 @@ def createMeshFromPoints(pcd):
     return rec_mesh
 
 
-def genPulse(phase_x, phase_y, nnr, t0, nfc, bandw):
+def genPulse(phase_x, phase_y, nnr, nfs, nfc, bandw):
     phase = nfc - bandw // 2 + bandw * np.interp(np.linspace(0, 1, nnr), phase_x, phase_y)
-    return np.exp(1j * 2 * np.pi * np.cumsum(phase * t0 / nnr))
+    return np.exp(1j * 2 * np.pi * np.cumsum(phase * 1 / nfs))
 
 
 def rotate(az, nel, rot_mat):
