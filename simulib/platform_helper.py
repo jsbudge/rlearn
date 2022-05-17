@@ -1,5 +1,7 @@
 import numpy as np
 from scipy.interpolate import CubicSpline
+from SDRParsing import SDRParse
+from simulation_functions import llh2enu
 
 c0 = 299792458.0
 TAC = 125e6
@@ -83,3 +85,15 @@ class RadarPlatform(Platform):
                     np.floor(2 * nrange / c0 * TAC)) * self.fs / TAC)
         MPP = c0 / self.fs / upsample / 2
         return nrange + np.arange(nsam * upsample) * MPP + c0 / self.fs
+
+
+class SDRPlatform(RadarPlatform):
+    _sdr = None
+
+    def __init__(self, sdr_file, origin, ant_offsets=None, fs=2e9):
+        sdr_data = SDRParse(sdr_file)
+        e, n, u = llh2enu(sdr_data.gps_data['lat'], sdr_data.gps_data['lon'], sdr_data.gps_data['alt'], origin)
+        super().__init__(e=e, n=n, u=u, r=sdr_data.gps_data['r'], p=sdr_data.gps_data['p'], y=sdr_data.gps_data['y'],
+                         t=sdr_data.gps_data.index.values, ant_offsets=ant_offsets, dep_angle=sdr.ant[0].dep_ang,
+                         squint_angle=sdr.ant[0].squint, az_bw=sdr.ant[0].az_bw, el_bw=sdr.ant[0].el_bw, fs=fs)
+        self._sdr = sdr_data
