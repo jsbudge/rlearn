@@ -25,7 +25,7 @@ pio.renderers.default = 'browser'
 
 c0 = 299792458.0
 TAC = 125e6
-fs = 500e6
+fs = 100e6
 DTR = np.pi / 180
 inch_to_m = .0254
 BYTES_PER_SAMPLE = 4
@@ -47,7 +47,7 @@ def azelToVec(az, el):
 
 # OPTIONS
 fc = 32e9
-bandwidth = 220e6
+bandwidth = 90e6
 PRF = 1500.0
 collect_dur = 2.
 cpi_len = 32
@@ -298,8 +298,9 @@ sliders_dict = {
 }
 check_back_sz = 0.
 print('Running data simulation...')
+photon_data = np.zeros((nsam * upsample, n_pulses), dtype=np.complex128)
 
-for ts in tqdm([tt[pos:pos + cpi_len] for pos in range(0, len(tt), cpi_len)]):
+for ts_idx, ts in tqdm(enumerate([tt[pos:pos + cpi_len] for pos in range(0, len(tt), cpi_len)])):
     if len(ts) < cpi_len:
         break
     if static_points:
@@ -371,6 +372,7 @@ for ts in tqdm([tt[pos:pos + cpi_len] for pos in range(0, len(tt), cpi_len)]):
     pt_pow = []
     pt_sz = []
     ang_block = 0
+    photon_data[:, ts_idx * cpi_len:(ts_idx+1) * cpi_len] = data[:, :, 0]
 
     Rhats = np.zeros((rx_array.shape[0], rx_array.shape[0], cpi_len), dtype=np.complex128)
     Rinvs = np.zeros((rx_array.shape[0], rx_array.shape[0], cpi_len), dtype=np.complex128)
