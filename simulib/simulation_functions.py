@@ -140,6 +140,22 @@ def enu2llh(e, n, u, refllh):
     return ecef2llh(*ecef)
 
 
+def enu2ecef(e, n, u, refllh):
+    latr = refllh[0] * np.pi / 180
+    lonr = refllh[1] * np.pi / 180
+    rx, ry, rz = llh2ecef(*refllh)
+    enu = np.array([e, n, u])
+    tmp_rot = np.array([[-np.sin(lonr), np.cos(lonr), 0],
+                    [-np.sin(latr) * np.cos(lonr), -np.sin(latr) * np.sin(lonr), np.cos(latr)],
+                    [np.cos(latr) * np.cos(lonr), np.cos(latr) * np.sin(lonr), np.sin(latr)]]).T
+    if len(enu.shape) > 1:
+        sz = np.ones((enu.shape[1],))
+        ecef = tmp_rot.dot(enu) + np.array([sz * rx, sz * ry, sz * rz])
+    else:
+        ecef = tmp_rot.dot(enu) + np.array([rx, ry, rz])
+    return ecef[0], ecef[1], ecef[2]
+
+
 def llh2ecef(lat, lon, h):
     """
     Compute the Geocentric (Cartesian) Coordinates X, Y, Z

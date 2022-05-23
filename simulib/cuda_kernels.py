@@ -343,8 +343,8 @@ def genRangeWithoutIntersection(rng_states, tri_vert_indices, vert_xyz, vert_nor
             u = xoroshiro128p_uniform_float64(rng_states, tri)
             v = xoroshiro128p_uniform_float64(rng_states, tri)
             if u + v > 1:
-                u = u / 2
-                v = v / 2
+                u /= 2
+                v /= 2
             w = 1 - (u + v)
             # Get barycentric coordinates for bounce points
             bar_x = vert_xyz[tv1, 0] * u + vert_xyz[tv2, 0] * v + vert_xyz[tv3, 0] * w
@@ -430,6 +430,6 @@ def getMaxThreads():
     gpuDevice = cuda.get_current_device()
     maxThreads = gpuDevice.MAX_THREADS_PER_BLOCK // 3
     sqrtMaxThreads = int(np.sqrt(maxThreads))
-    return (sqrtMaxThreads, sqrtMaxThreads)
+    return sqrtMaxThreads, sqrtMaxThreads
 
 
