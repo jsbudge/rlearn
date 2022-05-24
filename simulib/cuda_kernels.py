@@ -310,8 +310,10 @@ def genRangeProfileFromMesh(ret_xyz, bounce_xyz, receive_xyz, return_pow, is_blo
         rng_bin = (two_way_rng / c0 - 2 * near_range_s) * source_fs
         but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
         if n_samples > but > 0:
+            # Get bounce vector dot product
             a = bounce_xyz[pt_idx, tt, 0] * rx / r_rng + bounce_xyz[pt_idx, tt, 1] * ry / r_rng + \
                          bounce_xyz[pt_idx, tt, 2] * rz / r_rng
+            # Run scattering coefficient through scaling to simulate real-world scattering
             P = return_pow[pt_idx, tt]
             sigma = .04 * P
             reflectivity = math.exp(-math.pow((a * a / (2 * sigma)), P))

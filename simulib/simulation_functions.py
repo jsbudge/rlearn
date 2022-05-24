@@ -3,6 +3,10 @@ from osgeo import gdal
 from scipy.interpolate import RectBivariateSpline
 from scipy.spatial.transform import Rotation as rot
 import open3d as o3d
+import plotly.io as pio
+import plotly.graph_objects as go
+
+pio.renderers.default = 'browser'
 
 WGS_A = 6378137.0
 WGS_F = 1 / 298.257223563
@@ -146,8 +150,8 @@ def enu2ecef(e, n, u, refllh):
     rx, ry, rz = llh2ecef(*refllh)
     enu = np.array([e, n, u])
     tmp_rot = np.array([[-np.sin(lonr), np.cos(lonr), 0],
-                    [-np.sin(latr) * np.cos(lonr), -np.sin(latr) * np.sin(lonr), np.cos(latr)],
-                    [np.cos(latr) * np.cos(lonr), np.cos(latr) * np.sin(lonr), np.sin(latr)]]).T
+                        [-np.sin(latr) * np.cos(lonr), -np.sin(latr) * np.sin(lonr), np.cos(latr)],
+                        [np.cos(latr) * np.cos(lonr), np.cos(latr) * np.sin(lonr), np.sin(latr)]]).T
     if len(enu.shape) > 1:
         sz = np.ones((enu.shape[1],))
         ecef = tmp_rot.dot(enu) + np.array([sz * rx, sz * ry, sz * rz])
@@ -306,3 +310,49 @@ def rotate(az, nel, rot_mat):
 
 def azelToVec(az, el):
     return np.array([np.sin(az) * np.sin(el), np.cos(az) * np.sin(el), np.cos(el)])
+
+
+'''
+------------------------------------------------------------------------------------
+------------------- RENDERING AND PLOTTING FUNCTIONS -------------------------------
+------------------------------------------------------------------------------------
+'''
+
+
+class PlotWithSliders(object):
+
+    def __init__(self, bg=None, ntraces=1):
+        self._frames = []
+        if bg is None:
+            self._fig = go.Figure(go.Scatter3d(x=[], y=[], z=[], mode="markers", marker=dict(color="red", size=10)))
+            self._traces = [0]
+        else:
+            self._fig = go.Figure(data=[go.Scatter3d(x=bg[:, 0], y=bg[:, 1], z=bg[:, 2], mode="markers",
+                                                     marker=dict(color="red", size=10))] +
+                                       [go.Scatter3d(x=[], y=[], z=[], mode="markers",
+                                                     marker=dict(color="red", size=10)) for _ in range(ntraces)])
+            self._traces = list(range(1, ntraces + 1))
+
+    def addFrame(self, fdata, trace=None, args=None):
+        t = [trace] if trace is not None else [self._traces[0]]
+        frame_args = dict(data=[go.Scatter3d(x=fdata[:, 0], y=fdata[:, 1], z=fdata[:, 2], mode='lines+markers')],
+                                     traces=t, name=f'frame {len(self._frames) + 1}')
+        if args is not None:
+            for key, val in args.items():
+                frame_args[key] = val
+        self._frames.append(go.Frame(**frame_args))
+
+    def render(self):
+        args = {"frame": {"duration": 0}, "mode": "immediate", "fromcurrent": True,
+                "transition": {"duration": 0, "easing": "linear"}, }
+        slider = [{"pad": {"b": 1, "t": 1}, "len": 0.9, "x": 0.1, "y": 0,
+                   "steps": [{"args": [[f.name], args],
+                              "label": str(k), "method": "animate", } for k, f in enumerate(self._fig.frames)]}]
+
+        update_menus = [{"buttons": [{'args': [None, args], 'label': 'Play', 'method': 'animate'},
+                            {'args': [[None], args], 'label': 'Pause', 'method': 'animate'}],
+                         "direction": "left", "pad": {"r": 10, "t": 1}, "type": "buttons", "x": 0.1, "y": 0, }]
+        self._fig.update(frames=self._frames)
+        self._fig.update_layout(updatemenus=update_menus, sliders=slider)
+        self._fig.update_layout(sliders=slider)
+        self._fig.show()

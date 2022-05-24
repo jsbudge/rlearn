@@ -25,8 +25,8 @@ class Environment(object):
 
         if pts is not None:
             # Create the point cloud for the mesh basis
-            scats = scattering if scattering is None else np.ones((pts.shape[0],))
-            refs = reflectivity if reflectivity is None else np.ones((pts.shape[0],))
+            scats = scattering if scattering is not None else np.ones((pts.shape[0],))
+            refs = reflectivity if reflectivity is not None else np.ones((pts.shape[0],))
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(pts)
             pcd.colors = o3d.utility.Vector3dVector(np.array([refs, scats, np.zeros_like(scats)]).T)
@@ -119,19 +119,20 @@ class MapEnvironment(Environment):
 
 class SDREnvironment(Environment):
 
-    def __init__(self, sdr_file):
+    def __init__(self, sdr_file, num_vertices=400000):
         # Load in the SDR file
         sdr = SDRParse(sdr_file)
         asi = sdr.loadASI(sdr.files['asi'])
         self._sdr = sdr
         self._asi = asi
         ref_llh = (sdr.ash['geo']['centerY'], sdr.ash['geo']['centerX'], sdr.ash['geo']['hRef'])
+        self.origin = ref_llh
         cg_e, cg_n = np.meshgrid(np.arange(asi.shape[0]), np.arange(asi.shape[1]))
         cg_e = cg_e.flatten()
         cg_n = cg_n.flatten()
         asi_pts = abs(asi[cg_e, cg_n])
-        # Set this so that we only get ~400000 points in the mesh
-        dec_fac = int(asi.shape[0] * asi.shape[1] / 400000)
+        # Set this so that we only get ~num_vertices points in the mesh
+        dec_fac = int(asi.shape[0] * asi.shape[1] / num_vertices)
         cg_e = (cg_e[::dec_fac] - asi.shape[0] / 2) * sdr.ash['geo']['rowPixelSizeM']
         cg_n = (cg_n[::dec_fac] - asi.shape[1] / 2) * sdr.ash['geo']['colPixelSizeM']
         asi_pts = asi_pts[::dec_fac]
