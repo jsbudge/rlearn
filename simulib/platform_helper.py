@@ -16,6 +16,7 @@ class Platform(object):
     _heading = None
 
     def __init__(self, e=None, n=None, u=None, r=None, p=None, y=None, t=None):
+        self._gpst = t
         # Build the position spline
         ee = CubicSpline(t, e)
         nn = CubicSpline(t, n)
@@ -35,7 +36,7 @@ class Platform(object):
         self._att = lambda lam_t: np.array([rr(lam_t), pp(lam_t), yy(lam_t)])
 
         # heading check
-        self._heading = lambda lam_t: np.arctan2(self._pos(lam_t)[1], self._pos(lam_t)[0])
+        self._heading = lambda lam_t: np.arctan2(self._vel(lam_t)[0], self._vel(lam_t)[1])
 
     @property
     def pos(self):
@@ -48,6 +49,10 @@ class Platform(object):
     @property
     def att(self):
         return self._att
+
+    @property
+    def gpst(self):
+        return self._gpst
 
 
 class RadarPlatform(Platform):
@@ -64,14 +69,14 @@ class RadarPlatform(Platform):
         self.fs = fs
 
     def calcRanges(self, height):
-        nrange = height / np.sin(self._att(0)[0] + self.dep_ang + self.el_half_bw - np.pi / 2)
-        frange = height / np.sin(self._att(0)[0] + self.dep_ang - self.el_half_bw - np.pi / 2)
+        nrange = height / np.sin(self._att(self.gpst[0])[0] + self.dep_ang + self.el_half_bw - np.pi / 2)
+        frange = height / np.sin(self._att(self.gpst[0])[0] + self.dep_ang - self.el_half_bw - np.pi / 2)
         return nrange, frange
 
     def calcPulseLength(self, height, pulse_length_percent=1., use_tac=False):
         nrange, _ = self.calcRanges(height)
         plength_s = (nrange * 2 / c0 - 1 / TAC) * pulse_length_percent
-        return int(plength_s / self.fs) if use_tac else plength_s
+        return int(plength_s * self.fs) if use_tac else plength_s
 
     def calcNumSamples(self, height, plp=1.):
         nrange, frange = self.calcRanges(height)
@@ -91,9 +96,12 @@ class SDRPlatform(RadarPlatform):
     _sdr = None
 
     def __init__(self, sdr_file, origin, ant_offsets=None, fs=2e9):
-        sdr_data = SDRParse(sdr_file)
-        e, n, u = llh2enu(sdr_data.gps_data['lat'], sdr_data.gps_data['lon'], sdr_data.gps_data['alt'], origin)
-        super().__init__(e=e, n=n, u=u, r=sdr_data.gps_data['r'], p=sdr_data.gps_data['p'], y=sdr_data.gps_data['y'],
-                         t=sdr_data.gps_data.index.values, ant_offsets=ant_offsets, dep_angle=sdr.ant[0].dep_ang,
-                         squint_angle=sdr.ant[0].squint, az_bw=sdr.ant[0].az_bw, el_bw=sdr.ant[0].el_bw, fs=fs)
-        self._sdr = sdr_data
+        sdr = SDRParse(sdr_file)
+        e, n, u = llh2enu(sdr.gps_data['lat'], sdr.gps_data['lon'], sdr.gps_data['alt'], origin)
+        if ant_offsets is None:
+            ant_offsets = np.array([np.array([ant.x, ant.y, ant.z]) for ant in sdr.port])
+        super().__init__(e=e, n=n, u=u, r=sdr.gps_data['r'] + np.pi / 2, p=sdr.gps_data['p'], y=sdr.gps_data['y'],
+                         t=sdr.gps_data.index.values, ant_offsets=ant_offsets, dep_angle=sdr.ant[0].dep_ang / DTR,
+                         squint_angle=sdr.ant[0].squint / DTR, az_bw=sdr.ant[0].az_bw / DTR,
+                         el_bw=sdr.ant[0].el_bw / DTR, fs=fs)
+        self._sdr = sdr

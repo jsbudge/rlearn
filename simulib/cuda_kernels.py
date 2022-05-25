@@ -392,7 +392,7 @@ def genRangeWithoutIntersection(rng_states, tri_vert_indices, vert_xyz, vert_nor
                 a = b_x * rx / r_rng + b_y * ry / r_rng + \
                     b_z * rz / r_rng
                 sigma = .04 * scat_ref
-                reflectivity = math.exp(-math.pow((a * a / (2 * sigma)), scat_ref))
+                reflectivity = scat_ref * a # math.exp(-math.pow((a * a / (2 * sigma)), scat_ref))
                 att = applyRadiationPattern(r_el, r_az, panrx[tt], elrx[tt], pantx[tt], eltx[tt], bw_az, bw_el) * \
                       1 / (two_way_rng * two_way_rng) * reflectivity * 1e2
                 acc_val = att * cmath.exp(-1j * wavenumber * two_way_rng) * scat_pow
