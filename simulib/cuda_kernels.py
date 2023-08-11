@@ -1,7 +1,8 @@
 import cmath
 import math
 from numba import cuda, njit
-from numba.cuda.random import xoroshiro128p_uniform_float64
+from numba.cuda.random import xoroshiro128p_uniform_float32
+from simulation_functions import findPowerOf2
 import numpy as np
 
 c0 = 299792458.0
@@ -22,7 +23,20 @@ def cpudiff(x, y):
 
 
 @cuda.jit(device=True)
-def interp(x, y, tt, bg):
+def raisedCosine(x, bw, a0):
+    """
+    Raised Cosine windowing function.
+    :param x: float. Azimuth difference between point and beam center in radians.
+    :param bw: float. Signal bandwidth in Hz.
+    :param a0: float. Factor for raised cosine window generation.
+    :return: float. Window value.
+    """
+    xf = x / bw + .5
+    return a0 - (1 - a0) * math.cos(2 * np.pi * xf)
+
+
+@cuda.jit(device=True)
+def interp(x, y, bg):
     # Simple 2d linear nearest neighbor interpolation
     x0 = int(x)
     y0 = int(y)
@@ -30,8 +44,8 @@ def interp(x, y, tt, bg):
     y1 = int(y0 + 1 if y - y0 >= 0 else -1)
     xdiff = x - x0
     ydiff = y - y0
-    return bg[tt, x1, y1].real * xdiff * ydiff + bg[tt, x1, y0].real * xdiff * (1 - ydiff) + bg[tt, x0, y1].real * \
-           (1 - xdiff) * ydiff + bg[tt, x0, y0].real * (1 - xdiff) * (1 - ydiff)
+    return bg[x1, y1] * xdiff * ydiff + bg[x1, y0] * xdiff * (1 - ydiff) + bg[x0, y1] * \
+           (1 - xdiff) * ydiff + bg[x0, y0] * (1 - xdiff) * (1 - ydiff)
 
 
 '''@cuda.jit(device=True)
@@ -63,7 +77,20 @@ def applyRadiationPattern(s_tx, s_ty, s_tz, rngtx, s_rx, s_ry, s_rz, rngrx, az_r
 
 @cuda.jit(device=True)
 def applyRadiationPattern(el_c, az_c, az_rx, el_rx, az_tx, el_tx, bw_az, bw_el):
-    a = np.pi / bw_az 
+    """
+    Applies a very simple sinc radiation pattern.
+    :param txonly:
+    :param el_c: float. Center of beam in elevation, radians.
+    :param az_c: float. Azimuth center of beam in radians.
+    :param az_rx: float. Azimuth value of Rx antenna in radians.
+    :param el_rx: float. Elevation value of Rx antenna in radians.
+    :param az_tx: float. Azimuth value of Tx antenna in radians.
+    :param el_tx: float. Elevation value of Tx antenna in radians.
+    :param bw_az: float. Azimuth beamwidth of antenna in radians.
+    :param bw_el: float. elevation beamwidth of antenna in radians.
+    :return: float. Value by which a point should be scaled.
+    """
+    a = np.pi / bw_az
     b = np.pi / bw_el
     eldiff = diff(el_c, el_tx)
     azdiff = diff(az_c, az_tx)
@@ -222,51 +249,103 @@ def getAngleBlock(sp, data, range_bin, az, el, rx, fc):
 
 
 @cuda.jit
-def calcBounceFromMesh(tri_vert_indices, vert_xyz, vert_norms, vert_reflectivity, source_xyz, bounce_uv, return_xyz,
-                       return_pow, bounce_xyz):
-    tri, tt = cuda.grid(ndim=2)
-    if tri < tri_vert_indices.shape[0] and tt < source_xyz.shape[1]:
-        tv1 = tri_vert_indices[tri, 0]
-        tv2 = tri_vert_indices[tri, 1]
-        tv3 = tri_vert_indices[tri, 2]
+def calcBounceFromMesh(rot, shift, vgz, vert_reflectivity,
+                       source_xyz, receive_xyz, panrx, elrx, pantx, eltx, pd_r, pd_i, rng_states, calc_pts, calc_angs,
+                       wavelength, near_range_s, source_fs, bw_az, bw_el, pts_per_tri, debug_flag):
+    # sourcery no-metrics
+    px, py = cuda.grid(ndim=2)
+    if px < vgz.shape[0] and py < vgz.shape[1]:
+        # Load in all the parameters that don't change
+        n_samples = pd_r.shape[0]
+        wavenumber = 2 * np.pi / wavelength
 
-        for n in range(bounce_uv.shape[0]):
-            u = bounce_uv[n, 0]
-            v = bounce_uv[n, 1]
-            w = 1 - (u + v)
-            # Get barycentric coordinates for bounce points
-            bar_x = vert_xyz[tv1, 0] * u + vert_xyz[tv2, 0] * v + vert_xyz[tv3, 0] * w
-            bar_y = vert_xyz[tv1, 1] * u + vert_xyz[tv2, 1] * v + vert_xyz[tv3, 1] * w
-            bar_z = vert_xyz[tv1, 2] * u + vert_xyz[tv2, 2] * v + vert_xyz[tv3, 2] * w
+        for ntri in range(pts_per_tri):
+            # I'm not sure why but vgz and vert_reflectivity need their indexes swapped here
+            if ntri != 0 and px < vgz.shape[0] - 1 and py < vgz.shape[1] - 1:
+                bx = px + .5 - \
+                     xoroshiro128p_uniform_float32(rng_states, py * vgz.shape[0] + px)
+                by = py + .5 - \
+                     xoroshiro128p_uniform_float32(rng_states, py * vgz.shape[0] + px)
 
-            norm_x = vert_norms[tv1, 0] * u + vert_norms[tv2, 0] * v + vert_norms[tv3, 0] * w
-            norm_y = vert_norms[tv1, 1] * u + vert_norms[tv2, 1] * v + vert_norms[tv3, 1] * w
-            norm_z = vert_norms[tv1, 2] * u + vert_norms[tv2, 2] * v + vert_norms[tv3, 2] * w
+                # Apply barycentric interpolation to get random point height and power
+                x3 = py - 1 if bx < py else py + 1
+                y3 = px
+                z3 = vgz[x3, y3]
+                r3 = vert_reflectivity[x3, y3]
+                x2 = py
+                y2 = px - 1 if by < px else px + 1
+                z2 = vgz[x2, y2]
+                r2 = vert_reflectivity[x2, y2]
 
-            # Calculate out the angles in azimuth and elevation for the bounce
-            s_tx = bar_x - source_xyz[0, tt]
-            s_ty = bar_y - source_xyz[1, tt]
-            s_tz = bar_z - source_xyz[2, tt]
-            rng = math.sqrt(s_tx * s_tx + s_ty * s_ty + s_tz * s_tz)
+                lam1 = ((y2 - y3) * (bx - x3) + (x3 - x2) * (by - y3)) / \
+                       ((y2 - y3) * (px - x3) + (x3 - x2) * (py - y3))
+                lam2 = ((y3 - py) * (bx - x3) + (px - x3) * (by - y3)) / \
+                       ((y2 - y3) * (px - x3) + (x3 - x2) * (py - y3))
+                lam3 = 1 - lam1 - lam2
 
-            # Calculate out the bounce angles
-            rnorm = norm_x * s_tx / rng + norm_y * s_ty / rng + norm_z * s_tz / rng
-            b_y = -(2 * rnorm * norm_x - s_tx / rng)
-            b_x = -(2 * rnorm * norm_y - s_ty / rng)
-            b_z = -(2 * rnorm * norm_z - s_tz / rng)
+                # Quick check to see if something's out of whack with the interpolation
+                # lam3 + lam1 + lam2 should always be one
+                if lam3 < 0.:
+                    continue
+                bar_z = vgz[py, px] * lam1 + lam2 * z2 + lam3 * z3
+                if lam1 < lam2 and lam1 < lam3:
+                    gpr = vert_reflectivity[py, px]
+                elif lam2 < lam1 and lam2 < lam3:
+                    gpr = r2
+                else:
+                    gpr = r3
+                # gpr = lam1 * vert_reflectivity[py, px] + lam2 * r2 + lam3 * r3
+            elif ntri != 0:
+                continue
+            else:
+                bx = float(px)
+                by = float(py)
+                bar_z = vgz[py, px]
+                gpr = vert_reflectivity[py, px]
+            bx -= float(vgz.shape[0]) / 2.
+            by -= float(vgz.shape[1]) / 2.
+            bar_x = rot[0, 0] * bx + rot[0, 1] * by + shift[0]
+            bar_y = rot[1, 0] * bx + rot[1, 1] * by + shift[1]
 
-            # Calc power multiplier based on range, reflectivity
-            pt_idx = tri * bounce_uv.shape[0] + n - 1
-            pow_mult = vert_reflectivity[tv1] * u + vert_reflectivity[tv2] * v + vert_reflectivity[tv3] * w
-            return_xyz[pt_idx, tt, 0] = s_tx
-            return_xyz[pt_idx, tt, 1] = s_ty
-            return_xyz[pt_idx, tt, 2] = s_tz
+            for tt in range(source_xyz.shape[1]):
 
-            bounce_xyz[pt_idx, tt, 0] = b_x
-            bounce_xyz[pt_idx, tt, 1] = b_y
-            bounce_xyz[pt_idx, tt, 2] = b_z
+                # Calculate out the angles in azimuth and elevation for the bounce
+                tx = bar_x - source_xyz[0, tt]
+                ty = bar_y - source_xyz[1, tt]
+                tz = bar_z - source_xyz[2, tt]
+                rng = math.sqrt(abs(tx * tx) + abs(ty * ty) + abs(tz * tz))
 
-            return_pow[pt_idx, tt] = pow_mult
+                rx = bar_x - receive_xyz[0, tt]
+                ry = bar_y - receive_xyz[1, tt]
+                rz = bar_z - receive_xyz[2, tt]
+                r_rng = math.sqrt(abs(rx * rx) + abs(ry * ry) + abs(rz * rz))
+                r_el = -math.asin(rz / r_rng)
+                r_az = math.atan2(-ry, rx) + np.pi / 2
+                if debug_flag and tt == 0:
+                    calc_pts[0, px, py] = rx
+                    calc_pts[1, px, py] = ry
+                    calc_pts[2, px, py] = rz
+                    calc_angs[0, px, py] = r_el
+                    calc_angs[1, px, py] = r_az
+
+                two_way_rng = rng + r_rng
+                rng_bin = (two_way_rng / c0 - 2 * near_range_s) * source_fs
+                but = int(rng_bin)  # if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
+
+                # if debug_flag and tt == 0:
+                #     calc_angs[2, px, py] = gpr
+
+                if n_samples > but > 0:
+                    # a = abs(b_x * rx / r_rng + b_y * ry / r_rng + b_z * rz / r_rng)
+                    reflectivity = 1.  # math.pow((1. / -a + 1.) / 20, 10)
+                    att = applyRadiationPattern(r_el, r_az, panrx[tt], elrx[tt],
+                                                pantx[tt], eltx[tt], bw_az, bw_el) / (two_way_rng * two_way_rng)
+                    if debug_flag and tt == 0:
+                        calc_angs[2, px, py] = att
+                    acc_val = att * cmath.exp(-1j * wavenumber * two_way_rng) * gpr * reflectivity
+                    cuda.atomic.add(pd_r, (but, np.uint16(tt)), acc_val.real)
+                    cuda.atomic.add(pd_i, (but, np.uint16(tt)), acc_val.imag)
+                cuda.syncthreads()
 
 
 @cuda.jit
@@ -312,126 +391,312 @@ def genRangeProfileFromMesh(ret_xyz, bounce_xyz, receive_xyz, return_pow, is_blo
         if n_samples > but > 0:
             # Get bounce vector dot product
             a = bounce_xyz[pt_idx, tt, 0] * rx / r_rng + bounce_xyz[pt_idx, tt, 1] * ry / r_rng + \
-                         bounce_xyz[pt_idx, tt, 2] * rz / r_rng
+                bounce_xyz[pt_idx, tt, 2] * rz / r_rng
             # Run scattering coefficient through scaling to simulate real-world scattering
             P = return_pow[pt_idx, tt]
             sigma = .04 * P
-            reflectivity = math.exp(-math.pow((a * a / (2 * sigma)), P))
+            reflectivity = 1  # math.exp(-math.pow((a * a / (2 * sigma)), P))
             att = applyRadiationPattern(r_el, r_az, panrx[tt], elrx[tt], pantx[tt], eltx[tt], bw_az, bw_el) * \
                   1 / (two_way_rng * two_way_rng) * reflectivity
             debug_att[pt_idx, tt] = att
-            acc_val = att * cmath.exp(-1j * wavenumber * two_way_rng) * 1e1
+            acc_val = att * cmath.exp(-1j * wavenumber * two_way_rng)
             cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
             cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
-            
-            
-@cuda.jit
-def genRangeWithoutIntersection(rng_states, tri_vert_indices, vert_xyz, vert_norms, vert_scattering, vert_reflectivity,
-                                source_xyz, receive_xyz, panrx, elrx, pantx, eltx, pd_r, pd_i, calc_pts, calc_angs,
+
+
+@cuda.jit()
+def genRangeWithoutIntersection(rot, shift, vgz, vert_reflectivity,
+                                source_xyz, receive_xyz, panrx, elrx, pantx, eltx, pd_r, pd_i, rng_states, calc_pts,
+                                calc_angs,
                                 wavelength, near_range_s, source_fs, bw_az, bw_el, pts_per_tri, debug_flag):
     # sourcery no-metrics
-    tri, tt = cuda.grid(ndim=2)
-    
-    if tri < tri_vert_indices.shape[0] and tt < source_xyz.shape[1]:
+    px, py = cuda.grid(ndim=2)
+    if px < vgz.shape[0] and py < vgz.shape[1]:
         # Load in all the parameters that don't change
         n_samples = pd_r.shape[0]
         wavenumber = 2 * np.pi / wavelength
 
-        tv1 = tri_vert_indices[tri, 0]
-        tv2 = tri_vert_indices[tri, 1]
-        tv3 = tri_vert_indices[tri, 2]
+        for ntri in range(pts_per_tri):
+            # I'm not sure why but vgz and vert_reflectivity need their indexes swapped here
+            if ntri != 0 and px < vgz.shape[0] - 1 and py < vgz.shape[1] - 1:
+                bx = px + .5 - \
+                     xoroshiro128p_uniform_float32(rng_states, py * vgz.shape[0] + px)
+                by = py + .5 - \
+                     xoroshiro128p_uniform_float32(rng_states, py * vgz.shape[0] + px)
 
-        for n in range(pts_per_tri):
-            u = xoroshiro128p_uniform_float64(rng_states, tri)
-            v = xoroshiro128p_uniform_float64(rng_states, tri)
-            if u + v > 1:
-                u /= 2
-                v /= 2
-            w = 1 - (u + v)
-            # Get barycentric coordinates for bounce points
-            bar_x = vert_xyz[tv1, 0] * u + vert_xyz[tv2, 0] * v + vert_xyz[tv3, 0] * w
-            bar_y = vert_xyz[tv1, 1] * u + vert_xyz[tv2, 1] * v + vert_xyz[tv3, 1] * w
-            bar_z = vert_xyz[tv1, 2] * u + vert_xyz[tv2, 2] * v + vert_xyz[tv3, 2] * w
+                # Apply barycentric interpolation to get random point height and power
+                x3 = py - 1 if bx < py else py + 1
+                y3 = px
+                z3 = vgz[x3, y3]
+                r3 = vert_reflectivity[x3, y3]
+                x2 = py
+                y2 = px - 1 if by < px else px + 1
+                z2 = vgz[x2, y2]
+                r2 = vert_reflectivity[x2, y2]
 
-            norm_x = vert_norms[tv1, 0] * u + vert_norms[tv2, 0] * v + vert_norms[tv3, 0] * w
-            norm_y = vert_norms[tv1, 1] * u + vert_norms[tv2, 1] * v + vert_norms[tv3, 1] * w
-            norm_z = vert_norms[tv1, 2] * u + vert_norms[tv2, 2] * v + vert_norms[tv3, 2] * w
+                lam1 = ((y2 - y3) * (bx - x3) + (x3 - x2) * (by - y3)) / \
+                       ((y2 - y3) * (px - x3) + (x3 - x2) * (py - y3))
+                lam2 = ((y3 - py) * (bx - x3) + (px - x3) * (by - y3)) / \
+                       ((y2 - y3) * (px - x3) + (x3 - x2) * (py - y3))
+                lam3 = 1 - lam1 - lam2
 
-            # Calculate out the angles in azimuth and elevation for the bounce
-            tx = bar_x - source_xyz[0, tt]
-            ty = bar_y - source_xyz[1, tt]
-            tz = bar_z - source_xyz[2, tt]
-            rng = math.sqrt(tx * tx + ty * ty + tz * tz)
+                # Quick check to see if something's out of whack with the interpolation
+                # lam3 + lam1 + lam2 should always be one
+                if lam3 < 0.:
+                    continue
+                bar_z = vgz[py, px] * lam1 + lam2 * z2 + lam3 * z3
+                if lam1 < lam2 and lam1 < lam3:
+                    gpr = vert_reflectivity[py, px]
+                elif lam2 < lam1 and lam2 < lam3:
+                    gpr = r2
+                else:
+                    gpr = r3
+                # gpr = lam1 * vert_reflectivity[py, px] + lam2 * r2 + lam3 * r3
+            elif ntri != 0:
+                continue
+            else:
+                bx = float(px)
+                by = float(py)
+                bar_z = vgz[py, px]
+                gpr = vert_reflectivity[py, px]
+            bx -= float(vgz.shape[0]) / 2.
+            by -= float(vgz.shape[1]) / 2.
+            bar_x = rot[0, 0] * bx + rot[0, 1] * by + shift[0]
+            bar_y = rot[1, 0] * bx + rot[1, 1] * by + shift[1]
+
+            for tt in range(source_xyz.shape[1]):
+
+                # Calculate out the angles in azimuth and elevation for the bounce
+                tx = bar_x - source_xyz[0, tt]
+                ty = bar_y - source_xyz[1, tt]
+                tz = bar_z - source_xyz[2, tt]
+                rng = math.sqrt(abs(tx * tx) + abs(ty * ty) + abs(tz * tz))
+
+                rx = bar_x - receive_xyz[0, tt]
+                ry = bar_y - receive_xyz[1, tt]
+                rz = bar_z - receive_xyz[2, tt]
+                r_rng = math.sqrt(abs(rx * rx) + abs(ry * ry) + abs(rz * rz))
+                r_el = -math.asin(rz / r_rng)
+                r_az = math.atan2(rx, ry)
+                if debug_flag and tt == 0:
+                    calc_pts[0, px, py] = rx
+                    calc_pts[1, px, py] = ry
+                    calc_pts[2, px, py] = rz
+                    calc_angs[0, px, py] = r_el
+                    calc_angs[1, px, py] = r_az
+
+                two_way_rng = rng + r_rng
+                rng_bin = (two_way_rng / c0 - 2 * near_range_s) * source_fs
+                but = int(rng_bin)  # if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
+
+                # if debug_flag and tt == 0:
+                #     calc_angs[2, px, py] = gpr
+
+                if n_samples > but > 0:
+                    # a = abs(b_x * rx / r_rng + b_y * ry / r_rng + b_z * rz / r_rng)
+                    reflectivity = 1.  # math.pow((1. / -a + 1.) / 20, 10)
+                    att = applyRadiationPattern(r_el, r_az, panrx[tt], elrx[tt],
+                                                pantx[tt], eltx[tt], bw_az, bw_el) / \
+                          (two_way_rng * two_way_rng * two_way_rng * two_way_rng)
+                    if debug_flag and tt == 0:
+                        calc_angs[2, px, py] = att
+                    acc_val = att * cmath.exp(-1j * wavenumber * two_way_rng) * gpr * reflectivity
+                    cuda.atomic.add(pd_r, (but, np.uint16(tt)), acc_val.real)
+                    cuda.atomic.add(pd_i, (but, np.uint16(tt)), acc_val.imag)
+                cuda.syncthreads()
+
+
+@cuda.jit('void(float64[:, :], float64[:, :], float64[:, :], float64[:, :], float64[:, :], float64[:], float64[:], '
+          'float64[:], float64[:], float64[:], complex128[:, :], complex128[:, :], float64, float64, float64, float64, '
+          'float64, float64, int32, float64[:, :, :], float64[:, :, :], int32, float64[:])')
+def backproject(source_xyz, receive_xyz, gx, gy, gz, rbins, panrx, elrx, pantx, eltx, pulse_data, final_grid,
+                wavelength, near_range_s, source_fs, signal_bw, bw_az, bw_el, poly, calc_pts, calc_angs, debug_flag,
+                range_atmos):
+    """
+    Backprojection kernel.
+    :param source_xyz: array. XYZ values of the source, usually Tx antenna, in meters.
+    :param receive_xyz: array. XYZ values of the receiver, usually Rx antenna, in meters.
+    :param gx: array. X values, in meters, of grid.
+    :param gy: array. Y values, in meters, of grid.
+    :param gz: array. Z values, in meters, of grid.
+    :param rbins: array. Range bins, in meters.
+    :param panrx: array. Rx azimuth values, in radians.
+    :param elrx: array. Rx elevation values, in radians.
+    :param pantx: array. Tx azimuth values, in radians.
+    :param eltx: array. Tx elevation values, in radians.
+    :param pulse_data: array. Complex pulse return data.
+    :param final_grid: array. 2D matrix that accumulates all the corrected phase values.
+    This is the backprojected image.
+    :param wavelength: float. Wavelength used for phase correction.
+    :param near_range_s: float. Near range value in seconds.
+    :param source_fs: float. Sampling frequency in Hz.
+    :param signal_bw: float. Bandwidth of signal in Hz.
+    :param bw_az: float. Azimuth beamwidth in radians.
+    :param bw_el: float. Elevation beamwidth in radians.
+    :param poly: int. Determines the order of polynomial interpolation for range bins.
+    :param calc_pts: array. Debug array for calculated ranges. Optional.
+    :param calc_angs: array. Debug array for calculated angles to points. Optional.
+    :param debug_flag: bool. If True, populates the calc_pts and calc_angs arrays.
+    :return: Nothing, technically. final_grid is the returned product.
+    """
+    px, py = cuda.grid(ndim=2)
+    if px < gx.shape[0] and py < gx.shape[1]:
+        # Load in all the parameters that don't change
+        acc_val = 0
+        nPulses = pulse_data.shape[1]
+        n_samples = pulse_data.shape[0]
+        k = 2 * np.pi / wavelength
+
+        # Grab pulse data and sum up for this pixel
+        for tt in range(nPulses):
+            cp = pulse_data[:, tt]
+            # Get LOS vector in XYZ and spherical coordinates at pulse time
+            # Tx first
+            tx = gx[px, py] - source_xyz[0, tt]
+            ty = gy[px, py] - source_xyz[1, tt]
+            tz = gz[px, py] - source_xyz[2, tt]
+            tx_rng = math.sqrt(abs(tx * tx) + abs(ty * ty) + abs(tz * tz))
+
+            # Rx
+            rx = gx[px, py] - receive_xyz[0, tt]
+            ry = gy[px, py] - receive_xyz[1, tt]
+            rz = gz[px, py] - receive_xyz[2, tt]
+            rx_rng = math.sqrt(abs(rx * rx) + abs(ry * ry) + abs(rz * rz))
+            r_el = -math.asin(rz / rx_rng)
+            r_az = math.atan2(-ry, rx) + np.pi / 2
             if debug_flag and tt == 0:
-                calc_pts[tri, 0] = tx
-                calc_pts[tri, 1] = ty
-                calc_pts[tri, 2] = tz
-                calc_angs[tri, 0] = math.acos(tz / rng)
-                calc_angs[tri, 1] = math.atan2(tx, ty)
+                calc_pts[0, px, py] = rx
+                calc_pts[1, px, py] = ry
+                calc_pts[2, px, py] = rz
+                calc_angs[0, px, py] = r_el
+                calc_angs[1, px, py] = r_az
 
-            # Calculate out the bounce angles
-            rnorm = norm_x * tx / rng + norm_y * ty / rng + norm_z * tz / rng
-            b_y = -(2 * rnorm * norm_x - tx / rng)
-            b_x = -(2 * rnorm * norm_y - ty / rng)
-            b_z = -(2 * rnorm * norm_z - tz / rng)
+            # Check to see if it's outside of our beam
+            az_diffrx = diff(r_az, panrx[tt])
+            el_diffrx = diff(r_el, elrx[tt])
+            if (abs(az_diffrx) > bw_az) or (abs(el_diffrx) > bw_el):
+                continue
 
-            # Calc power multiplier based on range, reflectivity
-            scat_ref = vert_reflectivity[tv1] * u + vert_reflectivity[tv2] * v + vert_reflectivity[tv3] * w
-            scat_pow = vert_scattering[tv1] * u + vert_scattering[tv2] * v + vert_scattering[tv3] * w
-
-            rx = tx - receive_xyz[0, tt]
-            ry = ty - receive_xyz[1, tt]
-            rz = tz - receive_xyz[2, tt]
-            r_rng = math.sqrt(rx * rx + ry * ry + rz * rz)
-            r_el = math.acos(rz / r_rng)
-            r_az = math.atan2(rx, ry)
-            two_way_rng = math.sqrt(tx * tx + ty * ty + tz * tz) + r_rng
+            # Get index into range compressed data
+            two_way_rng = tx_rng + rx_rng
             rng_bin = (two_way_rng / c0 - 2 * near_range_s) * source_fs
             but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
-            if n_samples > but > 0:
-                a = b_x * rx / r_rng + b_y * ry / r_rng + \
-                    b_z * rz / r_rng
-                sigma = .04 * scat_ref
-                reflectivity = scat_ref * a # math.exp(-math.pow((a * a / (2 * sigma)), scat_ref))
-                att = applyRadiationPattern(r_el, r_az, panrx[tt], elrx[tt], pantx[tt], eltx[tt], bw_az, bw_el) * \
-                      1 / (two_way_rng * two_way_rng) * reflectivity * 1e2
-                acc_val = att * cmath.exp(-1j * wavenumber * two_way_rng) * scat_pow
-                cuda.atomic.add(pd_r, (but, np.uint64(tt)), acc_val.real)
-                cuda.atomic.add(pd_i, (but, np.uint64(tt)), acc_val.imag)
+            if but > n_samples:
+                continue
+
+            # Attenuation of beam in elevation and azimuth
+            att = applyRadiationPattern(r_el, r_az, panrx[tt], elrx[tt], pantx[tt], eltx[tt],
+                                        bw_az, bw_el) / two_way_rng
+            if debug_flag and tt == 0:
+                calc_angs[2, px, py] = two_way_rng
+
+            # Azimuth window to reduce sidelobes
+            # Gaussian window
+            # az_win = math.exp(-az_diffrx * az_diffrx / (2 * .001))
+            # Raised Cosine window (a0=.5 for Hann window, .54 for Hamming)
+            az_win = raisedCosine(az_diffrx, signal_bw, .5)
+            # az_win = 1.
+
+            if rbins[but - 1] < tx_rng < rbins[but]:
+                bi0 = but - 1
+                bi1 = but
+            else:
+                bi0 = but
+                bi1 = but + 1
+
+            if poly == 0:
+                # This is how APS does it (for reference, I guess)
+                a = cp[bi1]
+            elif poly == 1:
+                # Linear interpolation between bins (slower but more accurate)
+                a = (cp[bi0] * (rbins[bi1] - tx_rng) + cp[bi1] * (tx_rng - rbins[bi0])) \
+                    / (rbins[bi1] - rbins[bi0])
+            else:
+                # This is a lagrange polynomial interpolation of the specified order
+                ar = ai = 0
+                kspan = (poly + 1 if poly % 2 != 0 else poly) // 2
+                ks = max(bi0 - kspan, 0)
+                ke = bi0 + kspan + 1 if bi0 + kspan < n_samples else n_samples
+                for jdx in range(ks, ke):
+                    mm = 1
+                    for kdx in range(ks, ke):
+                        if jdx != kdx:
+                            mm *= (tx_rng - rbins[kdx]) / (rbins[jdx] - rbins[kdx])
+                    ar += mm * cp[jdx].real
+                    ai += mm * cp[jdx].imag
+                a = ar + 1j * ai
+
+            # Multiply by phase reference function, attenuation and azimuth window
+            # if tt == 0:
+            #     print('att ', att, 'rng', tx_rng, 'bin', bi1, 'az_diff', az_diffrx, 'el_diff', el_diffrx)
+            ra = range_atmos[tt] if range_atmos is not None else 1
+            exp_phase = k * two_way_rng * ra
+            acc_val += a * cmath.exp(1j * exp_phase) * att * az_win
+        final_grid[px, py] = acc_val
 
 
-@njit
-def apply_shift(ray: np.ndarray, freq_shift: np.float64, samp_rate: np.float64) -> np.ndarray:
-    # apply frequency shift
-    precache = 2j * np.pi * freq_shift / samp_rate
-    new_ray = np.empty_like(ray)
-    for idx, val in enumerate(ray):
-        new_ray[idx] = val * np.exp(precache * idx)
-    return new_ray
+@cuda.jit()
+def backproject_gmti(source_hght, source_vel, grange, gvel, pantx, pulse_data, final_grid,
+                     wavelength, near_range_s, source_fs, pri):
+    """
+    Backprojection kernel.
+    :param source_hght: array. Altitude of platform in meters.
+    :param source_vel: array. ENU velocity values of platform in m/s.
+    :param grange: array. Range values to project to. Usually the range bins of a collect.
+    :param gvel: array. Radial velocity values in m/s.
+    :param pantx: array. Inertial azimuth angle of antenna in radians.
+    :param pulse_data: array. Complex pulse return data.
+    :param final_grid: array. 2D matrix that accumulates all the corrected phase values.
+    This is the backprojected image.
+    :param wavelength: float. Wavelength used for phase correction.
+    :param near_range_s: float. Near range value in seconds.
+    :param source_fs: float. Sampling frequency in Hz.
+    :param pri: float. PRI interval of pulses.
+    :return: Nothing, technically. final_grid is the returned product.
+    """
+    px, py = cuda.grid(ndim=2)
+    if px < grange.shape[0] and py < grange.shape[1]:
+        # Load in all the parameters that don't change
+        acc_val = 0
+        nPulses = pulse_data.shape[1]
+        n_samples = pulse_data.shape[0]
+        k = 2 * np.pi / wavelength
+
+        # Grab pulse data and sum up for this pixel
+        for tt in range(nPulses):
+            cp = pulse_data[:, tt]
+            delta_t = pri * (tt - nPulses / 2)
+
+            graze = math.asin(source_hght[tt] / grange[px, py])
+            clutter_vel = source_vel[0, tt] * math.cos(graze) * math.sin(pantx[tt]) + \
+                          source_vel[1, tt] * math.cos(graze) * math.cos(pantx[tt]) + \
+                          source_vel[2, tt] * -math.sin(graze)
+            eff_rng = grange[px, py] - (clutter_vel + gvel[px, py]) * delta_t
+            rng_bin = (2 * grange[px, py] / c0 - 2 * near_range_s) * source_fs
+            but = int(rng_bin) if rng_bin - int(rng_bin) < .5 else int(rng_bin) + 1
+            if but > n_samples:
+                continue
+
+            # Multiply by phase reference function, attenuation and azimuth window
+            exp_phase = k * eff_rng
+            acc_val += cp[but] * cmath.exp(2j * exp_phase)
+        final_grid[px, py] = acc_val
 
 
-def ambiguity(s1, s2, prf, dopp_bins, mag=True, normalize=True):
+def ambiguity(s1, s2, prf, dopp_bins, a_fs, mag=True, normalize=True):
     fdopp = np.linspace(-prf / 2, prf / 2, dopp_bins)
     fft_sz = findPowerOf2(len(s1)) * 2
     s1f = np.fft.fft(s1, fft_sz).conj().T
-    shift_grid = np.zeros((len(s2), dopp_bins), dtype=np.complex64)
-    for n in range(dopp_bins):
-        shift_grid[:, n] = apply_shift(s2, fdopp[n], fs)
-    s2f = np.fft.fft(shift_grid, n=fft_sz, axis=0)
-    A = np.fft.fftshift(np.fft.ifft(s2f * s1f[:, None], axis=0, n=fft_sz * 2),
-                        axes=0)[fft_sz - dopp_bins // 2: fft_sz + dopp_bins // 2]
+    shift_grid = np.arange(len(s2)) / a_fs
+    sg = np.fft.fft(np.array([np.exp(2j * np.pi * f * shift_grid) for f in fdopp]) * s2, fft_sz, axis=1)
+    A = np.fft.fftshift(np.fft.ifft(sg * s1f, axis=1), axes=1)
     if normalize:
         A = A / abs(A).max()
-    if mag:
-        return abs(A) ** 2, fdopp, np.linspace(-len(s1) / 2 / fs, len(s1) / 2 / fs, len(s1))
-    else:
-        return A, fdopp, np.linspace(-dopp_bins / 2 * fs / c0, dopp_bins / 2 * fs / c0, dopp_bins)
+    return abs(A) if mag else A, fdopp, (np.arange(fft_sz) - fft_sz // 2) * c0 / a_fs
 
 
 def getMaxThreads():
     gpuDevice = cuda.get_current_device()
-    maxThreads = gpuDevice.MAX_THREADS_PER_BLOCK // 3
-    sqrtMaxThreads = int(np.sqrt(maxThreads))
+    maxThreads = int(np.sqrt(gpuDevice.MAX_THREADS_PER_BLOCK))
+    sqrtMaxThreads = maxThreads // 2
     return sqrtMaxThreads, sqrtMaxThreads
-
-

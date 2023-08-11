@@ -1,10 +1,15 @@
 import numpy as np
 from osgeo import gdal
-from scipy.interpolate import RectBivariateSpline
+from scipy.interpolate import RectBivariateSpline, interpn
 from scipy.spatial.transform import Rotation as rot
-import open3d as o3d
+from itertools import product
+import scipy.ndimage.filters as filters
+import scipy.ndimage.morphology as morphology
 import plotly.io as pio
 import plotly.graph_objects as go
+import os
+from functools import reduce
+from numba import jit, prange
 
 pio.renderers.default = 'browser'
 
@@ -12,6 +17,8 @@ WGS_A = 6378137.0
 WGS_F = 1 / 298.257223563
 WGS_B = 6356752.314245179
 WGS_E2 = 6.69437999014e-3
+c0 = 299792458.0
+DTR = np.pi / 180
 
 
 def getDTEDName(lat, lon):
@@ -20,7 +27,21 @@ def getDTEDName(lat, lon):
     tmplon = int(np.floor(lon))
     direw = 'w' if tmplon < 0 else 'e'
     dirns = 's' if tmplat < 0 else 'n'
-    return '/data5/dted/%s%03d/%s%02d.dt2' % (direw, abs(tmplon), dirns, abs(tmplat))
+    if os.name == 'nt':
+        return 'Z:\\dted\\%s%03d\\%s%02d.dt2' % (direw, abs(tmplon), dirns, abs(tmplat))
+    else:
+        return '/data5/dted/%s%03d/%s%02d.dt2' % (direw, abs(tmplon), dirns, abs(tmplat))
+
+
+def detect_local_extrema(arr):
+    neighborhood = morphology.generate_binary_structure(len(arr.shape), 2)
+    local_min = filters.minimum_filter(arr, footprint=neighborhood) == arr
+    # local_max = filters.maximum_filter(arr, footprint=neighborhood) == arr
+    background = arr == 0
+    eroded_background = morphology.binary_erosion(
+        background, structure=neighborhood, border_value=1)
+    detected_extrema = local_min ^ eroded_background  # + local_max ^ eroded_background
+    return np.where(detected_extrema)
 
 
 def db(x):
@@ -34,7 +55,11 @@ def findPowerOf2(x):
 
 
 def undulationEGM96(lat, lon):
-    with open("/data5/dted/EGM96.DAT", "rb") as f:
+    if os.name == 'nt':
+        egmdatfile = "Z:\\dted\\EGM96.DAT"
+    else:
+        egmdatfile = "/data5/dted/EGM96.DAT"
+    with open(egmdatfile, "rb") as f:
         emg96 = np.fromfile(f, 'double', 1441 * 721, '')
         eg_n = np.ceil(lat / .25) * .25
         eg_s = np.floor(lat / .25) * .25
@@ -51,40 +76,70 @@ def undulationEGM96(lat, lon):
     return egc
 
 
-def getElevationMap(lats, lons):
+def getElevationMap(lats, lons, und=True, interp_method='linear'):
     """Returns the digital elevation for a latitude and longitude"""
-    dtedName = getDTEDName(lats[0], lons[0])
+    # First, check to see if multiple DTEDs are needed
+    floor_lats = np.floor(lats)
+    floor_lons = np.floor(lons)
+    hght = np.zeros_like(lats)
+    dteds = list(product(np.unique(np.floor(lats)), np.unique(np.floor(lons))))
+    for ted in dteds:
+        idx = np.logical_and(floor_lats == ted[0], floor_lons == ted[1])
+        dtedName = getDTEDName(*ted)
 
-    # open DTED file for reading
-    ds = gdal.Open(dtedName)
+        # open DTED file for reading
+        ds = gdal.Open(dtedName)
 
-    # grab geo transform with resolutions
-    gt = ds.GetGeoTransform()
+        # grab geo transform with resolutions
+        gt = ds.GetGeoTransform()
 
-    # read in raster data
-    raster = ds.GetRasterBand(1).ReadAsArray()
+        # read in raster data
+        raster = ds.GetRasterBand(1).ReadAsArray()
 
-    # Get lats and lons as bins into raster
-    bin_lat = (lats - gt[3]) / gt[-1]
-    bin_lon = (lons - gt[0]) / gt[1]
+        # Get lats and lons as bins into raster
+        bin_lat = (lats[idx] - gt[3]) / gt[-1]
+        bin_lon = (lons[idx] - gt[0]) / gt[1]
 
-    # Linear interpolation using bins
-    blatmin = bin_lat.astype(int)
-    lowLatDiff = bin_lat - blatmin
-    blatmax = (bin_lat + 1).astype(int)
-    upLatDiff = blatmax - bin_lat
-    blonmin = bin_lon.astype(int)
-    leftLonDiff = bin_lon - blonmin
-    blonmax = (bin_lon + 1).astype(int)
-    rightLonDiff = blonmax - bin_lon
+        # Linear interpolation using bins
+        # Supported interp methods are linear, nearest, slinear, cubic, quintic, pchip, splinef2d
+        hght[idx] = interpn(np.array([np.arange(3601), np.arange(3601)]), raster, np.array([bin_lat, bin_lon]).T,
+                       method=interp_method, bounds_error=False, fill_value=0) + undulationEGM96(lats[idx], lons[idx]) if und else hght
 
-    return (raster[blatmin, blonmin] * rightLonDiff * lowLatDiff
-            + raster[blatmin, blonmax] * leftLonDiff * lowLatDiff
-            + raster[blatmax, blonmin] * rightLonDiff * upLatDiff
-            + raster[blatmax, blonmax] * leftLonDiff * upLatDiff)
+    return hght
 
 
-def getElevation(pt):
+@jit(nopython=True, fastmath=True, nogil=True, cache=True, parallel=True)
+def bilinear_interpolation(x_in, y_in, f_in, x_out, y_out):
+    f_out = np.zeros((y_out.size, x_out.size))
+
+    for i in prange(f_out.shape[1]):
+        idx = np.searchsorted(x_in, x_out[i])
+
+        x1 = x_in[idx - 1]
+        x2 = x_in[idx]
+        x = x_out[i]
+
+        for j in prange(f_out.shape[0]):
+            idy = np.searchsorted(y_in, y_out[j])
+            y1 = y_in[idy - 1]
+            y2 = y_in[idy]
+            y = y_out[j]
+
+            f11 = f_in[idy - 1, idx - 1]
+            f21 = f_in[idy - 1, idx]
+            f12 = f_in[idy, idx - 1]
+            f22 = f_in[idy, idx]
+
+            f_out[j, i] = ((f11 * (x2 - x) * (y2 - y) +
+                            f21 * (x - x1) * (y2 - y) +
+                            f12 * (x2 - x) * (y - y1) +
+                            f22 * (x - x1) * (y - y1)) /
+                           ((x2 - x1) * (y2 - y1)))
+
+    return f_out
+
+
+def getElevation(pt, und=True):
     lat = pt[0]
     lon = pt[1]
     """Returns the digital elevation for a latitude and longitude"""
@@ -101,11 +156,9 @@ def getElevation(pt):
     # yskew is useless (0.0)
     # yres is the resolution in the y-direction (in degrees/sample)
     ulx, xres, xskew, uly, yskew, yres = ds.GetGeoTransform()
-    # pre-compute 1/elevation_grid_spacing
-    elevSpacInv = 1.0 / abs(xres * yres)
     # calculate the x and y indices into the DTED data for the lat/lon
-    px = int(np.round((lon - ulx) / xres))
-    py = int(np.round((lat - uly) / yres))
+    px = int((lon - ulx) / xres) - (1 if (lon - ulx) / xres % 1 < .5 else 0)
+    py = int((lat - uly) / yres) - (1 if (lat - uly) / yres % 1 < .5 else 0)
 
     # only if these x and y indices are within the bounds of the DTED, get the
     # raster band and try to read in the DTED values
@@ -115,23 +168,19 @@ def getElevation(pt):
         dtedData = rasterBand.ReadAsArray(px, py, 2, 2)
 
         # use bilinear interpolation to get the elevation for the lat/lon
-        leftLon = px * xres + ulx
-        upLat = py * yres + uly
+        x = (lon - ulx)
+        y = (lat - uly)
+        x1 = int((lon - ulx) / xres) * xres
+        x2 = int((lon - ulx) / xres + 1) * xres
+        y1 = int((lat - uly) / yres) * yres
+        y2 = int((lat - uly) / yres + 1) * yres
+        elevation = 1 / ((x2 - x1) * (y2 - y1)) * \
+                    dtedData.ravel().dot(np.array([[x2 * y2, -y2, -x2, 1],
+                                                    [-x2 * y1, y1, x2, -1],
+                                                    [-x1 * y2, y2, x1, -1],
+                                                    [x1 * y1, -y1, -x1, 1]])).dot(np.array([1, x, y, x * y]))
 
-        # pre compute the differences for the bilinear interpolation
-        rightLonDiff = (leftLon + xres) - lon
-        upLatDiff = upLat - lat
-        # lowLatDiff = lat - lowLat
-        leftLonDiff = lon - leftLon
-        lowLatDiff = lat - (upLat + yres)
-        # upLatDiff = (lowLat + yres) - lat
-
-        elevation = elevSpacInv * (dtedData[0, 0] * rightLonDiff * lowLatDiff
-                                   + dtedData[0, 1] * leftLonDiff * lowLatDiff
-                                   + dtedData[1, 0] * rightLonDiff * upLatDiff
-                                   + dtedData[1, 1] * leftLonDiff * upLatDiff)
-
-    return elevation + undulationEGM96(lat, lon)
+    return elevation + undulationEGM96(lat, lon) if und else elevation
 
 
 def llh2enu(lat, lon, h, refllh):
@@ -208,34 +257,6 @@ def ecef2enu(x, y, z, refllh):
     return enu[0], enu[1], enu[2]
 
 
-def getLivingRoom(voxel_downsample=.05):
-    pcd = o3d.io.read_point_cloud("./livingroom.ply")
-
-    # Stupid thing has walls, need to crop them out
-    cube_ext = 3
-    cube_hght = 2.5
-    cube_hght_below = .1
-    cube_points = np.array([
-        # Vertices Polygon1
-        [(cube_ext / 2), cube_hght, (cube_ext / 2)],  # face-topright
-        [-(cube_ext / 2), cube_hght, (cube_ext / 2)],  # face-topleft
-        [-(cube_ext / 2), cube_hght, -(cube_ext / 2)],  # rear-topleft
-        [(cube_ext / 2), cube_hght, -(cube_ext / 2)],  # rear-topright
-        # Vertices Polygon 2
-        [(cube_ext / 2), cube_hght_below, (cube_ext / 2)],
-        [-(cube_ext / 2), cube_hght_below, (cube_ext / 2)],
-        [-(cube_ext / 2), cube_hght_below, -(cube_ext / 2)],
-        [-(cube_ext / 2), cube_hght_below, -(cube_ext / 2)],
-    ]).astype("float64")
-    v3dv = o3d.utility.Vector3dVector(cube_points)
-    oriented_bounding_box = o3d.geometry.AxisAlignedBoundingBox.create_from_points(v3dv)
-    pcd = pcd.crop(oriented_bounding_box)
-
-    # This is not needed after the walls are removed
-    pcd = pcd.voxel_down_sample(voxel_size=voxel_downsample)
-    return pcd
-
-
 def getMapLocation(p1, extent, init_llh, npts_background=500, resample=True):
     pt_enu = llh2enu(*p1, init_llh)
     lats = np.linspace(p1[0] - extent[0] / 2 / 111111, p1[0] + extent[0] / 2 / 111111, npts_background)
@@ -305,11 +326,87 @@ def genPulse(phase_x, phase_y, nnr, nfs, nfc, bandw):
 
 
 def rotate(az, nel, rot_mat):
-    return rot.from_euler('xz', [nel - np.pi / 2, -az]).apply(rot_mat)
+    return rot.from_euler('zx', [[-az, 0.],
+                                 [0., nel - np.pi / 2]]).apply(rot_mat)
 
 
 def azelToVec(az, el):
-    return np.array([np.sin(az) * np.sin(el), np.cos(az) * np.sin(el), np.cos(el)])
+    return np.array([np.sin(az) * np.cos(el), np.cos(az) * np.cos(el), -np.sin(el)])
+
+
+def hornPattern(fc, width, height, theta=None, phi=None, deg_per_bin=.5, az_only=False):
+    _lambda = c0 / fc
+    d = _lambda / 2.
+    if theta is None:
+        theta = np.arange(0, np.pi, deg_per_bin * DTR)
+    if phi is None:
+        phi = [0] if az_only else np.arange(-np.pi / 2, np.pi / 2, deg_per_bin * DTR)
+    theta, phi = np.meshgrid(theta, phi)
+    lcw = np.arange(-width / 2, width / 2, d)
+    lch = np.arange(-height / 2, height / 2, d)
+    lch, lcw = np.meshgrid(lch, lcw)
+    lchm = lch.flatten()
+    lcwm = lcw.flatten()
+    k = 2 * np.pi / _lambda
+    locs = np.array([lcwm, np.zeros_like(lcwm), lchm]).T
+    ublock = -azelToVec(theta.flatten(), phi.flatten())
+    AF = np.sum(np.exp(-1j * k * locs.dot(ublock)), axis=0)
+    AF = AF.flatten() if az_only else AF.reshape(theta.shape)
+
+    # Return degree array and antenna pattern
+    return theta, phi, AF
+
+
+def calcSNR(p_s, ant_g, az, el, wavelength, pulse_time, bandw, dopp_mult, rng, rcs_val=None):
+    sig = calcPower(p_s, ant_g, az, el, wavelength, pulse_time, bandw, dopp_mult, rng, rcs_val)
+    # Boltzmans constant
+    kb = 1.3806503e-23
+    # the reference temperature (in Kelvin)
+    T0 = 290.0
+    # Noise figure of 3dB
+    F = 10.0 ** (3.0 / 10.0)
+    N0 = kb * T0 * F
+    sigma_n = np.sqrt(N0 * bandw)
+    noise = sigma_n ** 2
+    return db(np.array([sig / noise]))[0]
+
+
+def calcPower(p_s, ant_g, az, el, wavelength, pulse_time, bandw, dopp_mult, rng, rcs_val=None):
+    if rcs_val is None:
+        sig = p_s * ant_g ** 2 * np.tan(az) * np.tan(el) * wavelength ** 2 * pulse_time * bandw * dopp_mult
+        sig /= (4 * np.pi) ** 3 * rng ** 2
+    else:
+        sig = p_s * ant_g ** 2 * rcs_val * wavelength ** 2 * pulse_time * bandw * dopp_mult
+        sig /= (4 * np.pi) ** 3 * rng ** 4
+    return sig
+
+
+def arrayFactor(fc, pos, theta=None, phi=None, weights=None, deg_per_bin=.5, az_only=False, horn_dim=None,
+                horn_pattern=None):
+    use_pat = False
+    if horn_pattern is not None:
+        _, _, el_pat = horn_pattern
+        use_pat = True
+    elif horn_dim is not None:
+        use_pat = True
+        _, _, el_pat = hornPattern(fc, horn_dim[0], horn_dim[1], theta=theta, phi=phi,
+                                   deg_per_bin=deg_per_bin, az_only=az_only)
+    _lambda = c0 / fc
+    if theta is None:
+        theta = np.arange(0, np.pi, deg_per_bin * DTR)
+    if phi is None:
+        phi = [0] if az_only else np.arange(-np.pi / 2, np.pi / 2, deg_per_bin * DTR)
+    theta, phi = np.meshgrid(theta, phi)
+    k = 2 * np.pi / _lambda
+    # az, el = np.meshgrid(theta, theta)
+    ublock = -azelToVec(theta.flatten(), phi.flatten())
+    AF = np.exp(-1j * k * pos.dot(ublock))
+    if use_pat:
+        AF *= el_pat.flatten()[None, :]
+    weights = weights if weights is not None else np.ones(pos.shape[0])
+    AF = AF.T.dot(weights).flatten() if az_only else AF.T.dot(weights).reshape(theta.shape)
+    # Return degree array and antenna pattern
+    return theta, phi, AF
 
 
 '''
@@ -317,6 +414,46 @@ def azelToVec(az, el):
 ------------------- RENDERING AND PLOTTING FUNCTIONS -------------------------------
 ------------------------------------------------------------------------------------
 '''
+
+
+def createFigureDict(xrngs=None, yrngs=None, zrngs=None):
+    figure = {
+        'data': [],
+        'layout': {},
+        'frames': []
+    }
+    figure['layout']['scene'] = dict(
+        xaxis=dict(range=xrngs, autorange=False),
+        yaxis=dict(range=yrngs, autorange=False),
+        zaxis=dict(range=zrngs, autorange=False),
+        aspectratio=dict(x=1, y=1, z=1))
+    figure['layout']['updatemenus'] = [dict(
+        type="buttons",
+        buttons=[dict(label="Play",
+                      method="animate",
+                      args=[None]),
+                 {"args": [[None], {"frame": {"duration": 0, "redraw": True},
+                                    "mode": "immediate",
+                                    "transition": {"duration": 0}}],
+                  "label": "Pause",
+                  "method": "animate"}
+                 ])]
+    sliders_dict = {
+        'active': 0, 'yanchor': 'top', 'xanchor': 'left',
+        'currentvalue': {
+            'font': {'size': 20},
+            'prefix': 'Time: ',
+            'visible': True,
+            'xanchor': 'right'
+        },
+        'transition': {'duration': 0},
+        'pad': {'b': 10, 't': 50},
+        'len': 0.9,
+        'x': 0.1,
+        'y': 0,
+        'steps': []
+    }
+    return figure, sliders_dict
 
 
 class PlotWithSliders(object):
@@ -354,5 +491,616 @@ class PlotWithSliders(object):
                          "direction": "left", "pad": {"r": 10, "t": 1}, "type": "buttons", "x": 0.1, "y": 0, }]
         self._fig.update(frames=self._frames)
         self._fig.update_layout(updatemenus=update_menus, sliders=slider)
-        self._fig.update_layout(sliders=slider)
         self._fig.show()
+
+
+'''
+--------------------------------------DEBUG DATA PARSER STUFF-----------------------------------------------------------
+'''
+
+
+def loadRawData(filename, num_pulses, start_pulse=0):
+    with open(filename, 'rb') as fid:
+        num_frames = np.fromfile(fid, 'uint32', 1, '')[0]
+        if start_pulse + num_pulses > num_frames:
+            num_pulses = num_frames - start_pulse
+            print(f"Too many frames for file! Using {num_pulses} pulses instead")
+        num_samples = np.fromfile(fid, 'uint16', 1, '')[0]
+        attenuation = np.fromfile(fid, 'uint8', num_frames, '')
+        sys_time = np.fromfile(fid, 'double', num_frames, '')
+        raw_data = np.zeros((num_samples, num_pulses)).astype(np.int16)
+        fid.seek(fid.tell() + start_pulse * 2 * num_samples)
+        for i in range(num_pulses):
+            raw_data[:, i] = np.fromfile(fid, 'int16', num_samples, '') * 10 ** (attenuation[start_pulse + i] / 20)
+    return raw_data, num_pulses, attenuation, sys_time
+
+
+def getRawDataGen(filename, num_pulses, num_desired_frames=None, start_pulse=0, isIQ=False):
+    with open(filename, 'rb') as fid:
+        num_frames = np.fromfile(fid, 'uint32', 1, '')[0]
+        if isIQ:
+            num_samples = np.fromfile(fid, 'uint32', 1, '')[0]
+        else:
+            num_samples = np.fromfile(fid, 'uint16', 1, '')[0]
+        attenuation = np.fromfile(fid, 'int8', num_frames, '')
+        sys_time = np.fromfile(fid, 'double', num_frames, '')
+        ndf = num_frames if num_desired_frames is None else num_desired_frames
+        if isIQ:
+            fid.seek(fid.tell() + start_pulse * 2 * num_samples)
+            for npulse in range(0, ndf, num_pulses):
+                proc_pulses = num_pulses if npulse + num_pulses < ndf else ndf - npulse
+                raw_data = np.zeros((num_samples, proc_pulses)).astype(np.complex128)
+                pulse_range = np.arange(npulse + start_pulse, npulse + proc_pulses + start_pulse)
+                for i in range(proc_pulses):
+                    tmp = np.fromfile(fid, 'int16', num_samples * 2, '')
+                    raw_data[:, i] = (tmp[0::2] + 1j * tmp[1::2]) * 10 ** (attenuation[pulse_range[0] + i] / 20)
+                yield raw_data, pulse_range, attenuation[pulse_range], sys_time[pulse_range]
+        else:
+            fid.seek(fid.tell() + start_pulse * 2 * num_samples)
+            for npulse in range(0, ndf, num_pulses):
+                proc_pulses = num_pulses if npulse + num_pulses < ndf else ndf - npulse
+                raw_data = np.zeros((num_samples, proc_pulses)).astype(np.int16)
+                pulse_range = np.arange(npulse + start_pulse, npulse + proc_pulses + start_pulse)
+                for i in range(proc_pulses):
+                    raw_data[:, i] = np.fromfile(fid, 'int16', num_samples, '') * 10 ** (
+                            attenuation[pulse_range[0] + i] / 20)
+                yield raw_data, pulse_range, attenuation[pulse_range], sys_time[pulse_range]
+
+
+def getRawData(filename, num_pulses, start_pulse=0, isIQ=False):
+    """
+    Parses raw data from an APS debug .dat file.
+    :param filename: str Name of .dat file to parse.
+    :param num_pulses: int Number of pulses to parse.
+    :param start_pulse: int The function will start with this pulse number.
+    :param isIQ: bool if True, assumes data is stored as complex numbers. Otherwise, reads data as ints.
+    :return:
+        raw_data: numpy array Array of pulse data, size of number_samples_per_pulse x num_pulses.
+        pulse_range: numpy array List of each pulse's number in the parsed file.
+        attenuation: numpy array List of attenuation factors associated with each pulse.
+        sys_time: numpy array List of system times, in TAC, associated with each pulse.
+    """
+    with open(filename, 'rb') as fid:
+        num_frames = np.fromfile(fid, 'uint32', 1, '')[0]
+        if isIQ:
+            num_samples = np.fromfile(fid, 'uint32', 1, '')[0]
+        else:
+            num_samples = np.fromfile(fid, 'uint16', 1, '')[0]
+        attenuation = np.fromfile(fid, 'int8', num_frames, '')
+        sys_time = np.fromfile(fid, 'double', num_frames, '')
+        proc_pulses = num_pulses if start_pulse + num_pulses < num_frames else num_frames - start_pulse
+        pulse_range = np.arange(start_pulse, start_pulse + proc_pulses)
+        if isIQ:
+            fid.seek(fid.tell() + start_pulse * 4 * num_samples)
+            raw_data = np.zeros((num_samples, proc_pulses)).astype(np.complex128)
+            for i in range(proc_pulses):
+                tmp = np.fromfile(fid, 'int16', num_samples * 2, '')
+                raw_data[:, i] = (tmp[0::2] + 1j * tmp[1::2]) * 10 ** (attenuation[start_pulse + i] / 20)
+            return raw_data, pulse_range, attenuation[pulse_range], sys_time[pulse_range]
+        else:
+            fid.seek(fid.tell() + start_pulse * 2 * num_samples)
+            raw_data = np.zeros((num_samples, proc_pulses)).astype(np.int16)
+            for i in range(proc_pulses):
+                raw_data[:, i] = np.fromfile(fid, 'int16', num_samples, '') * 10 ** (
+                        attenuation[start_pulse + i] / 20)
+            return raw_data, pulse_range, attenuation[pulse_range], sys_time[pulse_range]
+
+
+def getFullRawData(filename, num_pulses, start_pulse=0, isIQ=False):
+    """
+    Parses raw data from an APS debug .dat file.
+    :param filename: str Name of .dat file to parse.
+    :param num_pulses: int Number of pulses to parse.
+    :param start_pulse: int The function will start with this pulse number.
+    :param isIQ: bool if True, assumes data is stored as complex numbers. Otherwise, reads data as ints.
+    :return:
+        raw_data: numpy array Array of pulse data, size of number_samples_per_pulse x num_pulses.
+        pulse_range: numpy array List of each pulse's number in the parsed file.
+        attenuation: numpy array List of attenuation factors associated with each pulse.
+        sys_time: numpy array List of system times, in TAC, associated with each pulse.
+    """
+    with open(filename, 'rb') as fid:
+        num_frames = np.fromfile(fid, 'uint32', 1, '')[0]
+        if isIQ:
+            num_samples = np.fromfile(fid, 'uint32', 1, '')[0]
+        else:
+            num_samples = np.fromfile(fid, 'uint16', 1, '')[0]
+        attenuation = np.fromfile(fid, 'int8', num_frames, '')
+        sys_time = np.fromfile(fid, 'double', num_frames, '')
+        proc_pulses = num_pulses if start_pulse + num_pulses < num_frames else num_frames - start_pulse
+        pulse_range = np.arange(start_pulse, start_pulse + proc_pulses)
+        if isIQ:
+            fid.seek(fid.tell() + start_pulse * 8 * num_samples)
+            raw_data = np.zeros((num_samples, proc_pulses)).astype(np.complex128)
+            for i in range(proc_pulses):
+                tmp = np.fromfile(fid, 'complex128', num_samples, '')
+                raw_data[:, i] = tmp
+        else:
+            fid.seek(fid.tell() + start_pulse * 2 * num_samples)
+            raw_data = np.zeros((num_samples, proc_pulses)).astype(np.int16)
+            for i in range(proc_pulses):
+                raw_data[:, i] = np.fromfile(fid, 'int16', num_samples, '') * 10 ** (
+                        attenuation[start_pulse + i] / 20)
+
+        return raw_data, pulse_range, attenuation[pulse_range], sys_time[pulse_range]
+
+
+def loadDechirpRawData(filename, num_pulses, start_pulse=0):
+    with open(filename, 'rb') as fid:
+        num_frames = np.fromfile(fid, 'uint32', 1, '')[0]
+        if start_pulse + num_pulses > num_frames:
+            num_pulses = num_frames - start_pulse
+            print(f"Too many frames for file! Using {num_pulses} pulses instead")
+        num_samples = np.fromfile(fid, 'uint32', 1, '')[0]
+        attenuation = np.fromfile(fid, 'int8', num_frames, '')
+        sys_time = np.fromfile(fid, 'double', num_frames, '')
+        raw_data = np.zeros((num_samples, num_pulses)).astype(np.complex64)
+        fid.seek(fid.tell() + start_pulse * 2 * num_samples)
+        for i in range(num_pulses):
+            raw_data[:, i] = (np.fromfile(fid, 'int16', num_samples, '') + 1j * np.fromfile(fid, 'int16', num_samples,
+                                                                                            '')) * 10 ** (
+                                     attenuation[i] / 20)
+    return raw_data, num_pulses, attenuation, sys_time
+
+
+def factors(n):
+    return list(set(reduce(list.__add__,
+                           ([i, n // i] for i in range(1, int(pow(n, 0.5) + 1)) if n % i == 0))))
+
+
+def getDechirpRawDataGen(filename, numPulses, numDesiredFrames=None, start_pulse=0):
+    with open(filename, 'rb') as fid:
+        numFrames = np.fromfile(fid, 'uint32', 1, '')[0]
+        numSamples = np.fromfile(fid, 'uint32', 1, '')[0]
+        attenuation = np.fromfile(fid, 'int8', numFrames, '')
+        sys_time = np.fromfile(fid, 'double', numFrames, '')
+        ndf = numFrames if numDesiredFrames is None else numDesiredFrames
+        fid.seek(fid.tell() + start_pulse * 2 * numSamples)
+        for npulse in range(0, ndf, numPulses):
+            proc_pulses = numPulses if npulse + numPulses < ndf else ndf - npulse
+            raw_data = np.zeros((numSamples, proc_pulses)).astype(np.complex128)
+            pulseRange = np.arange(npulse, npulse + proc_pulses)
+            for i in range(proc_pulses):
+                raw_data[:, i] = (np.fromfile(fid, 'int16', numSamples, '') + 1j * np.fromfile(fid, 'int16', numSamples,
+                                                                                               '')) * 10 ** (
+                                         attenuation[pulseRange[0] + i] / 20)
+            yield raw_data, pulseRange, attenuation[pulseRange], sys_time[pulseRange]
+
+
+def loadFFTData(filename, numPulses, start_pulse=0):
+    with open(filename, 'rb') as fid:
+        numFrames = np.fromfile(fid, 'uint32', 1, '')[0]
+        if start_pulse + numPulses > numFrames:
+            numPulses = numFrames - start_pulse
+            print(f"Too many frames for file! Using {numPulses} pulses instead")
+        numFFTSamples = np.fromfile(fid, 'uint32', 1, '')[0]
+        FFTData = np.zeros((numFFTSamples, numPulses)).astype(np.complex64)
+        fid.seek(fid.tell() + start_pulse * 8 * numFFTSamples)
+        for i in range(numPulses):
+            FFTData[:, i] = np.fromfile(fid, 'complex64', numFFTSamples, '')
+    return FFTData, numPulses
+
+
+def getFFTDataGen(filename, numPulses, numDesiredFrames=None, start_pulse=0):
+    with open(filename, 'rb') as fid:
+        numFrames = np.fromfile(fid, 'uint32', 1, '')[0]
+        numFFTSamples = np.fromfile(fid, 'uint32', 1, '')[0]
+        ndf = numFrames if numDesiredFrames is None else numDesiredFrames
+        fid.seek(fid.tell() + start_pulse * 8 * numFFTSamples)
+        for npulse in range(0, ndf, numPulses):
+            proc_pulses = numPulses if npulse + numPulses < ndf else ndf - npulse
+            FFTdata = np.zeros((numFFTSamples, proc_pulses)).astype(np.complex64)
+            pulseRange = np.arange(npulse + start_pulse, npulse + proc_pulses + start_pulse)
+            for i in range(proc_pulses):
+                FFTdata[:, i] = np.fromfile(fid, 'complex64', numFFTSamples, '')
+            yield FFTdata, pulseRange
+
+
+def getSinglePulse(filename, pulse):
+    with open(filename, 'rb') as fid:
+        numFrames = np.fromfile(fid, 'uint32', 1, '')[0]
+        numSamples = np.fromfile(fid, 'uint32', 1, '')[0]
+        attenuation = np.fromfile(fid, 'int8', numFrames, '')
+        sys_time = np.fromfile(fid, 'double', numFrames, '')
+        fid.seek(fid.tell() + pulse * 2 * numSamples)
+        raw_data = np.fromfile(fid, 'int16', numSamples, '') * 10 ** (attenuation[pulse] / 20)
+    return raw_data, attenuation[pulse], sys_time[pulse]
+
+
+def getSingleFFTPulse(filename, pulse):
+    with open(filename, 'rb') as fid:
+        numFrames = np.fromfile(fid, 'uint32', 1, '')[0]
+        numFFTSamples = np.fromfile(fid, 'uint32', 1, '')[0]
+        fid.seek(fid.tell() + pulse * 8 * numFFTSamples)
+        FFTData = np.fromfile(fid, 'complex64', numFFTSamples, '')
+    return FFTData
+
+
+"""
+GPS data format:
+First 32-bits: The number of INS frames (N)
+N * sizeof( double ): latitude in degrees
+N * sizeof( double ): longitude in degrees
+N * sizeof( double ): altitude in meters
+N * sizeof( double ): north velocity in meters per second
+N * sizeof( double ): east velocity in meters per second 
+N * sizeof( double ): up velocity in meters per second 
+N * sizeof( double ): roll in radians
+N * sizeof( double ): pitch in radians
+N * sizeof( double ): azimuth component in radians
+N * sizeof( double ): The number of milliseconds since the start of the GPS week, unwrapped
+"""
+
+
+def loadGPSData(filename):
+    fid = open(filename, 'rb')
+    numFrames = np.fromfile(fid, 'int32', 1, '')[0]
+    return {'frames': numFrames, 'lat': np.fromfile(fid, 'float64', numFrames, ''),
+            'lon': np.fromfile(fid, 'float64', numFrames, ''), 'alt': np.fromfile(fid, 'float64', numFrames, ''),
+            'vn': np.fromfile(fid, 'float64', numFrames, ''), 've': np.fromfile(fid, 'float64', numFrames, ''),
+            'vu': np.fromfile(fid, 'float64', numFrames, ''), 'r': np.fromfile(fid, 'float64', numFrames, ''),
+            'p': np.fromfile(fid, 'float64', numFrames, ''), 'azimuthX': np.fromfile(fid, 'float64', numFrames, ''),
+            'azimuthY': np.fromfile(fid, 'float64', numFrames, ''),
+            'gps_ms': np.fromfile(fid, 'float64', numFrames, ''), 'systime': np.fromfile(fid, 'float64', numFrames, '')}
+
+
+def loadPreCorrectionsGPSData(fnme):
+    # open the post-corrections
+    with open(fnme, 'rb') as fid:
+        # parse all of the post-correction data
+        numFrames = int(np.fromfile(fid, 'uint32', 1, '')[0])
+        lat = np.fromfile(fid, 'float64', numFrames, '')
+        lon = np.fromfile(fid, 'float64', numFrames, '')
+        alt = np.fromfile(fid, 'float64', numFrames, '')
+        vn = np.fromfile(fid, 'float64', numFrames, '')
+        ve = np.fromfile(fid, 'float64', numFrames, '')
+        vu = np.fromfile(fid, 'float64', numFrames, '')
+        r = np.fromfile(fid, 'float64', numFrames, '')
+        p = np.fromfile(fid, 'float64', numFrames, '')
+        az = np.fromfile(fid, 'float64', numFrames, '')
+        sec = np.fromfile(fid, 'float64', numFrames, '')
+    return dict(frames=numFrames, lat=lat, lon=lon, alt=alt, vn=vn, ve=ve, vu=vu, r=r, p=p, az=az, sec=sec)
+
+
+def loadPostCorrectionsGPSData(fnme):
+    # open the post-corrections
+    with open(fnme, 'rb') as fid:
+        # parse all of the post-correction data
+        numPostFrames = int(np.fromfile(fid, 'uint32', 1, '')[0])
+        latConv = np.fromfile(fid, 'float64', 1, '')[0]
+        lonConv = np.fromfile(fid, 'float64', 1, '')[0]
+        rxEastingM = np.fromfile(fid, 'float64', numPostFrames, '')
+        rxEastingM[abs(rxEastingM) < lonConv] *= lonConv
+        rxNorthingM = np.fromfile(fid, 'float64', numPostFrames, '')
+        rxNorthingM[abs(rxNorthingM) < latConv] *= \
+            latConv
+        rxAltM = np.fromfile(fid, 'float64', numPostFrames, '')
+        # fid.seek(numPostFrames * 8 * 3, 1)
+        txEastingM = np.fromfile(fid, 'float64', numPostFrames, '')
+        txEastingM[abs(txEastingM) < lonConv] *= lonConv
+        txNorthingM = np.fromfile(fid, 'float64', numPostFrames, '')
+        txNorthingM[abs(txNorthingM) < latConv] *= \
+            latConv
+        txAltM = np.fromfile(fid, 'float64', numPostFrames, '')
+        aziPostR = np.fromfile(fid, 'float64', numPostFrames, '')
+        sec = np.fromfile(fid, 'float64', numPostFrames, '')
+    return dict(frames=numPostFrames, latConv=latConv, lonConv=lonConv, rx_lon=rxEastingM / lonConv,
+                rx_lat=rxNorthingM / latConv, rx_alt=rxAltM, tx_lon=txEastingM / lonConv, tx_lat=txNorthingM / latConv,
+                tx_alt=txAltM, az=aziPostR, sec=sec)
+
+
+"""
+Gimbal data format:
+First 32-bits: The number of gimbal frames (N)
+N * sizeof( double ): pan position in radians
+N * sizeof( double ): tilt position in radians 
+N * sizeof( double ): system time in TAC, unwrapped
+"""
+
+
+def loadGimbalData(filename):
+    fid = open(filename, 'rb')
+    numFrames = np.fromfile(fid, 'uint32', 1, '')[0]
+    ret_dict = {'pan': np.fromfile(fid, 'float64', numFrames, ''), 'tilt': np.fromfile(fid, 'float64', numFrames, ''),
+                'systime': np.fromfile(fid, 'float64', numFrames, '')}
+    return ret_dict
+
+
+def loadMatchedFilter(filename):
+    with open(filename, 'rb') as fid:
+        numFrames = np.fromfile(fid, 'uint32', 1, '')[0]
+        ret = np.fromfile(fid, 'complex64', numFrames, '')
+    return ret
+
+
+def loadReferenceChirp(filename):
+    with open(filename, 'rb') as fid:
+        num_samples = np.fromfile(fid, 'uint32', 1, '')[0]
+        tmp = np.fromfile(fid, 'int16', num_samples * 2, '')
+        ret = (tmp[0::2] + 1j * tmp[1::2]) * 10 ** (31 / 20)
+    return ret
+
+
+def getFFTParams(filename):
+    with open(filename, 'rb') as fid:
+        numFrames = np.fromfile(fid, 'uint32', 1, '')
+        numFFTSamples = np.fromfile(fid, 'uint32', 1, '')
+    return numFrames[0], numFFTSamples[0]
+
+
+def getRawParams(filename):
+    with open(filename, 'rb') as fid:
+        numFrames = np.fromfile(fid, 'uint32', 1, '')[0]
+        numSamples = np.fromfile(fid, 'uint16', 1, '')[0]
+        attenuation = np.fromfile(fid, 'int8', numFrames, '')
+        sys_time = np.fromfile(fid, 'double', numFrames, '')
+    return numFrames, numSamples, attenuation, sys_time
+
+
+def getRawSDRParams(filename):
+    with open(filename, 'rb') as fid:
+        numFrames = np.fromfile(fid, 'uint32', 1, '')[0]
+        numSamples = np.fromfile(fid, 'uint32', 1, '')[0]
+        attenuation = np.fromfile(fid, 'int8', numFrames, '')
+        sys_time = np.fromfile(fid, 'double', numFrames, '')
+    return numFrames, numSamples, attenuation, sys_time
+
+
+def createIFTMatrix(m, fs):
+    D = np.ones((m, m), dtype='complex64')
+    for i in range(1, m):
+        D[:, m] = np.exp(1j * 2 * pi * i * fs / m * np.arange(m) * 1 / (fs / m))
+
+    return D
+
+
+def GetAdvMatchedFilter(chan, nbar=5, SLL=-35, sar=None, pulseNum=20, fft_len=None):
+    # Things the PS will need to know from the configuration
+    numSamples = chan.nsam
+    samplingFreqHz = chan.fs
+    basebandedChirpRateHzPerS = chan.chirp_rate
+    # If the NCO was positive it means we will have sampled the reverse spectrum
+    #   and the chirp will be flipped
+    if chan.NCO_freq_Hz > 0:
+        basebandedChirpRateHzPerS *= -1
+    halfBandwidthHz = chan.bw / 2.0
+    # Get the basebanded center, start and stop frequency of the chirp
+    basebandedCenterFreqHz = chan.baseband_fc
+    basebandedStartFreqHz = chan.baseband_fc - halfBandwidthHz
+    basebandedStopFreqHz = chan.baseband_fc + halfBandwidthHz
+    if basebandedChirpRateHzPerS < 0:
+        basebandedStartFreqHz = chan.baseband_fc + halfBandwidthHz
+        basebandedStopFreqHz = chan.baseband_fc - halfBandwidthHz
+
+    # Get the reference waveform and mix it down by the NCO frequency and
+    #   downsample to the sampling rate of the receive data if necessary
+    # The waveform input into the DAC has already had the Hilbert transform
+    #   and downsample operation performed on it by SDRParsing, so it is
+    #   complex sampled data at this point at the SlimSDR base complex sampling
+    #   rate.
+    # Compute the decimation rate if the data has been low-pass filtered and
+    #   downsampled
+    decimationRate = 1
+    if chan.is_lpf:
+        decimationRate = int(np.floor(chan.BASE_COMPLEX_SRATE_HZ / samplingFreqHz))
+
+    # Grab the waveform
+    waveformData = chan.ref_chirp
+
+    # Create the plot for the FFT of the waveform
+    waveformLen = len(waveformData)
+
+    # Compute the mixdown signal
+    mixDown = np.exp(1j * (2 * np.pi * chan.NCO_freq_Hz * np.arange(waveformLen) / chan.BASE_COMPLEX_SRATE_HZ))
+    basebandWaveform = mixDown * waveformData
+
+    # Decimate the waveform if applicable
+    if decimationRate > 1:
+        basebandWaveform = basebandWaveform[:: decimationRate]
+    # Calculate the updated baseband waveform length
+    basebandWaveformLen = len(basebandWaveform)
+    # Grab the calibration data
+    calData = chan.cal_chirp + 0.0
+    # Grab the pulses
+    if sar:
+        calData = sar.getPulse(pulseNum, channel=0).T + 0.0
+
+    # Calculate the convolution length
+    convolutionLength = numSamples + basebandWaveformLen - 1
+    FFTLength = findPowerOf2(convolutionLength) if fft_len is None else fft_len
+
+    # Calculate the inverse transfer function
+    FFTCalData = np.fft.fft(calData, FFTLength)
+    FFTBasebandWaveformData = np.fft.fft(basebandWaveform, FFTLength)
+    inverseTransferFunction = FFTBasebandWaveformData / FFTCalData
+    # NOTE! Outside of the bandwidth of the signal, the inverse transfer function
+    #   is invalid and should not be viewed. Values will be enormous.
+
+    # Generate the Taylor window
+    TAYLOR_NBAR = 5
+    TAYLOR_NBAR = nbar
+    TAYLOR_SLL_DB = -35
+    TAYLOR_SLL_DB = SLL
+    windowSize = \
+        int(np.floor(halfBandwidthHz * 2.0 / samplingFreqHz * FFTLength))
+    taylorWindow = window_taylor(windowSize, nbar=TAYLOR_NBAR, sll=TAYLOR_SLL_DB) if SLL != 0 else np.ones(windowSize)
+
+    # Create the matched filter and polish up the inverse transfer function
+    matchedFilter = np.fft.fft(basebandWaveform, FFTLength)
+    # IQ baseband vs offset video
+    if np.sign(basebandedStartFreqHz) != np.sign(basebandedStopFreqHz):
+        # Apply the inverse transfer function
+        aboveZeroLength = int(np.ceil((basebandedCenterFreqHz + halfBandwidthHz) / samplingFreqHz * FFTLength))
+        belowZeroLength = int(windowSize - aboveZeroLength)
+        taylorWindowExtended = np.zeros(FFTLength)
+        taylorWindowExtended[int(FFTLength / 2) - aboveZeroLength:int(FFTLength / 2) - aboveZeroLength + windowSize] = \
+            taylorWindow
+        # Zero out the invalid part of the inverse transfer function
+        inverseTransferFunction[aboveZeroLength: -belowZeroLength] = 0
+        taylorWindowExtended = np.fft.fftshift(taylorWindowExtended)
+    else:
+        # Apply the inverse transfer function
+        bandStartInd = \
+            int(np.floor((basebandedCenterFreqHz - halfBandwidthHz) / samplingFreqHz * FFTLength))
+        taylorWindowExtended = np.zeros(FFTLength)
+        taylorWindowExtended[bandStartInd: bandStartInd + windowSize] = taylorWindow
+        inverseTransferFunction[: bandStartInd] = 0
+        inverseTransferFunction[bandStartInd + windowSize:] = 0
+    matchedFilter = matchedFilter.conj() * inverseTransferFunction * taylorWindowExtended
+    return matchedFilter
+
+
+def window_taylor(N, nbar=4, sll=-30):
+    """Taylor tapering window
+    Taylor windows allows you to make tradeoffs between the
+    mainlobe width and sidelobe level (sll).
+    Implemented as described by Carrara, Goodman, and Majewski
+    in 'Spotlight Synthetic Aperture Radar: Signal Processing Algorithms'
+    Pages 512-513
+    :param N: window length
+    :param float nbar:
+    :param float sll:
+    The default values gives equal height
+    sidelobes (nbar) and maximum sidelobe level (sll).
+    .. warning:: not implemented
+    .. seealso:: :func:`create_window`, :class:`Window`
+    """
+    if sll > 0:
+        sll *= -1
+    B = 10 ** (-sll / 20)
+    A = np.log(B + np.sqrt(B ** 2 - 1)) / np.pi
+    s2 = nbar ** 2 / (A ** 2 + (nbar - 0.5) ** 2)
+    ma = np.arange(1, nbar)
+
+    def calc_Fm(m):
+        numer = (-1) ** (m + 1) \
+                * np.prod(1 - m ** 2 / s2 / (A ** 2 + (ma - 0.5) ** 2))
+        denom = 2 * np.prod([1 - m ** 2 / j ** 2 for j in ma if j != m])
+        return numer / denom
+
+    Fm = np.array([calc_Fm(m) for m in ma])
+
+    def W(n):
+        return 2 * np.sum(
+            Fm * np.cos(2 * np.pi * ma * (n - N / 2 + 1 / 2) / N)) + 1
+
+    w = np.array([W(n) for n in range(N)])
+    # normalize (Note that this is not described in the original text)
+    scale = W((N - 1) / 2)
+    w /= scale
+    return w
+
+
+def sinc_interp(x, s, u):
+    if len(x) != len(s):
+        raise ValueError('x and s must be the same length')
+
+    # Find the period
+    T = s[1] - s[0]
+
+    sincM = np.tile(u, (len(s), 1)) - np.tile(s[:, np.newaxis], (1, len(u)))
+    return np.dot(x, np.sinc(sincM / T))
+
+
+def getDopplerLine(effAzI, rangeBins, antVel, antPos, nearRangeGrazeR, azBeamwidthHalf, PRF, wavelength, origin):
+    """Compute the expected Doppler vs range for the given platform geometry"""
+
+    # compute the grazing angle for the near range to start
+    (nearRangeGrazeR, Rvec, surfaceHeight, numIter) = computeGrazingAngle(
+        effAzI, nearRangeGrazeR, antPos, rangeBins[0], origin)
+
+    # now I need to get the grazing angles across all of the range bins
+    grazeOverRanges = np.arcsin((antPos[2] + origin[2] - surfaceHeight) / rangeBins)
+
+    # this is a special version of Rvec (it is not 3x1, it is 3xNrv)
+    Rvec = np.array([
+        np.cos(grazeOverRanges) * np.sin(effAzI),
+        np.cos(grazeOverRanges) * np.cos(effAzI),
+        -np.sin(grazeOverRanges)])
+    # perform the dot product and calculate the Doppler
+    DopplerCen = ((2.0 / wavelength) * Rvec.T.dot(antVel).flatten()) % PRF
+    # account for wrapping of the Doppler spectrum
+    ind = np.nonzero(DopplerCen > PRF / 2)
+    DopplerCen[ind] -= PRF
+    ind = np.nonzero(DopplerCen < -PRF / 2)
+    DopplerCen[ind] += PRF
+
+    # generate the radial vector for the forward beamwidth edge
+    # (NOTE!!!: this is dependent
+    # on the antenna pointing vector attitude with respect to the aircraft heading.
+    # if on the left side, negative azimuth will be lower Doppler, and positive
+    # azimuth will be higher, but on the right side, it will be the opposite, one
+    # could use the sign of the cross-product to determine which it is.)
+    # if (xmlData.gimbalSettings.lookSide.lower() == 'left'):
+    eff_boresight = np.mean(np.array([
+        np.cos(grazeOverRanges) * np.sin(effAzI),
+        np.cos(grazeOverRanges) * np.cos(effAzI),
+        -np.sin(grazeOverRanges)]), axis=1)
+    ant_dir = np.cross(eff_boresight, antVel)
+    azBeamwidthHalf *= np.sign(ant_dir[2])
+
+    newAzI = effAzI - azBeamwidthHalf
+    Rvec = np.array([
+        np.cos(grazeOverRanges) * np.sin(newAzI),
+        np.cos(grazeOverRanges) * np.cos(newAzI),
+        -np.sin(grazeOverRanges)])
+    # perform the dot product and calculate the Upper Doppler
+    DopplerUp = ((2.0 / wavelength) * Rvec.T.dot(antVel).flatten()) % PRF
+    # account for wrapping of the Doppler spectrum
+    ind = np.nonzero(DopplerUp > PRF / 2)
+    DopplerUp[ind] -= PRF
+    ind = np.nonzero(DopplerUp < -PRF / 2)
+    DopplerUp[ind] += PRF
+
+    # generate the radial vector for the forward beamwidth edge
+    newAzI = effAzI + azBeamwidthHalf
+    Rvec = np.array([
+        np.cos(grazeOverRanges) * np.sin(newAzI),
+        np.cos(grazeOverRanges) * np.cos(newAzI),
+        -np.sin(grazeOverRanges)])
+    # perform the dot product and calculate the Upper Doppler
+    DopplerDown = \
+        ((2.0 / wavelength) * Rvec.T.dot(antVel).flatten()) % PRF
+    # account for wrapping of the Doppler spectrum
+    ind = np.nonzero(DopplerDown > PRF / 2)
+    DopplerDown[ind] -= PRF
+    ind = np.nonzero(DopplerDown < -PRF / 2)
+    DopplerDown[ind] += PRF
+    return DopplerCen, DopplerUp, DopplerDown, grazeOverRanges
+
+
+def computeGrazingAngle(effAzIR, grazeIR, antPos, theRange, origin):
+    # initialize the pointing vector to first range bin
+    Rvec = np.array([np.cos(grazeIR) * np.sin(effAzIR),
+                  np.cos(grazeIR) * np.cos(effAzIR),
+                  -np.sin(grazeIR)])
+
+    groundPoint = antPos + Rvec * theRange
+    nlat, nlon, alt = enu2llh(*groundPoint, origin)
+    # look up the height of the surface below the aircraft
+    surfaceHeight = getElevation((nlat, nlon), False)
+    # check the error in the elevation compared to what was calculated
+    elevDiff = surfaceHeight - alt
+
+    iterationThresh = 2
+    heightDiffThresh = 1.0
+    numIterations = 0
+    newGrazeR = grazeIR + 0.0
+    # iterate if the difference is greater than 1.0 m
+    while abs(elevDiff) > heightDiffThresh and numIterations < iterationThresh:
+        hAgl = antPos[2] + origin[2] - surfaceHeight
+        newGrazeR = np.arcsin(hAgl / theRange)
+        if np.isnan(newGrazeR) or np.isinf(newGrazeR):
+            print('NaN or inf found.')
+        Rvec = np.array([np.cos(newGrazeR) * np.sin(effAzIR),
+                      np.cos(newGrazeR) * np.cos(effAzIR),
+                      -np.sin(newGrazeR)])
+        groundPoint = antPos + Rvec * theRange
+        nlat, nlon, alt = enu2llh(*groundPoint, origin)
+        surfaceHeight = getElevation((nlat, nlon), False)
+        # check the error in the elevation compared to what was calculated
+        elevDiff = surfaceHeight - alt
+        numIterations += 1
+
+    return newGrazeR, Rvec, surfaceHeight, numIterations
+

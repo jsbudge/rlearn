@@ -1,9 +1,13 @@
+import contextlib
 import numpy as np
-from simulation_functions import getMapLocation, createMeshFromPoints, getElevationMap, rotate, llh2enu, genPulse, enu2llh
-import open3d as o3d
+from simulation_functions import getElevationMap, llh2enu, \
+    enu2llh, getElevation, db, resampleGrid
 from SDRParsing import SDRParse
 from scipy.spatial.transform import Rotation as rot
-
+from scipy.spatial import Delaunay
+from scipy.signal import medfilt2d
+from scipy.interpolate import CubicSpline, interpn, NearestNDInterpolator, LinearNDInterpolator
+import pickle
 
 fs = 2e9
 c0 = 299792458.0
@@ -12,136 +16,236 @@ DTR = np.pi / 180
 inch_to_m = .0254
 m_to_ft = 3.2808
 
+'''
+Environment
+This is a class to represent the environment of a radar. 
+'''
+
 
 class Environment(object):
-    _mesh = None
-    _pcd = None
-    _ref_coefs = None
-    _scat_coefs = None
-    _refscale = 1
-    _scatscale = 1
+    _altgrid = None
+    _transforms = None
+    _refgrid = None
 
-    def __init__(self, pts=None, scattering=None, reflectivity=None, scatscale=1, refscale=1):
+    def __init__(self, rmat=None, shift=None, reflectivity=None):
+        if rmat is not None:
+            self.setGrid(reflectivity, rmat, shift)
 
-        if pts is not None:
-            # Create the point cloud for the mesh basis
-            scats = scattering if scattering is not None else np.ones((pts.shape[0],))
-            refs = reflectivity if reflectivity is not None else np.ones((pts.shape[0],))
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pts)
-            pcd.colors = o3d.utility.Vector3dVector(np.array([refs, scats, np.zeros_like(scats)]).T)
-            self._refscale = refscale
-            self._scatscale = scatscale
+    def getDistance(self, pos):
+        return np.linalg.norm(self._grid - pos[None, :], axis=1)
 
-            # Downsample if possible to reduce number of triangles
-            pcd = pcd.voxel_down_sample(voxel_size=np.mean(pcd.compute_nearest_neighbor_distance()) / 1.5)
-            its = 0
-            while np.std(pcd.compute_nearest_neighbor_distance()) > 2. and its < 30:
-                dists = pcd.compute_nearest_neighbor_distance()
-                pcd = pcd.voxel_down_sample(voxel_size=np.mean(dists) / 1.5)
-                its += 1
+    def getGridParams(self, pos, width, height, npts, az=0):
+        shift_x, shift_y, _ = llh2enu(*pos, self.ref)
+        rmat = np.array([[np.cos(az), -np.sin(az)],
+                         [np.sin(az), np.cos(az)]]).dot(np.diag([width / npts[0], height / npts[1]]))
 
-            avg_dist = np.mean(pcd.compute_nearest_neighbor_distance())
-            radius = 3 * avg_dist
-            radii = [radius, radius * 2]
-            pcd.estimate_normals()
-            try:
-                pcd.orient_normals_consistent_tangent_plane(100)
-            except RuntimeError:
-                pass
+        return rmat, np.array([shift_x, shift_y])
 
-            # Generate mesh
-            rec_mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
-                pcd, o3d.utility.DoubleVector(radii))
-            # rec_mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+    def getGrid(self, pos=None, width=None, height=None, npts=None, az=0):
+        if pos is None:
+            x, y = np.meshgrid(np.arange(self.shape[0]) - self.shape[0] / 2,
+                               np.arange(self.shape[1]) - self.shape[1] / 2)
+            pts = np.column_stack((x.flatten(), y.flatten()))
+            pos_r = np.squeeze(np.einsum('ji, mni -> jmn', self._transforms[0], [pts])).T + self._transforms[1]
+            latg, long, altg = enu2llh(pos_r[:, 0], pos_r[:, 1], np.zeros(pos_r.shape[0]), self.ref)
+            gz = (getElevationMap(latg, long, interp_method='splinef2d') - self.ref[2])
+            sh = self.shape
+        else:
+            shift_x, shift_y, _ = llh2enu(*pos, self.ref)
+            gxx = np.linspace(-width / 2, width / 2, npts[0])
+            gyy = np.linspace(-height / 2, height / 2, npts[1])
+            gx, gy = np.meshgrid(gxx, gyy)
+            pts = np.column_stack((gx.flatten(), gy.flatten()))
+            rmat = np.array([[np.cos(az), -np.sin(az)],
+                             [np.sin(az), np.cos(az)]])
+            pos_r = np.squeeze(np.einsum('ji, mni -> jmn', rmat, [pts])).T + \
+                    np.array([shift_x, shift_y])
+            latg, long, altg = enu2llh(pos_r[:, 0], pos_r[:, 1], np.zeros(pos_r.shape[0]), self.ref)
+            sh = gx.shape
+            gz = (getElevationMap(latg, long, interp_method='splinef2d') - self.ref[2])
+        return pos_r[:, 0].reshape(sh), pos_r[:, 1].reshape(sh), gz.reshape(sh)
 
-            rec_mesh.remove_duplicated_vertices()
-            rec_mesh.remove_duplicated_triangles()
-            rec_mesh.remove_degenerate_triangles()
-            rec_mesh.remove_unreferenced_vertices()
-            self._mesh = rec_mesh
-            self._pcd = pcd
+    def setGrid(self, newgrid, rmat, shift):
+        self._refgrid = newgrid
+        self._transforms = (rmat, shift)
 
-    def setScatteringCoeffs(self, coef, scale=1):
-        if coef.shape[0] != self.vertices.shape[0]:
-            raise RuntimeError('Scattering coefficients must be the same size as vertex points')
-        old_stuff = np.asarray(self._pcd.colors)
-        old_stuff[:, 1] = coef
-        self._pcd.colors = o3d.utility.Vector3dVector(old_stuff)
-        self._scatscale = scale
+    def resample(self, pos, width, height, npts, az=0):
+        rmat, shift = self.getGridParams(pos, width, height, npts, az)
+        x, y, _ = self.getGrid(pos, width, height, npts, az)
+        pts = np.column_stack((x.flatten(), y.flatten()))
+        irmat = np.linalg.pinv(self._transforms[0])
+        pos_r = np.squeeze(np.einsum('ji, mni -> jmn', irmat, [pts - self._transforms[1]])).T + \
+                np.array([self.shape[0] / 2, self.shape[1] / 2])
+        self.setGrid(interpn((np.arange(self.refgrid.shape[0]),
+                              np.arange(self.refgrid.shape[1])), self.refgrid, pos_r, bounds_error=False,
+                             fill_value=0).reshape(x.shape), rmat, shift)
 
-    def setReflectivityCoeffs(self, coef):
-        if coef.shape[0] != self.vertices.shape[0]:
-            raise RuntimeError('Reflectivity coefficients must be the same size as vertex points')
-        old_stuff = np.asarray(self._pcd.colors)
-        old_stuff[:, 0] = coef
-        self._pcd.colors = o3d.utility.Vector3dVector(old_stuff)
-        self._refscale = scale
+    def save(self, fnme):
+        with open(fnme, 'wb') as f:
+            pickle.dump(self, f)
 
-    def visualize(self):
-        o3d.visualization.draw_geometries([self._pcd, self._mesh])
+    def getPos(self, px, py):
+        return self._transforms[0].dot(np.array([px - self.shape[0] / 2, py - self.shape[1] / 2])) + self._transforms[1]
 
-    @property
-    def vertices(self):
-        return np.asarray(self._pcd.points)
+    def getIndex(self, x, y):
+        irmat = np.linalg.pinv(self._transforms[0])
+        return irmat.dot(np.array([x, y]) - self._transforms[1]) + np.array([self.shape[0] / 2, self.shape[1] / 2])
 
-    @property
-    def triangles(self):
-        return np.asarray(self._mesh.triangles)
+    def interp(self, x, y):
+        return interpn((np.arange(self.refgrid.shape[0]),
+                 np.arange(self.refgrid.shape[1])), self.refgrid, self.getIndex(x, y)).reshape(x.shape)
 
     @property
-    def normals(self):
-        return np.asarray(self._mesh.vertex_normals)
+    def refgrid(self):
+        return self._refgrid
 
     @property
-    def ref_coefs(self):
-        return np.asarray(self._pcd.colors)[:, 0] * self._refscale
+    def shape(self):
+        return self._refgrid.shape
 
     @property
-    def scat_coefs(self):
-        return np.asarray(self._pcd.colors)[:, 1] * self._scatscale
+    def transforms(self):
+        return self._transforms
 
 
 class MapEnvironment(Environment):
 
-    def __init__(self, origin, ref_llh, extent, npts_background=500, resample=False):
-        lats = np.linspace(origin[0] - extent[0] / 2 / 111111, origin[0] + extent[0] / 2 / 111111, npts_background)
-        lons = np.linspace(origin[1] - extent[1] / 2 / 111111, origin[1] + extent[1] / 2 / 111111, npts_background)
-        lt, ln = np.meshgrid(lats, lons)
-        ltp = lt.flatten()
-        lnp = ln.flatten()
-        e, n, u = llh2enu(ltp, lnp, getElevationMap(ltp, lnp), ref_llh)
-        if resample:
-            nlat, nlon, nh = resampleGrid(u.reshape(lt.shape), lats, lons, int(len(u) * .8))
-            e, n, u = llh2enu(nlat, nlon, nh + ref_llh[2], ref_llh)
-        super().__init__(np.array([e, n, u]).T)
+    def __init__(self, origin, extent, npts_background=(500, 500)):
+        self.origin = origin
+        self.ref = origin
+        gp = getGridParams(origin, origin, extent[0], extent[1], npts_background)
+        super().__init__(gp[1], gp[0], np.zeros(npts_background))
 
 
 class SDREnvironment(Environment):
+    rps = 1
+    cps = 1
+    heading = 0.
 
-    def __init__(self, sdr_file, num_vertices=400000):
+    def __init__(self, sdr_file, local_grid=None, origin=None):
         # Load in the SDR file
-        sdr = SDRParse(sdr_file)
-        asi = sdr.loadASI(sdr.files['asi'])
+        sdr = SDRParse(sdr_file) if isinstance(sdr_file, str) else sdr_file
+        grid = None
+        print('SDR loaded')
+        try:
+            asi = sdr.loadASI(sdr.files['asi'])
+        except KeyError:
+            print('ASI not found.')
+            asi = np.random.rand(2000, 2000)
+            asi[250, 250] = 10
+            asi[750, 750] = 10
+            grid = asi
+        except TypeError:
+            asi = sdr.loadASI(sdr.files['asi'][0])
+            grid = abs(asi)
         self._sdr = sdr
         self._asi = asi
-        ref_llh = (sdr.ash['geo']['centerY'], sdr.ash['geo']['centerX'], sdr.ash['geo']['hRef'])
-        self.origin = ref_llh
-        cg_e, cg_n = np.meshgrid(np.arange(asi.shape[0]), np.arange(asi.shape[1]))
-        cg_e = cg_e.flatten()
-        cg_n = cg_n.flatten()
-        asi_pts = abs(asi[cg_e, cg_n])
-        # Set this so that we only get ~num_vertices points in the mesh
-        dec_fac = int(asi.shape[0] * asi.shape[1] / num_vertices)
-        cg_e = (cg_e[::dec_fac] - asi.shape[0] / 2) * sdr.ash['geo']['rowPixelSizeM']
-        cg_n = (cg_n[::dec_fac] - asi.shape[1] / 2) * sdr.ash['geo']['colPixelSizeM']
-        asi_pts = asi_pts[::dec_fac]
-        rotated = rot.from_euler('z', -sdr.ash['flight']['flnHdg'] * DTR).apply(
-            np.array([cg_e, cg_n, np.ones_like(cg_e)]).T)
-        lat, lon, alt = enu2llh(rotated[:, 0], rotated[:, 1], np.zeros_like(cg_n), ref_llh)
-        e, n, u = llh2enu(lat, lon, getElevationMap(lat, lon), ref_llh)
+        self.heading = -np.arctan2(sdr.gps_data['ve'].values[0], sdr.gps_data['vn'].values[0])
+        if sdr.ash is None:
+            try:
+                hght = sdr.xml['Flight_Line']['Flight_Line_Altitude_M']
+                pt = ((sdr.xml['Flight_Line']['Start_Latitude_D'] + sdr.xml['Flight_Line']['Stop_Latitude_D']) / 2,
+                      (sdr.xml['Flight_Line']['Start_Longitude_D'] + sdr.xml['Flight_Line']['Stop_Longitude_D']) / 2)
+                alt = getElevation(pt)
+            except KeyError:
+                alt = sdr.gps_data['alt'].mean()
+                pt = (sdr.gps_data['lat'].mean(), sdr.gps_data['lon'].mean())
+                hght = alt + getElevation(pt)
+            mrange = hght / np.tan(sdr.ant[0].dep_ang)
+            if origin is None:
+                ref_llh = origin = enu2llh(mrange * np.sin(self.heading), mrange * np.cos(self.heading), 0.,
+                                           (pt[0], pt[1], alt))
+            else:
+                ref_llh = enu2llh(mrange * np.sin(self.heading), mrange * np.cos(self.heading), 0.,
+                                           (pt[0], pt[1], alt))
+        else:
+            if origin is None:
+                origin = (sdr.ash['geo']['centerY'], sdr.ash['geo']['centerX'],
+                          getElevation((sdr.ash['geo']['centerY'], sdr.ash['geo']['centerX'])))
+            ref_llh = (sdr.ash['geo']['refLat'], sdr.ash['geo']['refLon'],
+                       sdr.ash['geo']['hRef'])
+            self.rps = sdr.ash['geo']['rowPixelSizeM']
+            self.cps = sdr.ash['geo']['colPixelSizeM']
+            self.heading = -sdr.ash['flight']['flnHdg'] * DTR
 
-        # Get the point cloud information
-        asi_max = asi_pts.max()
-        super().__init__(np.array([e, n, u]).T, scattering=np.ones_like(e), reflectivity=asi_pts / asi_max,
-                         refscale=asi_max)
+        self.origin = origin
+        self.ref = ref_llh
+
+        if local_grid is not None:
+            grid = local_grid
+        else:
+            # Set grid to be one meter resolution
+            '''rowup = int(1 / self.rps) if self.rps < 1 else 1
+            colup = int(1 / self.cps) if self.cps < 1 else 1
+            grid = grid[::rowup, ::colup]
+            self.rps *= rowup
+            self.cps *= colup'''
+
+        rmat, shift = self.getGridParams(self.origin, grid.shape[0] * self.rps, grid.shape[1] * self.cps, grid.shape,
+                                         self.heading)
+
+        super().__init__(rmat=rmat, shift=shift, reflectivity=grid)
+
+    @property
+    def sdr(self):
+        return self._sdr
+
+
+def mesh(grid, tri_err, num_vertices):
+    # Generate a mesh using SVS metrics to make triangles in the right spots
+    ptx = grid[0, :, :].flatten()
+    pty = grid[1, :, :].flatten()
+    im = grid[2, :, :].flatten()
+    pts = np.array([ptx, pty]).T
+
+    # Initial points are the four corners of the grid
+    init_pts = np.array([[ptx.min(), pty.min()],
+                         [ptx.min(), pty.max()],
+                         [ptx.max(), pty.min()],
+                         [ptx.max(), pty.max()]])
+    tri = Delaunay(init_pts, incremental=True, qhull_options='QJ')
+    total_err = np.inf
+    its = 0
+    total_its = 20
+    while total_err > tri_err and its < total_its:
+        pts_tri = tri.find_simplex(pts).astype(int)
+        sort_args = pts_tri.argsort()
+        sorted_arr = pts_tri[sort_args]
+        _, cut = np.unique(sorted_arr, return_index=True)
+        out = np.split(sort_args, cut)
+        total_err = 0
+        add_pts = []
+        for simplex in out:
+            # Calculate out SVS error of triangle
+            if len(simplex) > 1:
+                tric = im[simplex].mean()
+                errors = abs(im[simplex] - tric) ** 2
+                if np.mean(errors) > tri_err:
+                    winner = simplex[errors == errors.max()][0]
+                    add_pts.append([ptx[winner], pty[winner]])
+                    total_err += sum(errors)
+                    if len(add_pts) + tri.points.shape[0] >= num_vertices:
+                        its = total_its
+                        break
+        total_err /= len(pts_tri)
+        if not add_pts:
+            break
+        try:
+            tri.add_points(np.array(add_pts))
+        except Exception:
+            print('Something went wrong.')
+            break
+        its += 1
+    ptx = tri.points[:, 0]
+    pty = tri.points[:, 1]
+    reflectivity = tri.find_simplex(pts).reshape((grid.shape[1], grid.shape[2]))
+    return ptx, pty, reflectivity, tri.simplices
+
+
+def getGridParams(ref, pos, width, height, npts, az=0):
+    shift_x, shift_y, _ = llh2enu(*pos, ref)
+    rmat = np.array([[np.cos(az), -np.sin(az)],
+                     [np.sin(az), np.cos(az)]]).dot(np.diag([width / npts[0], height / npts[1]]))
+
+    return (shift_x, shift_y), rmat
+
